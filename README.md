@@ -15,3 +15,15 @@ Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727
     url     = {https://arxiv.org/abs/2605.16727}, 
 }
 ```
+
+```bibtex
+@misc{schmidhuber2012powerplaytrainingincreasinglygeneral,
+    title    = {POWERPLAY: Training an Increasingly General Problem Solver by Continually Searching for the Simplest Still Unsolvable Problem}, 
+    author   = {Jürgen Schmidhuber},
+    year     = {2012},
+    eprint   = {1112.5309},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.AI},
+    url      = {https://arxiv.org/abs/1112.5309}, 
+}
+```
