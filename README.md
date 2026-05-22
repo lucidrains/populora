@@ -1,6 +1,6 @@
 ## PopuLoRA (wip)
 
-Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727v1), Co-Evolving LLM Populations for Reasoning Self-Play, from Roger Castanyer et al at [vmax.ai](https://vmax.ai/)
+Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727v1), [Co-Evolving LLM Populations for Reasoning Self-Play](https://vmax.ai/team/populora-co-evolving-llm-populations-for-reasoning-self-play), from Roger Castanyer et al at [vmax.ai](https://vmax.ai/)
 
 ## Citations
 
