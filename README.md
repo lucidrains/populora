@@ -6,24 +6,36 @@ Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727
 
 ```bibtex
 @misc{castanyer2026populoracoevolvingllmpopulations,
-    title   = {PopuLoRA: Co-Evolving LLM Populations for Reasoning Self-Play}, 
+    title   = {PopuLoRA: Co-Evolving LLM Populations for Reasoning Self-Play},
     author  = {Roger Creus Castanyer and Geoffrey Bradway and Lorenz Wolf and Maxwill Lin and Augustine N. Mavor-Parker and Matthew James Sargent},
     year    = {2026},
     eprint  = {2605.16727},
     archivePrefix = {arXiv},
     primaryClass = {cs.AI},
-    url     = {https://arxiv.org/abs/2605.16727}, 
+    url     = {https://arxiv.org/abs/2605.16727},
 }
 ```
 
 ```bibtex
 @misc{schmidhuber2012powerplaytrainingincreasinglygeneral,
-    title    = {POWERPLAY: Training an Increasingly General Problem Solver by Continually Searching for the Simplest Still Unsolvable Problem}, 
+    title    = {POWERPLAY: Training an Increasingly General Problem Solver by Continually Searching for the Simplest Still Unsolvable Problem},
     author   = {Jürgen Schmidhuber},
     year     = {2012},
     eprint   = {1112.5309},
     archivePrefix = {arXiv},
     primaryClass = {cs.AI},
-    url      = {https://arxiv.org/abs/1112.5309}, 
+    url      = {https://arxiv.org/abs/1112.5309},
+}
+```
+
+```bibtex
+@misc{bahlousboldi2026vectorpolicyoptimizationtraining,
+    title   = {Vector Policy Optimization: Training for Diversity Improves Test-Time Search},
+    author  = {Ryan Bahlous-Boldi and Isha Puri and Idan Shenfeld and Akarsh Kumar and Mehul Damani and Sebastian Risi and Omar Khattab and Zhang-Wei Hong and Pulkit Agrawal},
+    year    = {2026},
+    eprint  = {2605.22817},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.22817},
 }
 ```
