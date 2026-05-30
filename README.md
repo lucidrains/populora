@@ -39,3 +39,15 @@ Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727
     url     = {https://arxiv.org/abs/2605.22817},
 }
 ```
+
+```bibtex
+@misc{bailey2026scalingselfplayselfguidance,
+    title   = {Scaling Self-Play with Self-Guidance},
+    author  = {Luke Bailey and Kaiyue Wen and Kefan Dong and Tatsunori Hashimoto and Tengyu Ma},
+    year    = {2026},
+    eprint  = {2604.20209},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2604.20209},
+}
+```

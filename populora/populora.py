@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch.nn import Linear, Module, Parameter, ParameterDict, init
+from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 
 from einops import einsum, repeat, rearrange
 from torch_einops_utils import tree_map_tensor
@@ -15,6 +15,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def extract_dict(v, k):
+    return v[k] if isinstance(v, dict) else v
 
 # evolution
 
@@ -35,7 +38,7 @@ def crossover(*parents):
 
 # main class
 
-class PopuLoRA(Module):
+class Population(Module):
     def __init__(
         self,
         model: Module,
@@ -150,3 +153,70 @@ class PopuLoRA(Module):
 
         with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
             return self.model(*args, **kwargs)
+
+class Populations(Module):
+    def __init__(
+        self,
+        *,
+        pop_sizes: dict[str, int],
+        low_ranks: int | dict[str, int],
+        lora_targets: tuple[str, ...] | list[str] | dict[str, tuple[str, ...] | list[str]],
+        model: Module | None = None,
+        models: dict[str, Module] | None = None,
+        requires_grad: bool = False
+    ):
+        super().__init__()
+
+        models = default(models, {})
+
+        self.populations = ModuleDict({})
+
+        for pop_name, pop_size in pop_sizes.items():
+            role_model = models.get(pop_name, model)
+            assert exists(role_model), f"no model provided for population {pop_name}"
+
+            self.populations[pop_name] = Population(
+                model = role_model,
+                pop_size = pop_size,
+                low_rank = extract_dict(low_ranks, pop_name),
+                lora_targets = extract_dict(lora_targets, pop_name),
+                requires_grad = requires_grad
+            )
+
+    def forward(self, *args, pop_name: str, **kwargs):
+        assert pop_name in self.populations, f"unknown population {pop_name}"
+        return self.populations[pop_name](*args, **kwargs)
+
+class PopuLoRA(Module):
+    def __init__(
+        self,
+        *,
+        num_teachers: int,
+        num_students: int,
+        low_rank: int | dict[str, int],
+        lora_targets: tuple[str, ...] | list[str] | dict[str, tuple[str, ...] | list[str]],
+        model: Module | None = None,
+        teacher_model: Module | None = None,
+        student_model: Module | None = None,
+        requires_grad: bool = False
+    ):
+        super().__init__()
+
+        models = dict()
+        if exists(teacher_model):
+            models['teacher'] = teacher_model
+
+        if exists(student_model):
+            models['student'] = student_model
+
+        self.populations = Populations(
+            pop_sizes = dict(teacher = num_teachers, student = num_students),
+            low_ranks = low_rank,
+            lora_targets = lora_targets,
+            model = model,
+            models = models,
+            requires_grad = requires_grad
+        )
+
+    def forward(self, *args, **kwargs):
+        return self.populations(*args, **kwargs)

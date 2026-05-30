@@ -1,1 +1,1 @@
-from populora.populora import PopuLoRA
+from populora.populora import Populations, Population, PopuLoRA
