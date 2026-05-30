@@ -45,6 +45,16 @@ def test_population():
     out_all = populora_model(x, all_individuals = True)
     assert out_all.shape == (4, 128, 1000)
 
+    # test batched input
+
+    x_batch_4 = x.repeat(4, 1)
+    out_all_from_batch = populora_model(x_batch_4, all_individuals = True)
+    assert torch.allclose(out_all, out_all_from_batch)
+
+    x_batch_3 = x.repeat(3, 1)
+    with pytest.raises(AssertionError):
+        populora_model(x_batch_3, all_individuals = True)
+
     out_all_chunked = out_all.chunk(4, dim = 0)
 
     assert torch.allclose(out_all_chunked[0], out_indiv_0, atol = 1e-6)
@@ -52,6 +62,15 @@ def test_population():
 
     out_subset = populora_model(x, individuals = [0, 1])
     assert out_subset.shape == (2, 128, 1000)
+
+    # test batched input for subset
+
+    x_batch_2 = x.repeat(2, 1)
+    out_subset_from_batch = populora_model(x_batch_2, individuals = [0, 1])
+    assert torch.allclose(out_subset, out_subset_from_batch)
+
+    with pytest.raises(AssertionError):
+        populora_model(x_batch_3, individuals = [0, 1])
 
     out_subset_chunked = out_subset.chunk(2, dim = 0)
 

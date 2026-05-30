@@ -139,15 +139,18 @@ class Population(Module):
         if all_individuals or exists(individuals):
             ignore = set(ignore_args_kwargs)
             p = self.pop_size if all_individuals else len(individuals)
-            repeat_batch = lambda t: repeat(t, 'b ... -> (p b) ...', p = p)
+
+            def maybe_expand_batch(t):
+                assert t.shape[0] in (1, p), f'batch dimension {t.shape[0]} must be equal to 1 or number of individuals {p}'
+                return t.expand(p, *t.shape[1:])
 
             args = tuple(
-                tree_map_tensor(repeat_batch, a) if i not in ignore else a
+                tree_map_tensor(maybe_expand_batch, a) if i not in ignore else a
                 for i, a in enumerate(args)
             )
 
             kwargs = {
-                k: tree_map_tensor(repeat_batch, v) if k not in ignore else v
+                k: tree_map_tensor(maybe_expand_batch, v) if k not in ignore else v
                 for k, v in kwargs.items()
             }
 
