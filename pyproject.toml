@@ -37,7 +37,8 @@ Repository = "https://codeberg.org/lucidrains/populora"
 [project.optional-dependencies]
 examples = []
 test = [
-    "pytest"
+    "pytest",
+    "x-transformers"
 ]
 
 [tool.pytest.ini_options]
