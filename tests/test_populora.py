@@ -141,8 +141,90 @@ def test_mutations():
 
     # unknown mutation
 
-    with pytest.raises(ValueError, match = 'Unknown mutation type'):
+    with pytest.raises(AssertionError, match = 'unknown mutation type'):
         pop.mutate('nonexistent_mutation', individual = 0)
+
+def test_select():
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.1, 0.9, 0.5, 0.2])
+
+    # deterministic
+
+    survivor_indices, culled_indices = pop.select(
+        'deterministic',
+        fitnesses,
+        survive_frac = 0.5,
+        elite_frac = 0.25
+    )
+
+    assert survivor_indices.shape == (2,)
+    assert culled_indices.shape == (2,)
+    assert set(survivor_indices.tolist()) == {1, 2}
+    assert set(culled_indices.tolist()) == {0, 3}
+
+    # probabilistic
+
+    survivor_indices, culled_indices = pop.select(
+        'probabilistic',
+        fitnesses,
+        survive_frac = 0.5,
+        elite_frac = 0.25
+    )
+
+    assert survivor_indices.shape == (2,)
+    assert culled_indices.shape == (2,)
+
+    # FUSS
+
+    survivor_indices, culled_indices = pop.select(
+        'fuss',
+        fitnesses,
+        survive_frac = 0.5,
+        elite_frac = 0.25
+    )
+
+    assert survivor_indices.shape == (2,)
+    assert culled_indices.shape == (2,)
+
+    # custom selection - every other 2
+
+    def select_every_other_two(fitnesses, num_select, **kwargs):
+        sorted_indices = fitnesses.argsort(descending = True)
+        return sorted_indices[::2][:num_select]
+
+    pop_custom = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q'],
+        selection_registry = dict(every_other_two = select_every_other_two)
+    )
+
+    survivor_indices, culled_indices = pop_custom.select(
+        'every_other_two',
+        fitnesses,
+        survive_frac = 0.5,
+        elite_frac = 0.,
+    )
+
+    assert survivor_indices.shape == (2,)
+    assert culled_indices.shape == (2,)
+
+    # fitnesses sorted desc = [0.9, 0.5, 0.2, 0.1] -> indices [1, 2, 3, 0]
+    # every other 2 -> indices [1, 3]
+
+    assert set(survivor_indices.tolist()) == {1, 3}
+
+    # unknown selection
+
+    with pytest.raises(AssertionError, match = 'unknown selection type'):
+        pop.select('nonexistent_selection', fitnesses)
 
 def test_custom_mutation():
     pop = Population(
