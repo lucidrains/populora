@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import torch
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
+from torch.linalg import qr, svd
 
-from einops import einsum, repeat, rearrange
+from einops import einsum, rearrange
 from torch_einops_utils import tree_map_tensor
 
 from contextlib import contextmanager
@@ -19,22 +21,156 @@ def default(v, d):
 def extract_dict(v, k):
     return v[k] if isinstance(v, dict) else v
 
-# evolution
+# tensor helpers
 
-# selection
+def _efficient_svd_of_lora(weight_down, weight_up):
+    Q_A, R_A = qr(weight_down)
+    Q_B, R_B = qr(weight_up)
 
-def select(population):
-    raise NotImplementedError
+    C = einsum(R_A, R_B, 'i j, k j -> i k')
+    U_C, S, V_C_T = svd(C)
 
-# mutation
+    U = einsum(Q_A, U_C, 'd r, r s -> d s')
+    V = einsum(Q_B, V_C_T, 'e r, s r -> e s')
+    return U, S, V
 
-def mutation(population):
-    raise NotImplementedError
+def skew_symmetrize(t):
+    return (t - rearrange(t, 'i j -> j i')) / 2
 
-# crossover
+# mutations
 
-def crossover(*parents):
-    raise NotImplementedError
+MUTATION_REGISTRY = {}
+
+def register_mutation(name: str, fn: callable):
+    MUTATION_REGISTRY[name] = fn
+
+# M1
+def mutation_svd_structured(
+    population: Population,
+    idx: int,
+    epsilon: float = 0.1,
+    **kwargs
+):
+    device = population.device
+
+    for key in population.weight_down.keys():
+        weight_down = population.weight_down[key][idx]
+        weight_up = population.weight_up[key][idx]
+
+        U, S, V = _efficient_svd_of_lora(weight_down, weight_up)
+        r = S.shape[-1]
+
+        z = torch.randn_like(S)
+        S_new = S * torch.exp(epsilon * z)
+
+        M_U = torch.randn((r, r), device = device, dtype = U.dtype)
+        R_U = torch.eye(r, device = device, dtype = U.dtype) + epsilon * skew_symmetrize(M_U)
+
+        M_V = torch.randn((r, r), device = device, dtype = V.dtype)
+        R_V = torch.eye(r, device = device, dtype = V.dtype) + epsilon * skew_symmetrize(M_V)
+
+        U_new = einsum(U, R_U, 'd r, r s -> d s')
+        V_new = einsum(V, R_V, 'e r, r s -> e s')
+
+        S_sqrt = torch.sqrt(S_new)
+        weight_down_new = einsum(U_new, S_sqrt, 'd r, r -> d r')
+        weight_up_new = einsum(V_new, S_sqrt, 'e r, r -> e r')
+
+        population.weight_down[key][idx].copy_(weight_down_new)
+        population.weight_up[key][idx].copy_(weight_up_new)
+
+# M2
+def mutation_layer_selective_gaussian(
+    population: Population,
+    idx: int,
+    epsilon: float = 0.1,
+    f: float = 0.33,
+    **kwargs
+):
+    device = population.device
+    keys = list(population.weight_down.keys())
+    num_mutate = max(1, int(f * len(keys)))
+
+    rand_indices = torch.randperm(len(keys), device = device)[:num_mutate].tolist()
+    mutate_keys = [keys[i] for i in rand_indices]
+
+    for key in mutate_keys:
+        weight_down = population.weight_down[key][idx]
+        weight_up = population.weight_up[key][idx]
+
+        weight_down_noise = torch.randn_like(weight_down) * (epsilon * weight_down.std())
+        weight_up_noise = torch.randn_like(weight_up) * (epsilon * weight_up.std())
+
+        population.weight_down[key][idx].add_(weight_down_noise)
+        population.weight_up[key][idx].add_(weight_up_noise)
+
+# M3
+def mutation_component_masking(
+    population: Population,
+    idx: int,
+    rho: float = 0.3,
+    **kwargs
+):
+    device = population.device
+
+    for key in population.weight_down.keys():
+        weight_down = population.weight_down[key][idx]
+        weight_up = population.weight_up[key][idx]
+
+        U, S, V = _efficient_svd_of_lora(weight_down, weight_up)
+        r = S.shape[-1]
+
+        num_drop = int(math.ceil(rho * r))
+        drop_indices = torch.randperm(r, device = device)[:num_drop]
+
+        S_new = S.clone()
+        S_new[drop_indices] = 0.0
+
+        S_sqrt = torch.sqrt(S_new)
+        weight_down_new = einsum(U, S_sqrt, 'd r, r -> d r')
+        weight_up_new = einsum(V, S_sqrt, 'e r, r -> e r')
+
+        population.weight_down[key][idx].copy_(weight_down_new)
+        population.weight_up[key][idx].copy_(weight_up_new)
+
+# M4
+def mutation_full_gaussian(
+    population: Population,
+    idx: int,
+    epsilon: float = 0.15,
+    **kwargs
+):
+    for key in population.weight_down.keys():
+        weight_down = population.weight_down[key][idx]
+        weight_up = population.weight_up[key][idx]
+
+        weight_down_noise = torch.randn_like(weight_down) * (epsilon * weight_down.std())
+        weight_up_noise = torch.randn_like(weight_up) * (epsilon * weight_up.std())
+
+        population.weight_down[key][idx].add_(weight_down_noise)
+        population.weight_up[key][idx].add_(weight_up_noise)
+
+# M5
+def mutation_neftune_style(
+    population: Population,
+    idx: int,
+    alpha: float = 10.0,
+    **kwargs
+):
+    for key in population.weight_down.keys():
+        weight_down = population.weight_down[key][idx]
+
+        numel = weight_down.numel()
+        bound = alpha / math.sqrt(numel)
+        eta = (torch.rand_like(weight_down) * 2 - 1) * bound
+
+        population.weight_down[key][idx].add_(eta)
+
+register_mutation('svd_structured', mutation_svd_structured)
+register_mutation('layer_selective_gaussian', mutation_layer_selective_gaussian)
+register_mutation('component_masking', mutation_component_masking)
+register_mutation('full_gaussian', mutation_full_gaussian)
+register_mutation('neftune_style', mutation_neftune_style)
 
 # main class
 
@@ -46,14 +182,16 @@ class Population(Module):
         pop_size: int,
         low_rank: int,
         lora_targets: tuple[str, ...] | list[str],
-        requires_grad: bool = False
+        requires_grad: bool = False,
+        mutation_registry: dict | None = None
     ):
         super().__init__()
         self.model = model
         self.pop_size = pop_size
+        self.mutation_registry = mutation_registry
 
-        self.w_down = ParameterDict()
-        self.w_up = ParameterDict()
+        self.weight_down = ParameterDict()
+        self.weight_up = ParameterDict()
         self._hooks = []
 
         for path in lora_targets:
@@ -63,15 +201,47 @@ class Population(Module):
             key = path.replace('.', '_')
             dim, dim_inner = linear.in_features, linear.out_features
 
-            self.w_down[key] = Parameter(torch.empty(pop_size, dim, low_rank), requires_grad = requires_grad)
-            self.w_up[key] = Parameter(torch.empty(pop_size, dim_inner, low_rank), requires_grad = requires_grad)
+            self.weight_down[key] = Parameter(torch.empty(pop_size, dim, low_rank), requires_grad = requires_grad)
+            self.weight_up[key] = Parameter(torch.empty(pop_size, dim_inner, low_rank), requires_grad = requires_grad)
 
-            init.normal_(self.w_down[key], std = dim ** -0.5)
-            init.normal_(self.w_up[key], std = low_rank ** -0.5)
+            init.normal_(self.weight_down[key], std = dim ** -0.5)
+            init.normal_(self.weight_up[key], std = low_rank ** -0.5)
 
             self._hooks.append(linear.register_forward_hook(self._create_hook(key)))
 
         self._individual = None
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @torch.no_grad()
+    def mutate(
+        self,
+        mutation_type: str,
+        individual: int | None = None,
+        individuals: tuple[int, ...] | list[int] | None = None,
+        all_individuals: bool = False,
+        **kwargs
+    ):
+        assert sum((exists(individual), exists(individuals), all_individuals)) == 1
+
+        mutation_registry = default(self.mutation_registry, MUTATION_REGISTRY)
+
+        if mutation_type not in mutation_registry:
+            raise ValueError(f'Unknown mutation type: {mutation_type}')
+
+        mutation_fn = mutation_registry[mutation_type]
+
+        if all_individuals:
+            indices = list(range(self.pop_size))
+        elif exists(individuals):
+            indices = list(individuals)
+        else:
+            indices = [individual]
+
+        for idx in indices:
+            mutation_fn(self, idx, **kwargs)
 
     @contextmanager
     def _route(self, individual, individuals, all_individuals):
@@ -109,18 +279,18 @@ class Population(Module):
             if not exists(self._individual) and self._individual is not ...:
                 return output
 
-            w_down, w_up = self.w_down[lora_key], self.w_up[lora_key]
+            weight_down, weight_up = self.weight_down[lora_key], self.weight_up[lora_key]
             x, = args
 
             if isinstance(self._individual, list) or self._individual is ...:
-                w_down_i, w_up_i = w_down[self._individual], w_up[self._individual]
-                p = w_down_i.shape[0]
+                weight_down_i, weight_up_i = weight_down[self._individual], weight_up[self._individual]
+                p = weight_down_i.shape[0]
 
                 x = rearrange(x, '(p b) ... -> p b ...', p = p)
-                lora_out = einsum(x, w_down_i, w_up_i, 'p b ... d, p d r, p e r -> p b ... e')
+                lora_out = einsum(x, weight_down_i, weight_up_i, 'p b ... d, p d r, p e r -> p b ... e')
                 lora_out = rearrange(lora_out, 'p b ... -> (p b) ...')
             else:
-                lora_out = einsum(x, w_down[self._individual], w_up[self._individual], '... d, d r, e r -> ... e')
+                lora_out = einsum(x, weight_down[self._individual], weight_up[self._individual], '... d, d r, e r -> ... e')
 
             return output + lora_out
 
