@@ -99,7 +99,7 @@ def test_mutations():
     # M1 on individual 0
 
     before = clone_weights()
-    pop.mutate('svd_structured', individual = 0)
+    pop.mutate_('svd_structured', individual = 0)
 
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][0], before[k][0])
@@ -108,7 +108,7 @@ def test_mutations():
     # M2 on subset
 
     before = clone_weights()
-    pop.mutate('layer_selective_gaussian', individuals = [1, 2])
+    pop.mutate_('layer_selective_gaussian', individuals = [1, 2])
 
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][1:3], before[k][1:3])
@@ -118,7 +118,7 @@ def test_mutations():
     # M3 on all
 
     before = clone_weights()
-    pop.mutate('component_masking', all_individuals = True)
+    pop.mutate_('component_masking', all_individuals = True)
 
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k], before[k])
@@ -126,7 +126,7 @@ def test_mutations():
     # M4
 
     before = clone_weights()
-    pop.mutate('full_gaussian', individual = 1)
+    pop.mutate_('full_gaussian', individual = 1)
 
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][1], before[k][1])
@@ -134,7 +134,7 @@ def test_mutations():
     # M5
 
     before = clone_weights()
-    pop.mutate('neftune_style', individual = 2)
+    pop.mutate_('neftune_style', individual = 2)
 
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][2], before[k][2])
@@ -142,7 +142,7 @@ def test_mutations():
     # unknown mutation
 
     with pytest.raises(AssertionError, match = 'unknown mutation type'):
-        pop.mutate('nonexistent_mutation', individual = 0)
+        pop.mutate_('nonexistent_mutation', individual = 0)
 
 def test_select():
     pop = Population(
@@ -156,7 +156,7 @@ def test_select():
 
     # deterministic
 
-    survivor_indices, culled_indices = pop.select(
+    survivor_indices, culled_indices, elites = pop.select(
         'deterministic',
         fitnesses,
         survive_frac = 0.5,
@@ -170,7 +170,7 @@ def test_select():
 
     # probabilistic
 
-    survivor_indices, culled_indices = pop.select(
+    survivor_indices, culled_indices, elites = pop.select(
         'probabilistic',
         fitnesses,
         survive_frac = 0.5,
@@ -182,7 +182,7 @@ def test_select():
 
     # FUSS
 
-    survivor_indices, culled_indices = pop.select(
+    survivor_indices, culled_indices, elites = pop.select(
         'fuss',
         fitnesses,
         survive_frac = 0.5,
@@ -206,7 +206,7 @@ def test_select():
         selection_registry = dict(every_other_two = select_every_other_two)
     )
 
-    survivor_indices, culled_indices = pop_custom.select(
+    survivor_indices, culled_indices, elites = pop_custom.select(
         'every_other_two',
         fitnesses,
         survive_frac = 0.5,
@@ -248,8 +248,58 @@ def test_custom_mutation():
     rand_idx = torch.randint(0, 2, (1,)).item()
     other_idx = 1 - rand_idx
 
-    pop.mutate('random_signs', individual = rand_idx)
+    pop.mutate_('random_signs', individual = rand_idx)
 
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][rand_idx], before[k][rand_idx])
         assert allclose(pop.weight_down[k][other_idx], before[k][other_idx])
+
+def test_evolution_generation():
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.1, 0.9, 0.5, 0.2])
+
+    # 1. survivor selection
+
+    survivor_indices, culled_indices, elite_indices = pop.select(
+        'deterministic',
+        fitnesses,
+        survive_frac = 0.5,
+        elite_frac = 0.25
+    )
+
+    assert survivor_indices.shape == (2,)
+    assert culled_indices.shape == (2,)
+
+    # 2. parent selection from survivors
+
+    survivor_fitnesses = fitnesses[survivor_indices]
+    num_children = len(culled_indices)
+
+    parent_indices_in_survivors = pop.select_parents(
+        'tournament',
+        survivor_fitnesses,
+        num_children = num_children,
+        num_parents_per_child = 2
+    )
+
+    assert parent_indices_in_survivors.shape == (2, 2)
+
+    # map back to original population indices
+    parent_indices = survivor_indices[parent_indices_in_survivors]
+
+    # 3. reproduction (crossover: average the selected parent weights)
+
+    pop.crossover_('average', parent_indices, culled_indices)
+
+    # 4. mutation on children (protecting elites)
+
+    pop.mutate_('full_gaussian', all_individuals = True, ignore_individuals = elite_indices)
+
+    # verify generation completed
+    assert True

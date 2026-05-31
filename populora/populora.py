@@ -171,7 +171,7 @@ register_mutation('neftune_style', mutation_neftune_style)
 # survivor selection
 
 SELECTION_REGISTRY = {}
-SelectionResult = namedtuple('SelectionResult', ['survivors', 'culled'])
+SelectionResult = namedtuple('SelectionResult', ['survivors', 'culled', 'elites'])
 
 def register_selection(name: str, fn: callable):
     SELECTION_REGISTRY[name] = fn
@@ -199,12 +199,6 @@ def with_elites(select_fn, elite_frac = 0.25):
 
         return torch.cat((elite_indices, remaining[selected]))
     return inner
-
-def to_centered_ranks(fitnesses):
-    ranks = fitnesses.argsort(dim = -1).argsort(dim = -1)
-    pop_size = fitnesses.shape[-1]
-    # center and scale to [-1, 1]
-    return (ranks.float() / max(1, pop_size - 1)) * 2 - 1
 
 def select_deterministic(fitnesses, num_select, **kwargs):
     return fitnesses.topk(num_select).indices
@@ -236,9 +230,72 @@ register_selection('deterministic', select_deterministic)
 register_selection('probabilistic', select_probabilistic)
 register_selection('fuss', select_fuss)
 
-# parent selection - todo
+# parent selection
 
-# crossover - todo
+PARENT_SELECTION_REGISTRY = {}
+
+def register_parent_selection(name: str, fn: callable):
+    PARENT_SELECTION_REGISTRY[name] = fn
+
+def parent_select_tournament(fitnesses, num_children, num_parents_per_child = 2, tournament_size = 3, **kwargs):
+    pop_size = fitnesses.shape[0]
+    device = fitnesses.device
+
+    contender_ids = torch.randn((num_children, pop_size), device = device).argsort(dim = -1)[..., :tournament_size]
+    tournaments = fitnesses[contender_ids]
+
+    if num_parents_per_child == 1:
+        winners = tournaments.argmax(dim = -1)
+        return contender_ids[torch.arange(num_children, device = device), winners].unsqueeze(-1)
+
+    top_winners = tournaments.topk(num_parents_per_child, dim = -1, largest = True, sorted = False).indices
+    return contender_ids.gather(-1, top_winners)
+
+def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps = 1e-5, **kwargs):
+    # fitness uniform selection scheme - Marcus Hutter https://arxiv.org/abs/cs/0103015
+
+    pop_size = fitnesses.shape[0]
+    sorted_fitness, sort_indices = fitnesses.sort()
+
+    all_equal = sorted_fitness[0] == sorted_fitness[-1]
+
+    if pop_size == 1 or all_equal:
+        return torch.randint(0, pop_size, (num_children, num_parents_per_child), device = fitnesses.device)
+
+    # voronoi cell sizes
+
+    padded = torch.cat((sorted_fitness[:1], sorted_fitness, sorted_fitness[-1:]))
+    voronoi_cell_sizes = (padded[2:] - padded[:-2]) / 2
+
+    selected = torch.multinomial(voronoi_cell_sizes + eps, num_children * num_parents_per_child, replacement = True)
+    selected = selected.reshape(num_children, num_parents_per_child)
+    return sort_indices[selected]
+
+def parent_select_roulette(fitnesses, num_children, num_parents_per_child = 2, temperature = 1., **kwargs):
+    probs = F.softmax(fitnesses / temperature, dim = -1)
+    selected = torch.multinomial(probs, num_children * num_parents_per_child, replacement = True)
+    return selected.reshape(num_children, num_parents_per_child)
+
+register_parent_selection('tournament', parent_select_tournament)
+register_parent_selection('fuss', parent_select_fuss)
+register_parent_selection('roulette', parent_select_roulette)
+
+# crossover
+
+CROSSOVER_REGISTRY = {}
+
+def register_crossover(name: str, fn: callable):
+    CROSSOVER_REGISTRY[name] = fn
+
+def crossover_average(population, parent_indices, child_indices, **kwargs):
+    for key in population.weight_down.keys():
+        weight_down_parents = population.weight_down[key].data[parent_indices]
+        weight_up_parents = population.weight_up[key].data[parent_indices]
+
+        population.weight_down[key].data[child_indices] = weight_down_parents.mean(dim = 1)
+        population.weight_up[key].data[child_indices] = weight_up_parents.mean(dim = 1)
+
+register_crossover('average', crossover_average)
 
 # main class
 
@@ -252,12 +309,16 @@ class Population(Module):
         lora_targets: tuple[str, ...] | list[str],
         requires_grad: bool = False,
         selection_registry: dict | None = None,
+        parent_selection_registry: dict | None = None,
+        crossover_registry: dict | None = None,
         mutation_registry: dict | None = None
     ):
         super().__init__()
         self.model = model
         self.pop_size = pop_size
         self.selection_registry = selection_registry
+        self.parent_selection_registry = parent_selection_registry
+        self.crossover_registry = crossover_registry
         self.mutation_registry = mutation_registry
 
         self.weight_down = ParameterDict()
@@ -286,12 +347,13 @@ class Population(Module):
         return next(self.parameters()).device
 
     @torch.no_grad()
-    def mutate(
+    def mutate_(
         self,
         mutation_type: str,
         individual: int | None = None,
-        individuals: tuple[int, ...] | list[int] | None = None,
+        individuals: tuple[int, ...] | list[int] | Tensor | None = None,
         all_individuals: bool = False,
+        ignore_individuals: tuple[int, ...] | list[int] | Tensor | None = None,
         **kwargs
     ):
         assert sum((exists(individual), exists(individuals), all_individuals)) == 1
@@ -308,6 +370,10 @@ class Population(Module):
         else:
             indices = (individual,)
 
+        if exists(ignore_individuals):
+            ignore_set = set(ignore_individuals.tolist() if isinstance(ignore_individuals, Tensor) else ignore_individuals)
+            indices = [i for i in indices if i not in ignore_set]
+
         for idx in indices:
             mutation_fn(self, idx, **kwargs)
 
@@ -318,22 +384,20 @@ class Population(Module):
         fitnesses: Tensor,
         survive_frac: float = 0.8,
         elite_frac: float = 0.25,
-        use_centered_ranks: bool = False,
         **kwargs
     ):
         assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
-
-        if use_centered_ranks:
-            fitnesses = to_centered_ranks(fitnesses)
 
         selection_registry = default(self.selection_registry, SELECTION_REGISTRY)
         assert selection_type in selection_registry, f'unknown selection type {selection_type}'
 
         num_survivors = max(1, int(self.pop_size * survive_frac))
+        num_elites = max(1, int(self.pop_size * elite_frac)) if elite_frac > 0. else 0
         all_indices = torch.arange(self.pop_size, device = self.device)
 
         if num_survivors >= self.pop_size:
-            return SelectionResult(all_indices, all_indices[:0])
+            elites = fitnesses.topk(num_elites).indices if num_elites > 0 else all_indices[:0]
+            return SelectionResult(all_indices, all_indices[:0], elites)
 
         select_fn = with_elites(selection_registry[selection_type], elite_frac)
         survivors = select_fn(fitnesses, num_survivors, **kwargs)
@@ -341,7 +405,41 @@ class Population(Module):
         mask = torch.ones(self.pop_size, dtype = torch.bool, device = self.device)
         mask[survivors] = False
 
-        return SelectionResult(survivors, all_indices[mask])
+        elites = survivors[:num_elites]
+        return SelectionResult(survivors, all_indices[mask], elites)
+
+    @torch.no_grad()
+    def select_parents(
+        self,
+        selection_type: str,
+        fitnesses: Tensor,
+        num_children: int,
+        num_parents_per_child: int = 2,
+        **kwargs
+    ):
+        assert fitnesses.ndim == 1
+
+        parent_selection_registry = default(self.parent_selection_registry, PARENT_SELECTION_REGISTRY)
+        assert selection_type in parent_selection_registry, f'unknown parent selection type {selection_type}'
+
+        select_fn = parent_selection_registry[selection_type]
+        parents = select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **kwargs)
+
+        return parents
+
+    @torch.no_grad()
+    def crossover_(
+        self,
+        crossover_type: str,
+        parent_indices: Tensor,
+        child_indices: Tensor,
+        **kwargs
+    ):
+        crossover_registry = default(self.crossover_registry, CROSSOVER_REGISTRY)
+        assert crossover_type in crossover_registry, f'unknown crossover type {crossover_type}'
+
+        crossover_fn = crossover_registry[crossover_type]
+        crossover_fn(self, parent_indices, child_indices, **kwargs)
 
     @contextmanager
     def _route(self, individual, individuals, all_individuals):
