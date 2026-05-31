@@ -1,4 +1,6 @@
 import pytest
+param = pytest.mark.parametrize
+
 import torch
 from torch import allclose
 
@@ -254,15 +256,16 @@ def test_custom_mutation():
         assert not allclose(pop.weight_down[k][rand_idx], before[k][rand_idx])
         assert allclose(pop.weight_down[k][other_idx], before[k][other_idx])
 
-def test_evolution_generation():
+@param('num_parents', [2, 3])
+def test_evolution_generation(num_parents):
     pop = Population(
         get_model(),
-        pop_size = 4,
+        pop_size = 6,
         low_rank = 2,
         lora_targets = ['attn_layers.layers.0.1.to_q']
     )
 
-    fitnesses = torch.tensor([0.1, 0.9, 0.5, 0.2])
+    fitnesses = torch.tensor([0.1, 0.9, 0.5, 0.2, 0.8, 0.6])
 
     # 1. survivor selection
 
@@ -273,8 +276,11 @@ def test_evolution_generation():
         elite_frac = 0.25
     )
 
-    assert survivor_indices.shape == (2,)
-    assert culled_indices.shape == (2,)
+    num_survivors = max(1, int(6 * 0.5))
+    num_culled = 6 - num_survivors
+
+    assert survivor_indices.shape == (num_survivors,)
+    assert culled_indices.shape == (num_culled,)
 
     # 2. parent selection from survivors
 
@@ -285,10 +291,10 @@ def test_evolution_generation():
         'tournament',
         survivor_fitnesses,
         num_children = num_children,
-        num_parents_per_child = 2
+        num_parents_per_child = num_parents
     )
 
-    assert parent_indices_in_survivors.shape == (2, 2)
+    assert parent_indices_in_survivors.shape == (num_children, num_parents)
 
     # map back to original population indices
     parent_indices = survivor_indices[parent_indices_in_survivors]
