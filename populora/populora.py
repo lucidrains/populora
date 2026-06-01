@@ -398,49 +398,35 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
     num_bad_parents = default(num_bad_parents, num_good_parents)
     pop_size = fitnesses.shape[-1]
 
-    tournament_size = min(max(kwargs.get('tournament_size', 3), num_bad_parents), pop_size)
+    tournament_size = min(max(kwargs.get('tournament_size', 3), num_bad_parents), pop_size - num_good_parents)
 
-    # 1. select bad parents via tournament on inverted fitnesses
+    # 1. select bad parents via tournament, excluding good parents without replacement
 
-    inverted_fitnesses = -fitnesses
-    inv_fit_expanded = repeat(inverted_fitnesses, 'p -> c p', c = num_children).clone()
+    rand = torch.randn((num_children, pop_size), device = device)
+    rand.scatter_(-1, parent_indices, -float('inf'))
 
-    inv_fit_expanded.scatter_(-1, parent_indices, -float('inf'))
+    contender_ids = rand.argsort(dim = -1, descending = True)[..., :tournament_size]
 
-    rand_shape = (num_children, pop_size)
-    contender_ids = torch.randn(rand_shape, device = device).argsort(dim = -1)[..., :tournament_size]
+    neg_fitnesses = repeat(-fitnesses, 'p -> c p', c = num_children).gather(-1, contender_ids)
 
-    tournaments = inv_fit_expanded.gather(-1, contender_ids)
-
-    if num_bad_parents == 1:
-        bad_parent_indices = contender_ids.gather(-1, tournaments.argmax(dim = -1, keepdim = True))
-    else:
-        top_winners = tournaments.topk(num_bad_parents, dim = -1, largest = True, sorted = False).indices
-        bad_parent_indices = contender_ids.gather(-1, top_winners)
+    worst_ids = neg_fitnesses.topk(num_bad_parents, dim = -1, largest = True, sorted = False).indices
+    bad_parent_indices = contender_ids.gather(-1, worst_ids)
 
     all_parent_indices = torch.cat((parent_indices, bad_parent_indices), dim = -1)
 
-    # 2. compute z-scores
+    # 2. compute z-scored weights
 
     selected_fitnesses = fitnesses[all_parent_indices]
+    weights = z_score(selected_fitnesses, dim = -1) / selected_fitnesses.shape[-1]
 
-    z_scores = z_score(selected_fitnesses, dim = -1)
-    weights = z_scores / z_scores.shape[-1]
-
-    # 3. apply update
+    # 3. apply update - mean + eta * weighted direction
 
     for key in population.weight_down:
         w_down = population.weight_down[key].data[all_parent_indices]
         w_up = population.weight_up[key].data[all_parent_indices]
 
-        w_down_mean = w_down.mean(dim = 1)
-        w_up_mean = w_up.mean(dim = 1)
-
-        w_down_update = einsum(weights, w_down, 'c p, c p ... -> c ...')
-        w_up_update = einsum(weights, w_up, 'c p, c p ... -> c ...')
-
-        population.weight_down[key].data[child_indices] = w_down_mean + eta * w_down_update
-        population.weight_up[key].data[child_indices] = w_up_mean + eta * w_up_update
+        population.weight_down[key].data[child_indices] = w_down.mean(dim = 1) + eta * einsum(weights, w_down, 'c p, c p ... -> c ...')
+        population.weight_up[key].data[child_indices] = w_up.mean(dim = 1) + eta * einsum(weights, w_up, 'c p, c p ... -> c ...')
 
 register_crossover('xes', crossover_xes)
 
