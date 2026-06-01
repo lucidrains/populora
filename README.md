@@ -51,3 +51,15 @@ Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727
     url     = {https://arxiv.org/abs/2604.20209},
 }
 ```
+
+```bibtex
+@misc{fleuret2025freetransformer,
+    title   = {The Free Transformer},
+    author  = {François Fleuret},
+    year    = {2025},
+    eprint  = {2510.17558},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2510.17558},
+}
+```
