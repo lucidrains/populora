@@ -45,6 +45,11 @@ def _efficient_svd_of_lora(weight_down, weight_up):
 def skew_symmetrize(t):
     return (t - rearrange(t, 'i j -> j i')) / 2
 
+def z_score(t, dim = -1, eps = 1e-5):
+    mean = t.mean(dim = dim, keepdim = True)
+    std = t.std(dim = dim, keepdim = True).clamp(min = eps)
+    return (t - mean) / std
+
 # mutations
 
 MUTATION_REGISTRY = {}
@@ -303,7 +308,7 @@ CROSSOVER_REGISTRY = {}
 def register_crossover(name: str, fn: callable):
     CROSSOVER_REGISTRY[name] = fn
 
-def crossover_average(population, parent_indices, child_indices, **kwargs):
+def crossover_average(population, parent_indices, child_indices, fitnesses = None, **kwargs):
     for key in population.weight_down:
         w_down = population.weight_down[key].data[parent_indices]
         w_up = population.weight_up[key].data[parent_indices]
@@ -312,7 +317,7 @@ def crossover_average(population, parent_indices, child_indices, **kwargs):
         population.weight_up[key].data[child_indices] = w_up.mean(dim = 1)
 
 # X1
-def crossover_dare(population, parent_indices, child_indices, p = 0.7, **kwargs):
+def crossover_dare(population, parent_indices, child_indices, p = 0.7, fitnesses = None, **kwargs):
     for key in population.weight_down:
         w_down = population.weight_down[key].data[parent_indices]
         w_up = population.weight_up[key].data[parent_indices]
@@ -324,7 +329,7 @@ def crossover_dare(population, parent_indices, child_indices, p = 0.7, **kwargs)
         population.weight_up[key].data[child_indices] = w_up_dropped.mean(dim = 1)
 
 # X2
-def crossover_layer_wise(population, parent_indices, child_indices, **kwargs):
+def crossover_layer_wise(population, parent_indices, child_indices, fitnesses = None, **kwargs):
     num_children, num_parents = parent_indices.shape
     device = population.device
     batch_indices = torch.arange(num_children, device = device)
@@ -339,7 +344,7 @@ def crossover_layer_wise(population, parent_indices, child_indices, **kwargs):
         population.weight_up[key].data[child_indices] = w_up[batch_indices, parent_choice]
 
 # X3
-def crossover_svd_subspace(population, parent_indices, child_indices, **kwargs):
+def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses = None, **kwargs):
     num_children, num_parents = parent_indices.shape
     assert num_parents == 2, 'svd subspace crossover requires exactly 2 parents'
 
@@ -365,7 +370,7 @@ def crossover_svd_subspace(population, parent_indices, child_indices, **kwargs):
             population.weight_up[key].data[child_indices[i]] = V_child * S_sqrt
 
 # X4
-def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, **kwargs):
+def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, fitnesses = None, **kwargs):
     num_children, num_parents = parent_indices.shape
     assert num_parents == 2, 'extrapolative crossover requires exactly 2 parents'
 
@@ -383,6 +388,61 @@ register_crossover('dare', crossover_dare)
 register_crossover('layer_wise', crossover_layer_wise)
 register_crossover('svd_subspace', crossover_svd_subspace)
 register_crossover('extrapolative', crossover_extrapolative)
+
+# X5
+def crossover_xes(population, parent_indices, child_indices, fitnesses = None, num_bad_parents = None, eta = 1.0, **kwargs):
+    assert exists(fitnesses), 'XES crossover requires fitnesses'
+
+    device = population.device
+    num_children, num_good_parents = parent_indices.shape
+    num_bad_parents = default(num_bad_parents, num_good_parents)
+    pop_size = fitnesses.shape[-1]
+
+    tournament_size = min(max(kwargs.get('tournament_size', 3), num_bad_parents), pop_size)
+
+    # 1. select bad parents via tournament on inverted fitnesses
+
+    inverted_fitnesses = -fitnesses
+    inv_fit_expanded = repeat(inverted_fitnesses, 'p -> c p', c = num_children).clone()
+
+    inv_fit_expanded.scatter_(-1, parent_indices, -float('inf'))
+
+    rand_shape = (num_children, pop_size)
+    contender_ids = torch.randn(rand_shape, device = device).argsort(dim = -1)[..., :tournament_size]
+
+    tournaments = inv_fit_expanded.gather(-1, contender_ids)
+
+    if num_bad_parents == 1:
+        bad_parent_indices = contender_ids.gather(-1, tournaments.argmax(dim = -1, keepdim = True))
+    else:
+        top_winners = tournaments.topk(num_bad_parents, dim = -1, largest = True, sorted = False).indices
+        bad_parent_indices = contender_ids.gather(-1, top_winners)
+
+    all_parent_indices = torch.cat((parent_indices, bad_parent_indices), dim = -1)
+
+    # 2. compute z-scores
+
+    selected_fitnesses = fitnesses[all_parent_indices]
+
+    z_scores = z_score(selected_fitnesses, dim = -1)
+    weights = z_scores / z_scores.shape[-1]
+
+    # 3. apply update
+
+    for key in population.weight_down:
+        w_down = population.weight_down[key].data[all_parent_indices]
+        w_up = population.weight_up[key].data[all_parent_indices]
+
+        w_down_mean = w_down.mean(dim = 1)
+        w_up_mean = w_up.mean(dim = 1)
+
+        w_down_update = einsum(weights, w_down, 'c p, c p ... -> c ...')
+        w_up_update = einsum(weights, w_up, 'c p, c p ... -> c ...')
+
+        population.weight_down[key].data[child_indices] = w_down_mean + eta * w_down_update
+        population.weight_up[key].data[child_indices] = w_up_mean + eta * w_up_update
+
+register_crossover('xes', crossover_xes)
 
 # main class
 
@@ -573,10 +633,14 @@ class Population(Module):
         crossover_type: str,
         parent_indices: Tensor,
         child_indices: Tensor,
+        fitnesses: Tensor | None = None,
         **kwargs
     ):
         crossover_registry = default(self.crossover_registry, CROSSOVER_REGISTRY)
         assert crossover_type in crossover_registry, f'unknown crossover type {crossover_type}'
+
+        if exists(fitnesses):
+            kwargs = {**kwargs, 'fitnesses': fitnesses}
 
         crossover_fn = crossover_registry[crossover_type]
         crossover_fn(self, parent_indices, child_indices, **kwargs)

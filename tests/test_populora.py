@@ -295,6 +295,45 @@ def test_crossovers():
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
 
+    # X5 XES
+    before = clone_weights()
+    fitnesses = torch.tensor([0.9, 0.8, 0.1, 0.2])
+    pop.crossover_('xes', parent_indices, child_indices, fitnesses = fitnesses)
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
+
+def test_crossover_xes():
+    pop = Population(
+        get_model(),
+        pop_size = 6,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.9, 0.8, 0.1, 0.2, 0.5, 0.6])
+
+    # good parents: 0 and 1
+    # bad parents should be chosen from [2, 3, 4, 5], but inverted fitness means [2, 3] will be strongly favored.
+    parent_indices = torch.tensor([[0, 1]])
+    child_indices = torch.tensor([4])
+
+    def clone_weights():
+        return {k: v.clone() for k, v in pop.weight_down.items()}
+
+    before = clone_weights()
+
+    # Run with eta = 0.0 (should just be the mean of good and bad parents)
+    pop.crossover_('xes', parent_indices, child_indices, fitnesses = fitnesses, eta = 0.0)
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][4], before[k][4])
+
+    # Run with larger eta
+    pop.crossover_('xes', parent_indices, child_indices, fitnesses = fitnesses, eta = 1.0)
+
+    # Verify that without fitnesses it raises an assertion
+    with pytest.raises(AssertionError, match = 'XES crossover requires fitnesses'):
+        pop.crossover_('xes', parent_indices, child_indices)
+
 @param('num_parents', [2, 3])
 def test_evolution_generation(num_parents):
     pop = Population(
