@@ -256,6 +256,44 @@ def test_custom_mutation():
         assert not allclose(pop.weight_down[k][rand_idx], before[k][rand_idx])
         assert allclose(pop.weight_down[k][other_idx], before[k][other_idx])
 
+def test_crossovers():
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    parent_indices = torch.tensor([[0, 1], [0, 1]])
+    child_indices = torch.tensor([2, 3])
+
+    def clone_weights():
+        return {k: v.clone() for k, v in pop.weight_down.items()}
+
+    # X1 DARE
+    before = clone_weights()
+    pop.crossover_('dare', parent_indices, child_indices)
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
+
+    # X2 Layer-wise
+    before = clone_weights()
+    pop.crossover_('layer_wise', parent_indices, child_indices)
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
+
+    # X3 SVD Subspace
+    before = clone_weights()
+    pop.crossover_('svd_subspace', parent_indices, child_indices)
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
+
+    # X4 Extrapolative
+    before = clone_weights()
+    pop.crossover_('extrapolative', parent_indices, child_indices)
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
+
 @param('num_parents', [2, 3])
 def test_evolution_generation(num_parents):
     pop = Population(

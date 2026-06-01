@@ -288,14 +288,85 @@ def register_crossover(name: str, fn: callable):
     CROSSOVER_REGISTRY[name] = fn
 
 def crossover_average(population, parent_indices, child_indices, **kwargs):
-    for key in population.weight_down.keys():
-        weight_down_parents = population.weight_down[key].data[parent_indices]
-        weight_up_parents = population.weight_up[key].data[parent_indices]
+    for key in population.weight_down:
+        w_down = population.weight_down[key].data[parent_indices]
+        w_up = population.weight_up[key].data[parent_indices]
 
-        population.weight_down[key].data[child_indices] = weight_down_parents.mean(dim = 1)
-        population.weight_up[key].data[child_indices] = weight_up_parents.mean(dim = 1)
+        population.weight_down[key].data[child_indices] = w_down.mean(dim = 1)
+        population.weight_up[key].data[child_indices] = w_up.mean(dim = 1)
+
+# X1
+def crossover_dare(population, parent_indices, child_indices, p = 0.7, **kwargs):
+    for key in population.weight_down:
+        w_down = population.weight_down[key].data[parent_indices]
+        w_up = population.weight_up[key].data[parent_indices]
+
+        w_down_dropped = F.dropout(w_down, p = p, training = True)
+        w_up_dropped = F.dropout(w_up, p = p, training = True)
+
+        population.weight_down[key].data[child_indices] = w_down_dropped.mean(dim = 1)
+        population.weight_up[key].data[child_indices] = w_up_dropped.mean(dim = 1)
+
+# X2
+def crossover_layer_wise(population, parent_indices, child_indices, **kwargs):
+    num_children, num_parents = parent_indices.shape
+    device = population.device
+    batch_indices = torch.arange(num_children, device = device)
+
+    for key in population.weight_down:
+        w_down = population.weight_down[key].data[parent_indices]
+        w_up = population.weight_up[key].data[parent_indices]
+
+        parent_choice = torch.randint(0, num_parents, (num_children,), device = device)
+
+        population.weight_down[key].data[child_indices] = w_down[batch_indices, parent_choice]
+        population.weight_up[key].data[child_indices] = w_up[batch_indices, parent_choice]
+
+# X3
+def crossover_svd_subspace(population, parent_indices, child_indices, **kwargs):
+    num_children, num_parents = parent_indices.shape
+    assert num_parents == 2, 'svd subspace crossover requires exactly 2 parents'
+
+    for key in population.weight_down:
+        w_down = population.weight_down[key].data[parent_indices]
+        w_up = population.weight_up[key].data[parent_indices]
+
+        r = w_down.shape[-1]
+
+        for i in range(num_children):
+            U1, S1, V1 = _efficient_svd_of_lora(w_down[i, 0], w_up[i, 0])
+            U2, S2, V2 = _efficient_svd_of_lora(w_down[i, 1], w_up[i, 1])
+
+            k = torch.randint(1, r, (1,)).item() if r > 1 else 1
+
+            U_child = torch.cat((U1[:, :k], U2[:, k:]), dim = 1)
+            S_child = torch.cat((S1[:k], S2[k:]), dim = 0)
+            V_child = torch.cat((V1[:, :k], V2[:, k:]), dim = 1)
+
+            S_sqrt = torch.sqrt(S_child)
+
+            population.weight_down[key].data[child_indices[i]] = U_child * S_sqrt
+            population.weight_up[key].data[child_indices[i]] = V_child * S_sqrt
+
+# X4
+def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, **kwargs):
+    num_children, num_parents = parent_indices.shape
+    assert num_parents == 2, 'extrapolative crossover requires exactly 2 parents'
+
+    eta = random.uniform(eta_min, eta_max)
+
+    for key in population.weight_down:
+        w_down = population.weight_down[key].data[parent_indices]
+        w_up = population.weight_up[key].data[parent_indices]
+
+        population.weight_down[key].data[child_indices] = w_down[:, 0].lerp(w_down[:, 1], eta)
+        population.weight_up[key].data[child_indices] = w_up[:, 0].lerp(w_up[:, 1], eta)
 
 register_crossover('average', crossover_average)
+register_crossover('dare', crossover_dare)
+register_crossover('layer_wise', crossover_layer_wise)
+register_crossover('svd_subspace', crossover_svd_subspace)
+register_crossover('extrapolative', crossover_extrapolative)
 
 # main class
 
