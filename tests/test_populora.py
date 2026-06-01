@@ -5,6 +5,7 @@ import torch
 from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
+from einops import rearrange
 from populora import Population, Populations, PopuLoRA, register_mutation
 
 # helper
@@ -345,5 +346,30 @@ def test_evolution_generation(num_parents):
 
     pop.mutate_('full_gaussian', all_individuals = True, ignore_individuals = elite_indices)
 
-    # verify generation completed
-    assert True
+def test_islands_no_influence():
+    pop = Population(
+        get_model(),
+        pop_size = 12,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.rand(12)
+
+    # 1. verify survivor selection never crosses islands
+
+    survivors, *_ = pop.select('deterministic', fitnesses, survive_frac = 0.5, elite_frac = 0.25, num_groups = 3)
+
+    survivors = rearrange(survivors, '(g s) -> g s', g = 3)
+    group_indices = rearrange(torch.arange(3), 'g -> g 1')
+
+    assert (survivors // 4 == group_indices).all(), 'survivors crossed island boundaries'
+
+    # 2. verify parent selection never crosses islands
+
+    parents = pop.select_parents('tournament', fitnesses, num_children = 6, num_parents_per_child = 2, num_groups = 3)
+
+    parents = rearrange(parents, '(g c) p -> g c p', g = 3)
+    group_indices = rearrange(torch.arange(3), 'g -> g 1 1')
+
+    assert (parents // 4 == group_indices).all(), 'parents crossed island boundaries'
