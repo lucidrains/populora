@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from collections import namedtuple
 
 import torch
-from torch import Tensor
+from torch import Tensor, cat, stack
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from torch.linalg import qr, svd
@@ -66,11 +66,11 @@ def mutation_svd_structured(
 ):
     device = population.device
 
-    for key in population.weight_down.keys():
-        weight_down = population.weight_down[key][idx]
-        weight_up = population.weight_up[key][idx]
+    for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down = weight_down[idx]
+        w_up = weight_up[idx]
 
-        U, S, V = _efficient_svd_of_lora(weight_down, weight_up)
+        U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
 
         z = torch.randn_like(S)
@@ -86,11 +86,8 @@ def mutation_svd_structured(
         V_new = einsum(V, R_V, 'e r, r s -> e s')
 
         S_sqrt = torch.sqrt(S_new)
-        weight_down_new = einsum(U_new, S_sqrt, 'd r, r -> d r')
-        weight_up_new = einsum(V_new, S_sqrt, 'e r, r -> e r')
-
-        population.weight_down[key][idx].copy_(weight_down_new)
-        population.weight_up[key][idx].copy_(weight_up_new)
+        weight_down[idx].copy_(einsum(U_new, S_sqrt, 'd r, r -> d r'))
+        weight_up[idx].copy_(einsum(V_new, S_sqrt, 'e r, r -> e r'))
 
 # M2
 def mutation_layer_selective_gaussian(
@@ -121,11 +118,11 @@ def mutation_component_masking(
 ):
     device = population.device
 
-    for key in population.weight_down.keys():
-        weight_down = population.weight_down[key][idx]
-        weight_up = population.weight_up[key][idx]
+    for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down = weight_down[idx]
+        w_up = weight_up[idx]
 
-        U, S, V = _efficient_svd_of_lora(weight_down, weight_up)
+        U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
 
         num_drop = math.ceil(rho * r)
@@ -135,11 +132,8 @@ def mutation_component_masking(
         S_new[drop_indices] = 0.0
 
         S_sqrt = torch.sqrt(S_new)
-        weight_down_new = einsum(U, S_sqrt, 'd r, r -> d r')
-        weight_up_new = einsum(V, S_sqrt, 'e r, r -> e r')
-
-        population.weight_down[key][idx].copy_(weight_down_new)
-        population.weight_up[key][idx].copy_(weight_up_new)
+        weight_down[idx].copy_(einsum(U, S_sqrt, 'd r, r -> d r'))
+        weight_up[idx].copy_(einsum(V, S_sqrt, 'e r, r -> e r'))
 
 # M4
 def mutation_full_gaussian(
@@ -148,12 +142,12 @@ def mutation_full_gaussian(
     epsilon: float = 0.15,
     **kwargs
 ):
-    for key in population.weight_down.keys():
-        weight_down = population.weight_down[key][idx]
-        weight_up = population.weight_up[key][idx]
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down_i = w_down[idx]
+        w_up_i = w_up[idx]
 
-        weight_down.add_(torch.randn_like(weight_down), alpha = epsilon * weight_down.std())
-        weight_up.add_(torch.randn_like(weight_up), alpha = epsilon * weight_up.std())
+        w_down_i.add_(torch.randn_like(w_down_i), alpha = epsilon * w_down_i.std())
+        w_up_i.add_(torch.randn_like(w_up_i), alpha = epsilon * w_up_i.std())
 
 # M5
 def mutation_neftune_style(
@@ -162,13 +156,13 @@ def mutation_neftune_style(
     alpha: float = 10.0,
     **kwargs
 ):
-    for key in population.weight_down.keys():
-        weight_down = population.weight_down[key][idx]
+    for weight_down in population.weight_down.values():
+        w_down = weight_down[idx]
 
-        bound = alpha / math.sqrt(weight_down.numel())
-        noise = torch.rand_like(weight_down).mul_(2).sub_(1)
+        bound = alpha / math.sqrt(w_down.numel())
+        noise = torch.empty_like(w_down).uniform_(-bound, bound)
 
-        weight_down.add_(noise, alpha = bound)
+        w_down.add_(noise)
 
 register_mutation('svd_structured', mutation_svd_structured)
 register_mutation('layer_selective_gaussian', mutation_layer_selective_gaussian)
@@ -209,7 +203,7 @@ def with_elites(select_fn, elite_frac = 0.25):
 
         mapped_selected = remaining_indices.gather(-1, selected)
 
-        return torch.cat((elite_indices, mapped_selected), dim=-1)
+        return cat((elite_indices, mapped_selected), dim=-1)
     return inner
 
 def select_deterministic(fitnesses, num_select, **kwargs):
@@ -230,7 +224,7 @@ def select_fuss(fitnesses, num_select, eps = 1e-5, **kwargs):
 
     # voronoi cell sizes
 
-    padded = torch.cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim=-1)
+    padded = cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim=-1)
     voronoi_cell_sizes = (padded[..., 2:] - padded[..., :-2]) / 2
 
     # when all equal, voronoi cell sizes are 0, plus eps falls back to uniform
@@ -281,7 +275,7 @@ def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps =
 
     # voronoi cell sizes
 
-    padded = torch.cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim=-1)
+    padded = cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim=-1)
     voronoi_cell_sizes = (padded[..., 2:] - padded[..., :-2]) / 2
 
     num_samples = num_children * num_parents_per_child
@@ -297,9 +291,28 @@ def parent_select_roulette(fitnesses, num_children, num_parents_per_child = 2, t
     selected = torch.multinomial(probs, num_samples, replacement = True)
     return rearrange(selected, '... (c p) -> ... c p', c = num_children)
 
+def parent_select_queen_bee(fitnesses, num_children, num_parents_per_child = 2, tournament_size = 3, num_elites = 1, **kwargs):
+    # queen-bee mutant-bee evolution - Jung 2007 https://www.researchgate.net/publication/290131255
+
+    device = fitnesses.device
+    batch_shape = fitnesses.shape[:-1]
+
+    elites = fitnesses.topk(num_elites, dim = -1).indices
+    queen_indices = torch.randint(0, elites.shape[-1], (*batch_shape, num_children, 1), device = device)
+
+    if elites.ndim == 1:
+        queens = elites[queen_indices]
+    else:
+        queens = repeat(elites, '... e -> ... c e', c = num_children).gather(-1, queen_indices)
+
+    drones = parent_select_tournament(fitnesses, num_children, num_parents_per_child = num_parents_per_child - 1, tournament_size = tournament_size, **kwargs)
+
+    return cat((queens, drones), dim = -1)
+
 register_parent_selection('tournament', parent_select_tournament)
 register_parent_selection('fuss', parent_select_fuss)
 register_parent_selection('roulette', parent_select_roulette)
+register_parent_selection('queen_bee', parent_select_queen_bee)
 
 # crossover
 
@@ -309,65 +322,58 @@ def register_crossover(name: str, fn: callable):
     CROSSOVER_REGISTRY[name] = fn
 
 def crossover_average(population, parent_indices, child_indices, fitnesses = None, **kwargs):
-    for key in population.weight_down:
-        w_down = population.weight_down[key].data[parent_indices]
-        w_up = population.weight_up[key].data[parent_indices]
-
-        population.weight_down[key].data[child_indices] = w_down.mean(dim = 1)
-        population.weight_up[key].data[child_indices] = w_up.mean(dim = 1)
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down.data[child_indices] = w_down.data[parent_indices].mean(dim = 1)
+        w_up.data[child_indices] = w_up.data[parent_indices].mean(dim = 1)
 
 # X1
 def crossover_dare(population, parent_indices, child_indices, p = 0.7, fitnesses = None, **kwargs):
-    for key in population.weight_down:
-        w_down = population.weight_down[key].data[parent_indices]
-        w_up = population.weight_up[key].data[parent_indices]
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down_parents = w_down.data[parent_indices]
+        w_up_parents = w_up.data[parent_indices]
 
-        w_down_dropped = F.dropout(w_down, p = p, training = True)
-        w_up_dropped = F.dropout(w_up, p = p, training = True)
+        w_down_dropped = F.dropout(w_down_parents, p = p, training = True)
+        w_up_dropped = F.dropout(w_up_parents, p = p, training = True)
 
-        population.weight_down[key].data[child_indices] = w_down_dropped.mean(dim = 1)
-        population.weight_up[key].data[child_indices] = w_up_dropped.mean(dim = 1)
+        w_down.data[child_indices] = w_down_dropped.mean(dim = 1)
+        w_up.data[child_indices] = w_up_dropped.mean(dim = 1)
 
 # X2
 def crossover_layer_wise(population, parent_indices, child_indices, fitnesses = None, **kwargs):
     num_children, num_parents = parent_indices.shape
     device = population.device
     batch_indices = torch.arange(num_children, device = device)
+    parent_choice = torch.randint(0, num_parents, (num_children,), device = device)
 
-    for key in population.weight_down:
-        w_down = population.weight_down[key].data[parent_indices]
-        w_up = population.weight_up[key].data[parent_indices]
-
-        parent_choice = torch.randint(0, num_parents, (num_children,), device = device)
-
-        population.weight_down[key].data[child_indices] = w_down[batch_indices, parent_choice]
-        population.weight_up[key].data[child_indices] = w_up[batch_indices, parent_choice]
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down.data[child_indices] = w_down.data[parent_indices][batch_indices, parent_choice]
+        w_up.data[child_indices] = w_up.data[parent_indices][batch_indices, parent_choice]
 
 # X3
 def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses = None, **kwargs):
     num_children, num_parents = parent_indices.shape
     assert num_parents == 2, 'svd subspace crossover requires exactly 2 parents'
 
-    for key in population.weight_down:
-        w_down = population.weight_down[key].data[parent_indices]
-        w_up = population.weight_up[key].data[parent_indices]
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down_parents = w_down.data[parent_indices]
+        w_up_parents = w_up.data[parent_indices]
 
-        r = w_down.shape[-1]
+        r = w_down_parents.shape[-1]
 
         for i in range(num_children):
-            U1, S1, V1 = _efficient_svd_of_lora(w_down[i, 0], w_up[i, 0])
-            U2, S2, V2 = _efficient_svd_of_lora(w_down[i, 1], w_up[i, 1])
+            U1, S1, V1 = _efficient_svd_of_lora(w_down_parents[i, 0], w_up_parents[i, 0])
+            U2, S2, V2 = _efficient_svd_of_lora(w_down_parents[i, 1], w_up_parents[i, 1])
 
             k = torch.randint(1, r, (1,)).item() if r > 1 else 1
 
-            U_child = torch.cat((U1[:, :k], U2[:, k:]), dim = 1)
-            S_child = torch.cat((S1[:k], S2[k:]), dim = 0)
-            V_child = torch.cat((V1[:, :k], V2[:, k:]), dim = 1)
+            U_child = cat((U1[:, :k], U2[:, k:]), dim = 1)
+            S_child = cat((S1[:k], S2[k:]), dim = 0)
+            V_child = cat((V1[:, :k], V2[:, k:]), dim = 1)
 
             S_sqrt = torch.sqrt(S_child)
 
-            population.weight_down[key].data[child_indices[i]] = U_child * S_sqrt
-            population.weight_up[key].data[child_indices[i]] = V_child * S_sqrt
+            w_down.data[child_indices[i]] = U_child * S_sqrt
+            w_up.data[child_indices[i]] = V_child * S_sqrt
 
 # X4
 def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, fitnesses = None, **kwargs):
@@ -376,12 +382,12 @@ def crossover_extrapolative(population, parent_indices, child_indices, eta_min =
 
     eta = random.uniform(eta_min, eta_max)
 
-    for key in population.weight_down:
-        w_down = population.weight_down[key].data[parent_indices]
-        w_up = population.weight_up[key].data[parent_indices]
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down_parents = w_down.data[parent_indices]
+        w_up_parents = w_up.data[parent_indices]
 
-        population.weight_down[key].data[child_indices] = w_down[:, 0].lerp(w_down[:, 1], eta)
-        population.weight_up[key].data[child_indices] = w_up[:, 0].lerp(w_up[:, 1], eta)
+        w_down.data[child_indices] = w_down_parents[:, 0].lerp(w_down_parents[:, 1], eta)
+        w_up.data[child_indices] = w_up_parents[:, 0].lerp(w_up_parents[:, 1], eta)
 
 register_crossover('average', crossover_average)
 register_crossover('dare', crossover_dare)
@@ -412,7 +418,7 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
     worst_ids = neg_fitnesses.topk(num_bad_parents, dim = -1, largest = True, sorted = False).indices
     bad_parent_indices = contender_ids.gather(-1, worst_ids)
 
-    all_parent_indices = torch.cat((parent_indices, bad_parent_indices), dim = -1)
+    all_parent_indices = cat((parent_indices, bad_parent_indices), dim = -1)
 
     # 2. compute z-scored weights
 
@@ -421,12 +427,12 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
 
     # 3. apply update - mean + eta * weighted direction
 
-    for key in population.weight_down:
-        w_down = population.weight_down[key].data[all_parent_indices]
-        w_up = population.weight_up[key].data[all_parent_indices]
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down_parents = w_down.data[all_parent_indices]
+        w_up_parents = w_up.data[all_parent_indices]
 
-        population.weight_down[key].data[child_indices] = w_down.mean(dim = 1) + eta * einsum(weights, w_down, 'c p, c p ... -> c ...')
-        population.weight_up[key].data[child_indices] = w_up.mean(dim = 1) + eta * einsum(weights, w_up, 'c p, c p ... -> c ...')
+        w_down.data[child_indices] = w_down_parents.mean(dim = 1) + eta * einsum(weights, w_down_parents, 'c p, c p ... -> c ...')
+        w_up.data[child_indices] = w_up_parents.mean(dim = 1) + eta * einsum(weights, w_up_parents, 'c p, c p ... -> c ...')
 
 register_crossover('xes', crossover_xes)
 

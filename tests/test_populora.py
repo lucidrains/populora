@@ -412,3 +412,27 @@ def test_islands_no_influence():
     group_indices = rearrange(torch.arange(3), 'g -> g 1 1')
 
     assert (parents // 4 == group_indices).all(), 'parents crossed island boundaries'
+
+def test_parent_select_queen_bee():
+    pop = Population(
+        get_model(),
+        pop_size = 6,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.1, 0.9, 0.5, 0.2, 0.8, 0.6])
+
+    # select 3 survivors, and 1 elite
+    survivor_indices, culled_indices, elite_indices = pop.select(
+        'deterministic',
+        fitnesses,
+        survive_frac = 0.5,
+        elite_frac = 0.33
+    )
+
+    survivor_fitnesses = fitnesses[survivor_indices]
+
+    # queen bee selection just uses the top individuals from fitnesses as queens
+    parents = pop.select_parents('queen_bee', survivor_fitnesses, num_children = 3, num_parents_per_child = 2)
+    assert parents.shape == (3, 2)
