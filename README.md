@@ -29,6 +29,18 @@ Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727
 ```
 
 ```bibtex
+@misc{xu2026selfimprovinglanguagemodelsbidirectional,
+    title   = {Self-Improving Language Models with Bidirectional Evolutionary Search},
+    author  = {Guowei Xu and Zhenting Qi and Huangyuan Su and Weirui Ye and Himabindu Lakkaraju and Sham M. Kakade and Yilun Du},
+    year    = {2026},
+    eprint  = {2605.28814},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL},
+    url     = {https://arxiv.org/abs/2605.28814},
+}
+```
+
+```bibtex
 @misc{bahlousboldi2026vectorpolicyoptimizationtraining,
     title   = {Vector Policy Optimization: Training for Diversity Improves Test-Time Search},
     author  = {Ryan Bahlous-Boldi and Isha Puri and Idan Shenfeld and Akarsh Kumar and Mehul Damani and Sebastian Risi and Omar Khattab and Zhang-Wei Hong and Pulkit Agrawal},
