@@ -502,8 +502,9 @@ def reinit_es(
     island_idx: int,
     num_islands: int,
     fitnesses: Tensor,
+    elite_frac: float = 0.25,
     eta: float = 1.0,
-    noise_std: float = 0.01,
+    noise_std_min: float = 1e-5,
     **kwargs
 ):
     assert exists(fitnesses), 'ES reinit requires fitnesses'
@@ -516,6 +517,9 @@ def reinit_es(
     island_fitnesses = fitnesses[island_indices]
     weights = z_score(island_fitnesses, dim = -1) / island_size
 
+    num_elites = max(1, int(island_size * elite_frac))
+    elite_local_indices = island_fitnesses.topk(num_elites, dim = -1).indices
+
     for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
         w_down_island = w_down.data[island_indices]
         w_up_island = w_up.data[island_indices]
@@ -523,8 +527,11 @@ def reinit_es(
         w_down_mean = w_down_island.mean(dim = 0) + eta * einsum(weights, w_down_island, 'p, p ... -> ...')
         w_up_mean = w_up_island.mean(dim = 0) + eta * einsum(weights, w_up_island, 'p, p ... -> ...')
 
-        w_down.data[island_indices] = w_down_mean + torch.randn_like(w_down_island) * noise_std
-        w_up.data[island_indices] = w_up_mean + torch.randn_like(w_up_island) * noise_std
+        w_down_std = w_down_island[elite_local_indices].std(dim = 0, unbiased = False).clamp(min = noise_std_min)
+        w_up_std = w_up_island[elite_local_indices].std(dim = 0, unbiased = False).clamp(min = noise_std_min)
+
+        w_down.data[island_indices] = w_down_mean + torch.randn_like(w_down_island) * w_down_std
+        w_up.data[island_indices] = w_up_mean + torch.randn_like(w_up_island) * w_up_std
 
 def reinit_pool_and_breed(
     population: Population,

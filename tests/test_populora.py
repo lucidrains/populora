@@ -528,4 +528,3 @@ def test_reinit_islands():
     for k in pop.weight_down.keys():
         assert allclose(pop.weight_down[k][0:6], before[k][0:6])
         assert allclose(pop.weight_down[k][6:8], torch.zeros_like(pop.weight_down[k][6:8]))
-
