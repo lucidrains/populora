@@ -436,3 +436,96 @@ def test_parent_select_queen_bee():
     # queen bee selection just uses the top individuals from fitnesses as queens
     parents = pop.select_parents('queen_bee', survivor_fitnesses, num_children = 3, num_parents_per_child = 2)
     assert parents.shape == (3, 2)
+
+def test_migration():
+    pop = Population(
+        get_model(),
+        pop_size = 8,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.9, 0.1, 0.8, 0.2, 0.7, 0.3, 0.6, 0.4])
+
+    def clone_weights():
+        return {k: v.clone() for k, v in pop.weight_down.items()}
+
+    before = clone_weights()
+
+    pop.migrate_('fuss_roll', fitnesses, num_islands = 4, migrate_frac = 0.5, elite_frac = 0.5)
+
+    for k in pop.weight_down.keys():
+        w = pop.weight_down[k]
+        w_before = before[k]
+
+        assert allclose(w[0::2], w_before[0::2])
+        assert allclose(w[1::2], torch.roll(w_before[1::2], shifts = 1, dims = 0))
+
+    # custom callable
+
+    def custom_migration(fitnesses, num_islands, **kwargs):
+        indices = torch.arange(fitnesses.shape[-1], device = fitnesses.device)
+        return torch.roll(indices, shifts = 1, dims = 0)
+
+    before_custom = clone_weights()
+    pop.migrate_(custom_migration, fitnesses, num_islands = 4)
+
+    for k in pop.weight_down.keys():
+        w = pop.weight_down[k]
+        w_before = before_custom[k]
+
+        assert allclose(w, torch.roll(w_before, shifts = 1, dims = 0))
+
+def test_reinit_islands():
+    pop = Population(
+        get_model(),
+        pop_size = 8,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.9, 0.1, 0.8, 0.2, 0.7, 0.3, 0.6, 0.4])
+
+    def clone_weights():
+        return {k: v.clone() for k, v in pop.weight_down.items()}
+
+    # es - reinit islands 0 and 2, leaving 1 and 3 untouched
+
+    before = clone_weights()
+
+    pop.reinit_islands_('es', islands = [0, 2], num_islands = 4, fitnesses = fitnesses)
+
+    for k in pop.weight_down.keys():
+        assert not allclose(pop.weight_down[k][0:2], before[k][0:2])
+        assert allclose(pop.weight_down[k][2:4], before[k][2:4])
+        assert not allclose(pop.weight_down[k][4:6], before[k][4:6])
+        assert allclose(pop.weight_down[k][6:8], before[k][6:8])
+
+    # pool and breed - reinit island 1 from island 3
+
+    before = clone_weights()
+
+    pop.reinit_islands_('pool_and_breed', islands = 1, parent_islands = [3], num_islands = 4, fitnesses = fitnesses)
+
+    for k in pop.weight_down.keys():
+        assert allclose(pop.weight_down[k][0:2], before[k][0:2])
+        assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
+        assert allclose(pop.weight_down[k][4:8], before[k][4:8])
+
+    # custom callable
+
+    before = clone_weights()
+
+    def zero_out(population, island_idx, num_islands, **kwargs):
+        island_size = population.pop_size // num_islands
+        sl = slice(island_idx * island_size, (island_idx + 1) * island_size)
+        for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+            w_down.data[sl] = 0.
+            w_up.data[sl] = 0.
+
+    pop.reinit_islands_(zero_out, islands = 3, num_islands = 4)
+
+    for k in pop.weight_down.keys():
+        assert allclose(pop.weight_down[k][0:6], before[k][0:6])
+        assert allclose(pop.weight_down[k][6:8], torch.zeros_like(pop.weight_down[k][6:8]))
+

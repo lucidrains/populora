@@ -436,6 +436,142 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
 
 register_crossover('xes', crossover_xes)
 
+# migration
+
+MIGRATION_REGISTRY = {}
+
+def register_migration(name: str, fn: callable):
+    MIGRATION_REGISTRY[name] = fn
+
+def migrate_fuss_roll(
+    fitnesses: Tensor,
+    num_islands: int,
+    migrate_frac: float = 0.1,
+    elite_frac: float = 0.25,
+    eps: float = 1e-5,
+    **kwargs
+):
+    device = fitnesses.device
+    pop_size = fitnesses.shape[-1]
+    island_size = pop_size // num_islands
+    num_elites = int(island_size * elite_frac)
+    num_migrate = max(1, int(island_size * migrate_frac))
+
+    assert num_elites + num_migrate <= island_size, 'elites + migrants cannot exceed island size'
+
+    fitnesses_grouped = rearrange(fitnesses, '(i p) -> i p', i = num_islands)
+
+    # exclude elites from migration candidates
+
+    if num_elites > 0:
+        elite_indices = fitnesses_grouped.topk(num_elites, dim = -1).indices
+    else:
+        elite_indices = torch.empty((num_islands, 0), dtype = torch.long, device = device)
+
+    mask = torch.ones_like(fitnesses_grouped, dtype = torch.bool)
+    mask.scatter_(-1, elite_indices, False)
+
+    remaining_indices = mask.long().argsort(dim = -1, descending = True)[..., :island_size - num_elites]
+    remaining_fitnesses = fitnesses_grouped.gather(-1, remaining_indices)
+
+    # fuss to select migrants, roll to shift to neighboring island
+
+    selected = select_fuss(remaining_fitnesses, num_migrate, eps = eps)
+    migrate_local = remaining_indices.gather(-1, selected)
+
+    offset = torch.arange(num_islands, device = device) * island_size
+    migrate_abs = migrate_local + rearrange(offset, 'i -> i 1')
+
+    new_arrangement = torch.arange(pop_size, device = device)
+    sources = torch.roll(migrate_abs, shifts = 1, dims = 0)
+    new_arrangement.scatter_(0, migrate_abs.flatten(), sources.flatten())
+
+    return new_arrangement
+
+register_migration('fuss_roll', migrate_fuss_roll)
+
+# island reinitialization
+
+ISLAND_REINIT_REGISTRY = {}
+
+def register_island_reinit(name: str, fn: callable):
+    ISLAND_REINIT_REGISTRY[name] = fn
+
+def reinit_es(
+    population: Population,
+    island_idx: int,
+    num_islands: int,
+    fitnesses: Tensor,
+    eta: float = 1.0,
+    noise_std: float = 0.01,
+    **kwargs
+):
+    assert exists(fitnesses), 'ES reinit requires fitnesses'
+    pop_size = population.pop_size
+    island_size = pop_size // num_islands
+
+    offset = island_idx * island_size
+    island_indices = torch.arange(island_size, device = fitnesses.device) + offset
+
+    island_fitnesses = fitnesses[island_indices]
+    weights = z_score(island_fitnesses, dim = -1) / island_size
+
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down_island = w_down.data[island_indices]
+        w_up_island = w_up.data[island_indices]
+
+        w_down_mean = w_down_island.mean(dim = 0) + eta * einsum(weights, w_down_island, 'p, p ... -> ...')
+        w_up_mean = w_up_island.mean(dim = 0) + eta * einsum(weights, w_up_island, 'p, p ... -> ...')
+
+        w_down.data[island_indices] = w_down_mean + torch.randn_like(w_down_island) * noise_std
+        w_up.data[island_indices] = w_up_mean + torch.randn_like(w_up_island) * noise_std
+
+def reinit_pool_and_breed(
+    population: Population,
+    island_idx: int,
+    num_islands: int,
+    fitnesses: Tensor,
+    parent_islands: list[int] | tuple[int, ...] | Tensor,
+    parent_selection_type: str = 'tournament',
+    crossover_type: str = 'average',
+    mutation_type: str = 'full_gaussian',
+    num_parents_per_child: int = 2,
+    **kwargs
+):
+    assert exists(fitnesses), 'pool_and_breed reinit requires fitnesses'
+    device = fitnesses.device
+    pop_size = population.pop_size
+    island_size = pop_size // num_islands
+
+    offset = island_idx * island_size
+    child_indices = torch.arange(island_size, device = device) + offset
+
+    parent_islands_tensor = torch.tensor(parent_islands, device = device) if not isinstance(parent_islands, Tensor) else parent_islands
+
+    parent_offsets = parent_islands_tensor * island_size
+    parent_local_indices = torch.arange(island_size, device = device)
+
+    parent_pool_indices = (rearrange(parent_offsets, 'i -> i 1') + parent_local_indices).flatten()
+    pool_fitnesses = fitnesses[parent_pool_indices]
+
+    parent_selection_registry = default(population.parent_selection_registry, PARENT_SELECTION_REGISTRY)
+    select_fn = parent_selection_registry[parent_selection_type]
+
+    selected_in_pool = select_fn(
+        pool_fitnesses,
+        num_children = island_size,
+        num_parents_per_child = num_parents_per_child,
+        **kwargs
+    )
+
+    parent_indices = parent_pool_indices[selected_in_pool]
+
+    population.crossover_(crossover_type, parent_indices, child_indices, fitnesses = fitnesses, **kwargs)
+    population.mutate_(mutation_type, individuals = child_indices, **kwargs)
+
+register_island_reinit('es', reinit_es)
+register_island_reinit('pool_and_breed', reinit_pool_and_breed)
+
 # main class
 
 class Population(Module):
@@ -450,7 +586,9 @@ class Population(Module):
         selection_registry: dict | None = None,
         parent_selection_registry: dict | None = None,
         crossover_registry: dict | None = None,
-        mutation_registry: dict | None = None
+        mutation_registry: dict | None = None,
+        migration_registry: dict | None = None,
+        island_reinit_registry: dict | None = None
     ):
         super().__init__()
         self.model = model
@@ -459,6 +597,8 @@ class Population(Module):
         self.parent_selection_registry = parent_selection_registry
         self.crossover_registry = crossover_registry
         self.mutation_registry = mutation_registry
+        self.migration_registry = migration_registry
+        self.island_reinit_registry = island_reinit_registry
 
         self.weight_down = ParameterDict()
         self.weight_up = ParameterDict()
@@ -636,6 +776,63 @@ class Population(Module):
 
         crossover_fn = crossover_registry[crossover_type]
         crossover_fn(self, parent_indices, child_indices, **kwargs)
+
+    @torch.no_grad()
+    def migrate_(
+        self,
+        migration_type_or_fn: str | callable,
+        fitnesses: Tensor,
+        num_islands: int,
+        **kwargs
+    ):
+        assert num_islands > 1, 'migration requires more than one island'
+        assert divisible_by(self.pop_size, num_islands), 'pop_size must be divisible by num_islands'
+
+        if isinstance(migration_type_or_fn, str):
+            migration_registry = default(self.migration_registry, MIGRATION_REGISTRY)
+            assert migration_type_or_fn in migration_registry, f'unknown migration type {migration_type_or_fn}'
+            migration_fn = migration_registry[migration_type_or_fn]
+        else:
+            migration_fn = migration_type_or_fn
+
+        new_arrangement = migration_fn(fitnesses, num_islands, **kwargs)
+
+        for w_down, w_up in zip(self.weight_down.values(), self.weight_up.values()):
+            w_down.data.copy_(w_down.data[new_arrangement].clone())
+            w_up.data.copy_(w_up.data[new_arrangement].clone())
+
+    @torch.no_grad()
+    def reinit_islands_(
+        self,
+        reinit_type_or_fn: str | callable,
+        islands: int | list[int] | tuple[int, ...] | Tensor,
+        num_islands: int,
+        fitnesses: Tensor | None = None,
+        **kwargs
+    ):
+        assert num_islands > 1, 'num_islands must be > 1'
+        assert divisible_by(self.pop_size, num_islands), 'pop_size must be divisible by num_islands'
+
+        if isinstance(reinit_type_or_fn, str):
+            reinit_registry = default(self.island_reinit_registry, ISLAND_REINIT_REGISTRY)
+            assert reinit_type_or_fn in reinit_registry, f'unknown island reinit type {reinit_type_or_fn}'
+            reinit_fn = reinit_registry[reinit_type_or_fn]
+        else:
+            reinit_fn = reinit_type_or_fn
+
+        if isinstance(islands, int):
+            islands = [islands]
+        elif isinstance(islands, Tensor):
+            islands = islands.tolist()
+
+        for island_idx in islands:
+            reinit_fn(
+                population = self,
+                island_idx = island_idx,
+                num_islands = num_islands,
+                fitnesses = fitnesses,
+                **kwargs
+            )
 
     @contextmanager
     def _route(self, individual, individuals, all_individuals):
