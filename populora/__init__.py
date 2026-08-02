@@ -7,5 +7,6 @@ from populora.populora import (
     register_parent_selection,
     register_crossover,
     register_migration,
-    register_island_reinit
+    register_island_reinit,
+    evaluate_population_distributed
 )

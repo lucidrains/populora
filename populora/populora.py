@@ -7,13 +7,14 @@ from contextlib import contextmanager
 from collections import namedtuple
 
 import torch
-from torch import Tensor, cat, stack
+import torch.distributed as dist
+from torch import Tensor, cat, is_tensor, stack
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from torch.linalg import qr, svd
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import tree_map_tensor
+from torch_einops_utils import temp_eval, tree_map_tensor, z_score
 
 # helpers
 
@@ -45,14 +46,9 @@ def _efficient_svd_of_lora(weight_down, weight_up):
 def skew_symmetrize(t):
     return (t - rearrange(t, 'i j -> j i')) / 2
 
-def z_score(t, dim = -1, eps = 1e-5):
-    mean = t.mean(dim = dim, keepdim = True)
-    std = t.std(dim = dim, keepdim = True).clamp(min = eps)
-    return (t - mean) / std
-
 # mutations
 
-MUTATION_REGISTRY = {}
+MUTATION_REGISTRY = dict()
 
 def register_mutation(name: str, fn: callable):
     MUTATION_REGISTRY[name] = fn
@@ -172,7 +168,7 @@ register_mutation('neftune_style', mutation_neftune_style)
 
 # survivor selection
 
-SELECTION_REGISTRY = {}
+SELECTION_REGISTRY = dict()
 SelectionResult = namedtuple('SelectionResult', ['survivors', 'culled', 'elites'])
 
 def register_selection(name: str, fn: callable):
@@ -188,14 +184,14 @@ def with_elites(select_fn, elite_frac = 0.25):
         num_elites = max(1, int(pop_size * elite_frac))
 
         if num_elites >= num_select:
-            return fitnesses.topk(num_select, dim=-1).indices
+            return fitnesses.topk(num_select, dim = -1).indices
 
-        elite_indices = fitnesses.topk(num_elites, dim=-1).indices
+        elite_indices = fitnesses.topk(num_elites, dim = -1).indices
 
         mask = torch.ones_like(fitnesses, dtype = torch.bool)
         mask.scatter_(-1, elite_indices, False)
 
-        sorted_mask_indices = mask.long().argsort(dim=-1, descending=True)
+        sorted_mask_indices = mask.long().argsort(dim = -1, descending = True)
         remaining_indices = sorted_mask_indices[..., :pop_size - num_elites]
 
         remaining_fitnesses = fitnesses.gather(-1, remaining_indices)
@@ -203,11 +199,11 @@ def with_elites(select_fn, elite_frac = 0.25):
 
         mapped_selected = remaining_indices.gather(-1, selected)
 
-        return cat((elite_indices, mapped_selected), dim=-1)
+        return cat((elite_indices, mapped_selected), dim = -1)
     return inner
 
 def select_deterministic(fitnesses, num_select, **kwargs):
-    return fitnesses.topk(num_select, dim=-1).indices
+    return fitnesses.topk(num_select, dim = -1).indices
 
 def select_probabilistic(fitnesses, num_select, temperature = 1., **kwargs):
     probs = F.softmax(fitnesses / temperature, dim = -1)
@@ -217,14 +213,14 @@ def select_fuss(fitnesses, num_select, eps = 1e-5, **kwargs):
     # fitness uniform selection scheme - Marcus Hutter https://arxiv.org/abs/cs/0103015
 
     pop_size = fitnesses.shape[-1]
-    sorted_fitness, sort_indices = fitnesses.sort(dim=-1)
+    sorted_fitness, sort_indices = fitnesses.sort(dim = -1)
 
     if pop_size == 1:
-        return torch.rand_like(fitnesses).argsort(dim=-1)[..., :num_select]
+        return torch.rand_like(fitnesses).argsort(dim = -1)[..., :num_select]
 
     # voronoi cell sizes
 
-    padded = cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim=-1)
+    padded = cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim = -1)
     voronoi_cell_sizes = (padded[..., 2:] - padded[..., :-2]) / 2
 
     # when all equal, voronoi cell sizes are 0, plus eps falls back to uniform
@@ -237,7 +233,7 @@ register_selection('fuss', select_fuss)
 
 # parent selection
 
-PARENT_SELECTION_REGISTRY = {}
+PARENT_SELECTION_REGISTRY = dict()
 
 def register_parent_selection(name: str, fn: callable):
     PARENT_SELECTION_REGISTRY[name] = fn
@@ -267,7 +263,7 @@ def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps =
     # fitness uniform selection scheme - Marcus Hutter https://arxiv.org/abs/cs/0103015
 
     pop_size = fitnesses.shape[-1]
-    sorted_fitness, sort_indices = fitnesses.sort(dim=-1)
+    sorted_fitness, sort_indices = fitnesses.sort(dim = -1)
     batch_shape = fitnesses.shape[:-1]
 
     if pop_size == 1:
@@ -275,7 +271,7 @@ def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps =
 
     # voronoi cell sizes
 
-    padded = cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim=-1)
+    padded = cat((sorted_fitness[..., :1], sorted_fitness, sorted_fitness[..., -1:]), dim = -1)
     voronoi_cell_sizes = (padded[..., 2:] - padded[..., :-2]) / 2
 
     num_samples = num_children * num_parents_per_child
@@ -316,7 +312,7 @@ register_parent_selection('queen_bee', parent_select_queen_bee)
 
 # crossover
 
-CROSSOVER_REGISTRY = {}
+CROSSOVER_REGISTRY = dict()
 
 def register_crossover(name: str, fn: callable):
     CROSSOVER_REGISTRY[name] = fn
@@ -438,7 +434,7 @@ register_crossover('xes', crossover_xes)
 
 # migration
 
-MIGRATION_REGISTRY = {}
+MIGRATION_REGISTRY = dict()
 
 def register_migration(name: str, fn: callable):
     MIGRATION_REGISTRY[name] = fn
@@ -492,7 +488,7 @@ register_migration('fuss_roll', migrate_fuss_roll)
 
 # island reinitialization
 
-ISLAND_REINIT_REGISTRY = {}
+ISLAND_REINIT_REGISTRY = dict()
 
 def register_island_reinit(name: str, fn: callable):
     ISLAND_REINIT_REGISTRY[name] = fn
@@ -688,14 +684,14 @@ class Population(Module):
 
         if num_groups == 1:
             if num_survivors >= group_size:
-                elites = fitnesses.topk(num_elites, dim=-1).indices if num_elites > 0 else all_indices[:0]
+                elites = fitnesses.topk(num_elites, dim = -1).indices if num_elites > 0 else all_indices[:0]
                 return SelectionResult(all_indices, all_indices[:0], elites)
 
             survivors = select_fn(fitnesses, num_survivors, **kwargs)
             mask = torch.ones(group_size, dtype = torch.bool, device = self.device)
             mask.scatter_(-1, survivors, False)
 
-            sorted_mask_indices = mask.long().argsort(dim=-1, descending=True)
+            sorted_mask_indices = mask.long().argsort(dim = -1, descending = True)
             culled = sorted_mask_indices[..., :group_size - num_survivors]
 
             elites = survivors[..., :num_elites]
@@ -705,7 +701,7 @@ class Population(Module):
 
         if num_survivors >= group_size:
             if num_elites > 0:
-                elites = fitnesses_grouped.topk(num_elites, dim=-1).indices
+                elites = fitnesses_grouped.topk(num_elites, dim = -1).indices
             else:
                 elites = repeat(all_indices[:0], 'p -> g p', g = num_groups)
             survivors = repeat(all_indices, 'p -> g p', g = num_groups)
@@ -715,7 +711,7 @@ class Population(Module):
             mask = torch.ones(num_groups, group_size, dtype = torch.bool, device = self.device)
             mask.scatter_(-1, survivors, False)
 
-            sorted_mask_indices = mask.long().argsort(dim=-1, descending=True)
+            sorted_mask_indices = mask.long().argsort(dim = -1, descending = True)
             culled = sorted_mask_indices[..., :group_size - num_survivors]
 
             elites = survivors[..., :num_elites]
@@ -779,7 +775,7 @@ class Population(Module):
         assert crossover_type in crossover_registry, f'unknown crossover type {crossover_type}'
 
         if exists(fitnesses):
-            kwargs = {**kwargs, 'fitnesses': fitnesses}
+            kwargs = dict(kwargs, fitnesses = fitnesses)
 
         crossover_fn = crossover_registry[crossover_type]
         crossover_fn(self, parent_indices, child_indices, **kwargs)
@@ -863,14 +859,8 @@ class Population(Module):
             yield
             return
 
-        is_training = self.training
-        self.eval()
-
-        with torch.no_grad():
-            try:
-                yield
-            finally:
-                self.train(is_training)
+        with temp_eval(self), torch.no_grad():
+            yield
 
     def _create_hook(self, lora_key: str):
         def hook(_, args, output):
@@ -938,9 +928,9 @@ class Populations(Module):
     ):
         super().__init__()
 
-        models = default(models, {})
+        models = default(models, dict())
 
-        self.populations = ModuleDict({})
+        self.populations = ModuleDict()
 
         for pop_name, pop_size in pop_sizes.items():
             role_model = models.get(pop_name, model)
@@ -973,12 +963,8 @@ class PopuLoRA(Module):
     ):
         super().__init__()
 
-        models = dict()
-        if exists(teacher_model):
-            models['teacher'] = teacher_model
-
-        if exists(student_model):
-            models['student'] = student_model
+        models = dict(teacher = teacher_model, student = student_model)
+        models = {k: v for k, v in models.items() if exists(v)}
 
         self.populations = Populations(
             pop_sizes = dict(teacher = num_teachers, student = num_students),
@@ -991,3 +977,37 @@ class PopuLoRA(Module):
 
     def forward(self, *args, **kwargs):
         return self.populations(*args, **kwargs)
+
+# distributed population evaluation
+
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+def evaluate_population_distributed(
+    population: Population,
+    eval_fn: callable,
+    batch_eval: bool = False,
+    device: torch.device | str | None = None
+) -> Tensor:
+
+    pop_size = population.pop_size
+    device = default(device, population.device)
+
+    world_size, rank = (dist.get_world_size(), dist.get_rank()) if is_distributed() else (1, 0)
+    assigned_indices = list(range(rank, pop_size, world_size))
+
+    fitnesses = torch.zeros(pop_size, device = device, dtype = torch.float32)
+
+    if batch_eval:
+        if len(assigned_indices) > 0:
+            res = eval_fn(population, assigned_indices)
+            fitnesses[assigned_indices] = res if is_tensor(res) else torch.tensor(res, device = device, dtype = torch.float32)
+    else:
+        for idx in assigned_indices:
+            fitnesses[idx] = eval_fn(population, idx)
+
+    if not is_distributed():
+        return fitnesses
+
+    dist.all_reduce(fitnesses, op = dist.ReduceOp.SUM)
+    return fitnesses
