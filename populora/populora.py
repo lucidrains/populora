@@ -27,6 +27,9 @@ def divisible_by(num, den):
 def default(v, d):
     return v if exists(v) else d
 
+def first(arr):
+    return arr[0] if len(arr) > 0 else None
+
 def extract_dict(v, k):
     return v[k] if isinstance(v, dict) else v
 
@@ -607,6 +610,8 @@ class Population(Module):
         self.weight_up = ParameterDict()
         self._hooks = []
 
+        self.lora_targets = tuple(lora_targets)
+
         for path in lora_targets:
             linear = model.get_submodule(path)
             assert isinstance(linear, Linear), f'{path} must point to a Linear module'
@@ -853,6 +858,27 @@ class Population(Module):
         finally:
             self._individual = None
 
+    def route(
+        self,
+        individual = None,
+        individuals = None,
+        all_individuals = False
+    ):
+        return self._route(individual, individuals, all_individuals)
+
+    @torch.no_grad()
+    def merge_(self, individual = 0):
+        for path in self.lora_targets:
+            linear = self.model.get_submodule(path)
+            key = path.replace('.', '_')
+            w_down = self.weight_down[key][individual]
+            w_up = self.weight_up[key][individual]
+            linear.weight.add_(einsum(w_up, w_down, 'e r, d r -> e d'))
+
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+
     @contextmanager
     def _eval_and_no_grad(self, enabled):
         if not enabled:
@@ -867,20 +893,23 @@ class Population(Module):
             if self._individual is None:
                 return output
 
+            x = first(args)
+            if not exists(x):
+                return output
+
             weight_down, weight_up = self.weight_down[lora_key], self.weight_up[lora_key]
-            x, = args
 
             if isinstance(self._individual, (list, tuple)) or self._individual is ...:
                 weight_down_i, weight_up_i = weight_down[self._individual], weight_up[self._individual]
                 p = weight_down_i.shape[0]
 
                 x = rearrange(x, '(p b) ... -> p b ...', p = p)
-                lora_out = einsum(x, weight_down_i, weight_up_i, 'p b ... d, p d r, p e r -> p b ... e')
+                lora_out = einsum(x, weight_down_i.to(x.dtype), weight_up_i.to(x.dtype), 'p b ... d, p d r, p e r -> p b ... e')
                 lora_out = rearrange(lora_out, 'p b ... -> (p b) ...')
             else:
-                lora_out = einsum(x, weight_down[self._individual], weight_up[self._individual], '... d, d r, e r -> ... e')
+                lora_out = einsum(x, weight_down[self._individual].to(x.dtype), weight_up[self._individual].to(x.dtype), '... d, d r, e r -> ... e')
 
-            return output + lora_out
+            return output + lora_out.to(output.dtype)
 
         return hook
 

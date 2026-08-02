@@ -528,3 +528,51 @@ def test_reinit_islands():
     for k in pop.weight_down.keys():
         assert allclose(pop.weight_down[k][0:6], before[k][0:6])
         assert allclose(pop.weight_down[k][6:8], torch.zeros_like(pop.weight_down[k][6:8]))
+
+def test_merge():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    lora_targets = [
+        'attn_layers.layers.0.1.to_q',
+        'attn_layers.layers.0.1.to_v'
+    ]
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = lora_targets
+    )
+
+    out_ind0 = pop(x, individual = 0)
+
+    pop.merge_(individual = 0)
+
+    out_merged = model(x)
+
+    assert allclose(out_ind0, out_merged, atol = 1e-5)
+
+def test_evolution_step_and_route():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    with pop.route(individual = 0):
+        out_route = model(x)
+
+    out_direct = pop(x, individual = 0)
+    assert allclose(out_route, out_direct)
+
+    fitnesses = torch.tensor([1.0, 2.0, 0.5, 3.0])
+    res = pop.select('deterministic', fitnesses, survive_frac = 0.5, elite_frac = 0.25)
+    parents = pop.select_parents('tournament', fitnesses, num_children = len(res.culled))
+    pop.crossover_('average', parents, res.culled, fitnesses = fitnesses)
+    pop.mutate_('full_gaussian', individuals = res.culled)
+    assert len(res.survivors) == 2
