@@ -8,5 +8,11 @@ from populora.populora import (
     register_crossover,
     register_migration,
     register_island_reinit,
-    evaluate_population_distributed
+    evaluate_population_distributed,
+    MUTATION_REGISTRY,
+    SELECTION_REGISTRY,
+    PARENT_SELECTION_REGISTRY,
+    CROSSOVER_REGISTRY,
+    MIGRATION_REGISTRY,
+    ISLAND_REINIT_REGISTRY
 )

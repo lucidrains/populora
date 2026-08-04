@@ -14,7 +14,7 @@ from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from torch.linalg import qr, svd
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import temp_eval, tree_map_tensor, z_score
+from torch_einops_utils import pad_right_at_dim_to, temp_eval, tree_map_tensor, z_score
 
 # helpers
 
@@ -36,14 +36,21 @@ def extract_dict(v, k):
 # tensor helpers
 
 def _efficient_svd_of_lora(weight_down, weight_up):
+    r = weight_down.shape[-1]
+
     Q_A, R_A = qr(weight_down)
     Q_B, R_B = qr(weight_up)
 
     C = einsum(R_A, R_B, 'i j, k j -> i k')
-    U_C, S, V_C_T = svd(C)
+    U_C, S, V_C_T = svd(C, full_matrices = False)
 
-    U = einsum(Q_A, U_C, 'd r, r s -> d s')
-    V = einsum(Q_B, V_C_T, 'e r, s r -> e s')
+    U = einsum(Q_A, U_C, 'd i, i s -> d s')
+    V = einsum(Q_B, V_C_T, 'e j, s j -> e s')
+
+    U = pad_right_at_dim_to(U, r, dim = -1)
+    S = pad_right_at_dim_to(S, r, dim = -1)
+    V = pad_right_at_dim_to(V, r, dim = -1)
+
     return U, S, V
 
 def skew_symmetrize(t):
