@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections import deque
 import gymnasium as gym
@@ -26,6 +27,14 @@ import fire
 from x_mlps_pytorch import MLP
 
 from populora import Population
+
+# helpers
+
+def exists(v):
+    return v is not None
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def evaluate_individual(env: gym.Env, pop: Population, individual_idx: int) -> float:
     state, _ = env.reset()
@@ -49,12 +58,16 @@ def validate_with_lunar(
     pop_size: int = 128,
     low_rank: int = 4,
     max_generations: int = 300,
-    seed: int = 42
+    seed: int = 42,
+    es_every_generations: int = 25,
+    es_topk: int | float | None = None,
+    es_temperature: float = 1.0
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     shutil.rmtree("videos", ignore_errors=True)
+    os.makedirs("videos", exist_ok=True)
     print("\nlogging videos of the best individual per generation to ./videos/\n")
 
     env = gym.make("LunarLanderContinuous-v3")
@@ -95,9 +108,14 @@ def validate_with_lunar(
             env.close()
             return
 
-        parents = pop.select_parents('tournament', fitnesses = fitnesses, num_children = len(result.culled))
-        pop.crossover_('extrapolative', parents, result.culled, fitnesses = fitnesses)
-        pop.mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15)
+        if es_every_generations > 0 and divisible_by(gen + 1, es_every_generations):
+            pbar.write(f"[ES] generation {gen:03d} | select_and_merge + repopulate")
+            pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature)
+            pop.repopulate()
+        else:
+            parents = pop.select_parents('tournament', fitnesses = fitnesses, num_children = len(result.culled))
+            pop.crossover_('extrapolative', parents, result.culled, fitnesses = fitnesses)
+            pop.mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15)
 
     env.close()
     assert False, f"LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})"

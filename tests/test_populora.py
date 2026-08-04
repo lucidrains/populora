@@ -576,3 +576,35 @@ def test_evolution_step_and_route():
     pop.crossover_('average', parents, res.culled, fitnesses = fitnesses)
     pop.mutate_('full_gaussian', individuals = res.culled)
     assert len(res.survivors) == 2
+
+def test_select_and_merge_and_repopulate():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    base_out_before = model(x).clone()
+    fitnesses = torch.tensor([1.0, 4.0, 2.0, 3.0])
+
+    pop.select_and_merge(fitnesses = fitnesses, topk = 2, temperature = 1.)
+
+    base_out_after_merge = model(x).clone()
+    assert not allclose(base_out_before, base_out_after_merge)
+
+    weight_down_before = {k: v.clone() for k, v in pop.weight_down.items()}
+
+    pop.repopulate()
+
+    for k, v in pop.weight_down.items():
+        assert not allclose(v, weight_down_before[k])
+
+    out_ind = pop(x, individual = 0)
+    assert out_ind.shape == (1, 16, 1000)
+    assert not allclose(out_ind, base_out_after_merge)
+
+

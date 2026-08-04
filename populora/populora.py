@@ -887,6 +887,68 @@ class Population(Module):
             hook.remove()
         self._hooks.clear()
 
+    @torch.no_grad()
+    def select_and_merge_(
+        self,
+        fitnesses: Tensor | None = None,
+        topk: int | float | None = None,
+        temperature: float = 1.0,
+        indices: Tensor | tuple[int, ...] | list[int] | None = None,
+        remove_hooks: bool = False
+    ):
+        assert exists(fitnesses) or exists(indices), 'either fitnesses or indices must be passed to select_and_merge_'
+
+        if exists(fitnesses):
+            assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+
+            topk = default(topk, max(1, self.pop_size // 4))
+            if isinstance(topk, float) and topk < 1.0:
+                topk = max(1, int(self.pop_size * topk))
+
+            topk_indices = fitnesses.topk(topk, dim = -1).indices
+            topk_fitnesses = fitnesses[topk_indices]
+        else:
+            topk_indices = torch.tensor(indices, device = self.device) if not isinstance(indices, Tensor) else indices
+            topk_fitnesses = torch.ones_like(topk_indices, dtype = torch.float32)
+
+        weights = F.softmax(topk_fitnesses / temperature, dim = -1)
+
+        for path in self.lora_targets:
+            linear = self.model.get_submodule(path)
+            key = path.replace('.', '_')
+            w_down_topk = self.weight_down[key][topk_indices]
+            w_up_topk = self.weight_up[key][topk_indices]
+
+            delta = einsum(weights, w_up_topk, w_down_topk, 'k, k e r, k d r -> e d')
+            linear.weight.add_(delta.to(linear.weight.dtype))
+
+        if remove_hooks:
+            for hook in self._hooks:
+                hook.remove()
+            self._hooks.clear()
+
+    select_and_merge = select_and_merge_
+
+    @torch.no_grad()
+    def repopulate_(
+        self,
+        std_down: float | None = None,
+        std_up: float | None = None
+    ):
+        for path in self.lora_targets:
+            linear = self.model.get_submodule(path)
+            key = path.replace('.', '_')
+            dim, dim_inner = linear.in_features, linear.out_features
+            low_rank = self.weight_down[key].shape[-1]
+
+            std_d = default(std_down, dim ** -0.5)
+            std_u = default(std_up, low_rank ** -0.5)
+
+            init.normal_(self.weight_down[key], std = std_d)
+            init.normal_(self.weight_up[key], std = std_u)
+
+    repopulate = repopulate_
+
     @contextmanager
     def _eval_and_no_grad(self, enabled):
         if not enabled:
