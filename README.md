@@ -2,6 +2,76 @@
 
 Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727v1), [Co-Evolving LLM Populations for Reasoning Self-Play](https://vmax.ai/team/populora-co-evolving-llm-populations-for-reasoning-self-play), from Roger Castanyer et al at [vmax.ai](https://vmax.ai/)
 
+## Install
+
+```bash
+pip install populora
+```
+
+## Usage
+
+```python
+import torch
+import torch.nn as nn
+from populora import Population
+
+# 2-layer MLP
+
+model = nn.Sequential(
+    nn.Linear(2, 8),
+    nn.ReLU(),
+    nn.Linear(8, 1)
+)
+
+# wrap with Population
+
+pop = Population(
+    model,
+    pop_size = 16,
+    low_rank = 4,
+    lora_targets = ['0', '2']
+)
+
+state = torch.randn(1, 4, 2)
+
+# evaluate population against environment
+
+preds = pop(state, all_individuals = True)
+
+labels = torch.randn(1, 4, 1)
+fitnesses = -((preds - labels ) ** 2).reshape(16, -1).mean(dim = -1)
+
+# selection
+
+result = pop.select(
+    selection_type = 'deterministic',
+    fitnesses = fitnesses,
+    survive_frac = 0.5
+)
+
+# parent selection
+
+parents = pop.select_parents(
+    selection_type = 'tournament',
+    fitnesses = fitnesses,
+    num_children = len(result.selected_out_indices)
+)
+
+# crossover
+
+pop.crossover_('average', parents, result.selected_out_indices)
+
+# mutate newly generated offspring, preserving surviving elite parents
+
+pop.mutate_('full_gaussian', individuals = result.selected_out_indices)
+
+# alternatively, mutate the entire population
+
+pop.mutate_('full_gaussian', all_individuals = True)
+
+# do the above in a loop
+```
+
 ## Citations
 
 ```bibtex

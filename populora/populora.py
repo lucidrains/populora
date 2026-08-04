@@ -179,7 +179,23 @@ register_mutation('neftune_style', mutation_neftune_style)
 # survivor selection
 
 SELECTION_REGISTRY = dict()
-SelectionResult = namedtuple('SelectionResult', ['survivors', 'culled', 'elites'])
+
+class SelectionResult(namedtuple('_SelectionResult', ['survivors', 'culled', 'elites'])):
+    @property
+    def selected_out_indices(self):
+        return self.culled
+
+    @property
+    def culled_indices(self):
+        return self.culled
+
+    @property
+    def survivor_indices(self):
+        return self.survivors
+
+    @property
+    def elite_indices(self):
+        return self.elites
 
 def register_selection(name: str, fn: callable):
     SELECTION_REGISTRY[name] = fn
