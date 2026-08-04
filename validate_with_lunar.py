@@ -61,7 +61,9 @@ def validate_with_lunar(
     seed: int = 42,
     es_every_generations: int = 25,
     es_topk: int | float | None = None,
-    es_temperature: float = 1.0
+    es_temperature: float = 1.0,
+    parent_selection_type: str = "queen_bee",
+    num_elites: int = 1
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -113,7 +115,7 @@ def validate_with_lunar(
             pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature)
             pop.repopulate()
         else:
-            parents = pop.select_parents('tournament', fitnesses = fitnesses, num_children = len(result.culled))
+            parents = pop.select_parents(parent_selection_type, fitnesses = fitnesses, num_children = len(result.culled), num_elites = num_elites)
             pop.crossover_('extrapolative', parents, result.culled, fitnesses = fitnesses)
             pop.mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15)
 
