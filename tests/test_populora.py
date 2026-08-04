@@ -607,4 +607,29 @@ def test_select_and_merge_and_repopulate():
     assert out_ind.shape == (1, 16, 1000)
     assert not allclose(out_ind, base_out_after_merge)
 
+@param('kwargs_factory', [
+    lambda fitnesses, best_idx: dict(fitnesses = fitnesses, topk = 1),
+    lambda fitnesses, best_idx: dict(indices = best_idx),
+    lambda fitnesses, best_idx: dict(indices = (best_idx,)),
+    lambda fitnesses, best_idx: dict(indices = torch.tensor(best_idx)),
+])
+def test_select_and_merge_single_individual(kwargs_factory):
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
 
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([1.0, 4.0, 2.0, 3.0])
+    best_idx = fitnesses.argmax().item()
+
+    out_best_before_merge = pop(x, individual = best_idx)
+
+    pop.select_and_merge(**kwargs_factory(fitnesses, best_idx))
+
+    out_after_merge = model(x)
+    assert allclose(out_best_before_merge, out_after_merge, atol = 1e-5)

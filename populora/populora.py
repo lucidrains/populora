@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import math
 import random
+from typing import Sequence
 from functools import wraps
 from contextlib import contextmanager
 from collections import namedtuple
 
 import torch
 import torch.distributed as dist
-from torch import Tensor, cat, is_tensor, stack
+from torch import Tensor, cat, is_tensor, stack, atleast_1d
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from torch.linalg import qr, svd
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import pad_right_at_dim_to, temp_eval, tree_map_tensor, z_score
+from torch_einops_utils import maybe, pad_right_at_dim_to, temp_eval, tree_map_tensor, z_score
 
 # helpers
 
@@ -32,6 +33,11 @@ def first(arr):
 
 def extract_dict(v, k):
     return v[k] if isinstance(v, dict) else v
+
+def cast_tuple(val, length = 1):
+    return val if isinstance(val, (tuple, list)) else ((val,) * length)
+
+maybe_cast_tuple = maybe(cast_tuple)
 
 # tensor helpers
 
@@ -561,7 +567,7 @@ def reinit_pool_and_breed(
     island_idx: int,
     num_islands: int,
     fitnesses: Tensor,
-    parent_islands: list[int] | tuple[int, ...] | Tensor,
+    parent_islands: Sequence[int] | Tensor,
     parent_selection_type: str = 'tournament',
     crossover_type: str = 'average',
     mutation_type: str = 'full_gaussian',
@@ -611,7 +617,7 @@ class Population(Module):
         *,
         pop_size: int,
         low_rank: int,
-        lora_targets: tuple[str, ...] | list[str],
+        lora_targets: Sequence[str],
         requires_grad: bool = False,
         selection_registry: dict | None = None,
         parent_selection_registry: dict | None = None,
@@ -662,9 +668,9 @@ class Population(Module):
         self,
         mutation_type: str,
         individual: int | None = None,
-        individuals: tuple[int, ...] | list[int] | Tensor | None = None,
+        individuals: Sequence[int] | Tensor | None = None,
         all_individuals: bool = False,
-        ignore_individuals: tuple[int, ...] | list[int] | Tensor | None = None,
+        ignore_individuals: Sequence[int] | Tensor | None = None,
         **kwargs
     ):
         assert sum((exists(individual), exists(individuals), all_individuals)) == 1
@@ -837,7 +843,7 @@ class Population(Module):
     def reinit_islands_(
         self,
         reinit_type_or_fn: str | callable,
-        islands: int | list[int] | tuple[int, ...] | Tensor,
+        islands: int | Sequence[int] | Tensor,
         num_islands: int,
         fitnesses: Tensor | None = None,
         **kwargs
@@ -909,9 +915,10 @@ class Population(Module):
         fitnesses: Tensor | None = None,
         topk: int | float | None = None,
         temperature: float = 1.0,
-        indices: Tensor | tuple[int, ...] | list[int] | None = None,
+        indices: Tensor | Sequence[int] | int | None = None,
         remove_hooks: bool = False
     ):
+        indices = maybe_cast_tuple(indices)
         assert exists(fitnesses) or exists(indices), 'either fitnesses or indices must be passed to select_and_merge_'
 
         if exists(fitnesses):
@@ -925,6 +932,7 @@ class Population(Module):
             topk_fitnesses = fitnesses[topk_indices]
         else:
             topk_indices = torch.tensor(indices, device = self.device) if not isinstance(indices, Tensor) else indices
+            topk_indices = atleast_1d(topk_indices)
             topk_fitnesses = torch.ones_like(topk_indices, dtype = torch.float32)
 
         weights = F.softmax(topk_fitnesses / temperature, dim = -1)
@@ -1003,9 +1011,9 @@ class Population(Module):
         self,
         *args,
         individual: int | None = None,
-        individuals: tuple[int, ...] | list[int] | None = None,
+        individuals: Sequence[int] | None = None,
         all_individuals: bool = False,
-        ignore_args_kwargs: tuple[int | str, ...] = tuple(),
+        ignore_args_kwargs: Sequence[int | str] = tuple(),
         eval_and_no_grad: bool = False,
         **kwargs
     ):
@@ -1036,7 +1044,7 @@ class Populations(Module):
         *,
         pop_sizes: dict[str, int],
         low_ranks: int | dict[str, int],
-        lora_targets: tuple[str, ...] | list[str] | dict[str, tuple[str, ...] | list[str]],
+        lora_targets: Sequence[str] | dict[str, Sequence[str]],
         model: Module | None = None,
         models: dict[str, Module] | None = None,
         requires_grad: bool = False
@@ -1070,7 +1078,7 @@ class PopuLoRA(Module):
         num_teachers: int,
         num_students: int,
         low_rank: int | dict[str, int],
-        lora_targets: tuple[str, ...] | list[str] | dict[str, tuple[str, ...] | list[str]],
+        lora_targets: Sequence[str] | dict[str, Sequence[str]],
         model: Module | None = None,
         teacher_model: Module | None = None,
         student_model: Module | None = None,

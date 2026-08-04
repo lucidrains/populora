@@ -16,4 +16,3 @@ from populora.populora import (
     MIGRATION_REGISTRY,
     ISLAND_REINIT_REGISTRY,
 )
-
