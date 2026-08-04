@@ -54,7 +54,7 @@ def evaluate_individual(env: gym.Env, pop: Population, individual_idx: int) -> f
 
 def validate_with_lunar(
     target_avg_reward: float = 100.0,
-    avg_window: int = 128,
+    avg_generations: int = 5,
     pop_size: int = 128,
     low_rank: int = 4,
     max_generations: int = 300,
@@ -83,7 +83,7 @@ def validate_with_lunar(
         lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2']
     )
 
-    recent_rewards = deque(maxlen = avg_window)
+    recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
 
     parent_selection_type = 'queen_bee' if queen_bee_mating else 'tournament'
@@ -96,10 +96,11 @@ def validate_with_lunar(
 
         result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = 0.5, elite_frac = 0.25)
         best_reward = fitnesses.max().item()
-        recent_rewards.append(best_reward)
+        mean_reward = fitnesses.mean().item()
+        recent_rewards.append(mean_reward)
 
         avg_recent = float(np.mean(recent_rewards))
-        pbar.write(f'gen {gen:03d} | best_reward: {best_reward:6.1f} | avg_last_{avg_window}_episodes: {avg_recent:6.1f}')
+        pbar.write(f'gen {gen:03d} | best_reward: {best_reward:6.1f} | mean_reward: {mean_reward:6.1f} | avg_last_{avg_generations}_generations: {avg_recent:6.1f}')
 
         best_idx = fitnesses.argmax().item()
         record_env = gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array')
@@ -107,8 +108,8 @@ def validate_with_lunar(
         evaluate_individual(record_env, pop, best_idx)
         record_env.close()
 
-        if len(recent_rewards) >= avg_window and avg_recent > target_avg_reward:
-            print(f'\n✓ PopuLoRA LunarLander Validation Passed! Last {avg_window} episodes avg reward: {avg_recent:.2f} > {target_avg_reward}')
+        if len(recent_rewards) >= avg_generations and avg_recent > target_avg_reward:
+            print(f'\n✓ PopuLoRA LunarLander Validation Passed! Last {avg_generations} generations avg reward: {avg_recent:.2f} > {target_avg_reward}')
             env.close()
             return
 
