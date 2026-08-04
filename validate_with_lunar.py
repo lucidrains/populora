@@ -62,17 +62,17 @@ def validate_with_lunar(
     es_every_generations: int = 25,
     es_topk: int | float | None = None,
     es_temperature: float = 1.0,
-    parent_selection_type: str = "queen_bee",
+    queen_bee_mating: bool = False,
     num_elites: int = 1
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    shutil.rmtree("videos", ignore_errors=True)
-    os.makedirs("videos", exist_ok=True)
-    print("\nlogging videos of the best individual per generation to ./videos/\n")
+    shutil.rmtree('videos', ignore_errors = True)
+    os.makedirs('videos', exist_ok = True)
+    print('\nlogging videos of the best individual per generation to ./videos/\n')
 
-    env = gym.make("LunarLanderContinuous-v3")
+    env = gym.make('LunarLanderContinuous-v3')
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
@@ -84,7 +84,9 @@ def validate_with_lunar(
     )
 
     recent_rewards = deque(maxlen = avg_window)
-    pbar = tqdm(range(max_generations), desc = "validating lunar lander")
+    pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
+
+    parent_selection_type = 'queen_bee' if queen_bee_mating else 'tournament'
 
     for gen in pbar:
         fitnesses = torch.zeros(pop_size)
@@ -97,21 +99,21 @@ def validate_with_lunar(
         recent_rewards.append(best_reward)
 
         avg_recent = float(np.mean(recent_rewards))
-        pbar.write(f"gen {gen:03d} | best_reward: {best_reward:6.1f} | avg_last_{avg_window}_episodes: {avg_recent:6.1f}")
+        pbar.write(f'gen {gen:03d} | best_reward: {best_reward:6.1f} | avg_last_{avg_window}_episodes: {avg_recent:6.1f}')
 
         best_idx = fitnesses.argmax().item()
-        record_env = gym.make("LunarLanderContinuous-v3", render_mode="rgb_array")
-        record_env = gym.wrappers.RecordVideo(record_env, video_folder="videos", name_prefix=f"gen_{gen:03d}", disable_logger=True)
+        record_env = gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array')
+        record_env = gym.wrappers.RecordVideo(record_env, video_folder = 'videos', name_prefix = f'gen_{gen:03d}', disable_logger = True)
         evaluate_individual(record_env, pop, best_idx)
         record_env.close()
 
         if len(recent_rewards) >= avg_window and avg_recent > target_avg_reward:
-            print(f"\n✓ PopuLoRA LunarLander Validation Passed! Last {avg_window} episodes avg reward: {avg_recent:.2f} > {target_avg_reward}")
+            print(f'\n✓ PopuLoRA LunarLander Validation Passed! Last {avg_window} episodes avg reward: {avg_recent:.2f} > {target_avg_reward}')
             env.close()
             return
 
         if es_every_generations > 0 and divisible_by(gen + 1, es_every_generations):
-            pbar.write(f"[ES] generation {gen:03d} | select_and_merge + repopulate")
+            pbar.write(f'[ES] generation {gen:03d} | select_and_merge + repopulate')
             pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature)
             pop.repopulate()
         else:
@@ -120,7 +122,7 @@ def validate_with_lunar(
             pop.mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15)
 
     env.close()
-    assert False, f"LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})"
+    assert False, f'LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})'
 
 if __name__ == '__main__':
     fire.Fire(validate_with_lunar)
