@@ -349,9 +349,9 @@ def crossover_layer_wise(population, parent_indices, child_indices, fitnesses = 
     num_children, num_parents = parent_indices.shape
     device = population.device
     batch_indices = torch.arange(num_children, device = device)
-    parent_choice = torch.randint(0, num_parents, (num_children,), device = device)
 
     for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        parent_choice = torch.randint(0, num_parents, (num_children,), device = device)
         w_down.data[child_indices] = w_down.data[parent_indices][batch_indices, parent_choice]
         w_up.data[child_indices] = w_up.data[parent_indices][batch_indices, parent_choice]
 
@@ -373,7 +373,7 @@ def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses 
             k = torch.randint(1, r, (1,)).item() if r > 1 else 1
 
             U_child = cat((U1[:, :k], U2[:, k:]), dim = 1)
-            S_child = cat((S1[:k], S2[k:]), dim = 0)
+            S_child = cat((S1[:k], S2[k:]), dim = 0).clamp(min = 0.)
             V_child = cat((V1[:, :k], V2[:, k:]), dim = 1)
 
             S_sqrt = torch.sqrt(S_child)
@@ -385,8 +385,9 @@ def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses 
 def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, fitnesses = None, **kwargs):
     num_children, num_parents = parent_indices.shape
     assert num_parents == 2, 'extrapolative crossover requires exactly 2 parents'
+    device = population.device
 
-    eta = random.uniform(eta_min, eta_max)
+    eta = torch.empty((num_children, 1, 1), device = device).uniform_(eta_min, eta_max)
 
     for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
         w_down_parents = w_down.data[parent_indices]

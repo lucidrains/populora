@@ -92,8 +92,15 @@ def train_xor(
             tournament_size = tournament_size
         )
 
-        pop.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses)
-        pop.mutate_(mutation_type, individuals = result.culled, **(mutation_kwargs or {}))
+        if exists(crossover_type):
+            pop.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses)
+        else:
+            for w_down, w_up in zip(pop.weight_down.values(), pop.weight_up.values()):
+                w_down.data[result.culled] = w_down.data[parents[:, 0]]
+                w_up.data[result.culled] = w_up.data[parents[:, 0]]
+
+        if exists(mutation_type):
+            pop.mutate_(mutation_type, individuals = result.culled, **(mutation_kwargs or {}))
 
         if exists(auxiliary_mutation_type):
             pop.mutate_(auxiliary_mutation_type, individuals = result.culled, epsilon = auxiliary_epsilon)
@@ -108,11 +115,11 @@ def validate_with_xor(
     pop_size = 64,
     low_rank = 4,
     hidden_dim = 8,
-    crossover_generations = 600,
-    parent_selection_generations = 800,
-    survivor_selection_generations = 800,
+    crossover_generations = 1000,
+    parent_selection_generations = 1200,
+    survivor_selection_generations = 1200,
     mutation_generations = 1200,
-    crossover_epsilon = 0.05,
+    crossover_epsilon = 0.02,
     auxiliary_epsilon = 0.05,
     survive_frac = 0.5,
     elite_frac = 0.25,
@@ -180,6 +187,7 @@ def validate_with_xor(
     for name in MUTATION_REGISTRY:
         auxiliary = 'full_gaussian' if name in REGULARIZATION_ONLY_MUTATIONS else None
         loss = train_xor(
+            crossover_type = None,
             mutation_type = name,
             auxiliary_mutation_type = auxiliary,
             auxiliary_epsilon = auxiliary_epsilon,
