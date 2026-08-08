@@ -63,7 +63,9 @@ def validate_with_lunar(
     es_topk: int | float | None = None,
     es_temperature: float = 1.0,
     queen_bee_mating: bool = False,
-    num_elites: int = 1
+    num_elites: int = 1,
+    weight_decay: float = 1e-3,
+    soft_threshold: float = 0.0
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -115,12 +117,11 @@ def validate_with_lunar(
 
         if es_every_generations > 0 and divisible_by(gen + 1, es_every_generations):
             pbar.write(f'[ES] generation {gen:03d} | select_and_merge + repopulate')
-            pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature)
+            pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature, use_z_score = True)
             pop.repopulate()
         else:
             parents = pop.select_parents(parent_selection_type, fitnesses = fitnesses, num_children = len(result.culled), num_elites = num_elites, culled = result.culled)
-            pop.crossover_('extrapolative', parents, result.culled, fitnesses = fitnesses)
-            pop.mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15)
+            pop.crossover_('extrapolative', parents, result.culled, fitnesses = fitnesses).mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15).regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
 
     env.close()
     assert False, f'LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})'

@@ -28,6 +28,9 @@ def divisible_by(num, den):
 def default(v, d):
     return v if exists(v) else d
 
+def has_(v):
+    return exists(v) and (v.any().item() if is_tensor(v) else v > 0.)
+
 def first(arr):
     return arr[0] if len(arr) > 0 else None
 
@@ -698,6 +701,8 @@ class Population(Module):
         for idx in indices:
             mutation_fn(self, idx, **kwargs)
 
+        return self
+
     @torch.no_grad()
     def select(
         self,
@@ -870,6 +875,7 @@ class Population(Module):
 
         crossover_fn = crossover_registry[crossover_type]
         crossover_fn(self, parent_indices, child_indices, **kwargs)
+        return self
 
     @torch.no_grad()
     def migrate_(
@@ -894,6 +900,8 @@ class Population(Module):
         for w_down, w_up in zip(self.weight_down.values(), self.weight_up.values()):
             w_down.data.copy_(w_down.data[new_arrangement].clone())
             w_up.data.copy_(w_up.data[new_arrangement].clone())
+
+        return self
 
     @torch.no_grad()
     def reinit_islands_(
@@ -927,6 +935,8 @@ class Population(Module):
                 fitnesses = fitnesses,
                 **kwargs
             )
+
+        return self
 
     @contextmanager
     def _route(self, individual, individuals, all_individuals):
@@ -1007,6 +1017,7 @@ class Population(Module):
         fitnesses: Tensor | None = None,
         topk: int | float | None = None,
         temperature: float = 1.0,
+        use_z_score: bool = False,
         indices: Tensor | Sequence[int] | int | None = None,
         remove_hooks: bool = False
     ):
@@ -1022,6 +1033,8 @@ class Population(Module):
 
             topk_indices = fitnesses.topk(topk, dim = -1).indices
             topk_fitnesses = fitnesses[topk_indices]
+            if use_z_score:
+                topk_fitnesses = z_score(topk_fitnesses)
         else:
             topk_indices = torch.tensor(indices, device = self.device) if not isinstance(indices, Tensor) else indices
             topk_indices = atleast_1d(topk_indices)
@@ -1064,6 +1077,42 @@ class Population(Module):
             init.normal_(self.weight_up[key], std = std_u)
 
     repopulate = repopulate_
+
+    @torch.no_grad()
+    def regularize_(
+        self,
+        weight_decay: float = 0.0,
+        soft_threshold: float = 0.0,
+        individuals: Sequence[int] | Tensor | None = None
+    ):
+        if not (has_(weight_decay) or has_(soft_threshold)):
+            return self
+
+        for weight in (*self.weight_down.values(), *self.weight_up.values()):
+            w = weight if not exists(individuals) else weight[individuals]
+
+            if has_(weight_decay):
+                w.mul_(1. - weight_decay)
+
+            if has_(soft_threshold):
+                w.copy_(w.sign() * (w.abs() - soft_threshold).clamp(min = 0.))
+
+        return self
+
+    regularize = regularize_
+
+    @staticmethod
+    def adapt_mutation_epsilon(
+        epsilon: float,
+        success_rate: float,
+        target_success_rate: float = 0.20,
+        factor: float = 1.15,
+        min_epsilon: float = 1e-4,
+        max_epsilon: float = 1.0
+    ) -> float:
+
+        mult = factor if success_rate > target_success_rate else (1. / factor)
+        return float(max(min_epsilon, min(epsilon * mult, max_epsilon)))
 
     @contextmanager
     def _eval_and_no_grad(self, enabled):

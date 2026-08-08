@@ -693,3 +693,34 @@ def test_select_and_merge_best():
     out_pop_again = pop(x, individual = best_idx)
     assert len(pop._hooks) > 0
     assert out_pop_again.shape == (1, 16, 1000)
+
+def test_select_and_merge_with_z_score():
+    model = get_model()
+    pop = Population(model, pop_size = 16, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+
+    fitnesses = torch.randn(16) * 100.0 - 500.0
+    merged_model = pop.select_and_merge(fitnesses = fitnesses, use_z_score = True)
+    assert merged_model is not None
+
+def test_regularize_():
+    model = get_model()
+    pop = Population(model, pop_size = 16, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+
+    initial_norm = pop.weight_down['attn_layers_layers_0_1_to_q'].norm().item()
+    pop.regularize_(weight_decay = 0.10)
+    decayed_norm = pop.weight_down['attn_layers_layers_0_1_to_q'].norm().item()
+
+    assert decayed_norm < initial_norm
+
+    # test soft thresholding
+    pop.weight_down['attn_layers_layers_0_1_to_q'].data[0, 0, 0] = 0.001
+    pop.regularize_(soft_threshold = 0.002)
+    assert pop.weight_down['attn_layers_layers_0_1_to_q'].data[0, 0, 0] == 0.0
+
+def test_adapt_mutation_epsilon():
+    eps = 0.10
+    eps_up = Population.adapt_mutation_epsilon(eps, success_rate = 0.30, target_success_rate = 0.20, factor = 1.15)
+    assert eps_up > eps
+
+    eps_down = Population.adapt_mutation_epsilon(eps, success_rate = 0.10, target_success_rate = 0.20, factor = 1.15)
+    assert eps_down < eps
