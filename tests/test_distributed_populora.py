@@ -34,7 +34,7 @@ def test_distributed_evolution():
         assert fitnesses.shape == (6,) and (fitnesses > 0).all()
 
         survivors, culled, elites = pop.select('deterministic', fitnesses, survive_frac = 0.5, elite_frac = 0.33)
-        parents = pop.select_parents('tournament', fitnesses, num_children = len(culled))
+        parents = pop.select_parents('tournament', fitnesses, num_children = len(culled), culled = culled)
 
         pop.crossover_('average', parents, culled)
         pop.mutate_('full_gaussian', individuals = culled)

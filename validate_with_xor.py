@@ -89,7 +89,8 @@ def train_xor(
             fitnesses = fitnesses,
             num_children = len(result.culled),
             num_parents_per_child = 2,
-            tournament_size = tournament_size
+            tournament_size = tournament_size,
+            culled = result.culled
         )
 
         if exists(crossover_type):

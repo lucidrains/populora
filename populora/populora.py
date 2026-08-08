@@ -9,13 +9,13 @@ from collections import namedtuple
 
 import torch
 import torch.distributed as dist
-from torch import Tensor, cat, is_tensor, stack, atleast_1d
+from torch import Tensor, cat, is_tensor, tensor, atleast_1d
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from torch.linalg import qr, svd
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import maybe, pad_right_at_dim_to, temp_eval, tree_map_tensor, z_score
+from torch_einops_utils import batched_index_select, maybe, pad_right_at_dim_to, temp_eval, tree_map_tensor, z_score
 
 # helpers
 
@@ -38,6 +38,9 @@ def cast_tuple(val, length = 1):
     return val if isinstance(val, (tuple, list)) else ((val,) * length)
 
 maybe_cast_tuple = maybe(cast_tuple)
+
+def cast_tensor(val, device = None):
+    return val if is_tensor(val) else tensor(val, device = device)
 
 # tensor helpers
 
@@ -773,26 +776,78 @@ class Population(Module):
         num_children: int,
         num_parents_per_child: int = 2,
         num_groups: int = 1,
+        culled: Tensor | Sequence[int] | None = None,
+        survivors: Tensor | Sequence[int] | None = None,
+        ignore_indices: Tensor | Sequence[int] | None = None,
         **kwargs
     ):
         assert fitnesses.ndim == 1
         assert divisible_by(self.pop_size, num_groups)
         assert divisible_by(num_children, num_groups)
 
+        # unwrap SelectionResult if passed
+
+        if isinstance(culled, SelectionResult):
+            culled = culled.culled
+        if isinstance(survivors, SelectionResult):
+            survivors = survivors.survivors
+
+        # derive eligible parent indices
+
+        eligible_indices = None
+
+        if exists(survivors):
+            eligible_indices = cast_tensor(survivors, self.device).flatten()
+        elif exists(culled) or exists(ignore_indices):
+            to_ignore = []
+            if exists(culled):
+                to_ignore.append(cast_tensor(culled, self.device).flatten())
+            if exists(ignore_indices):
+                to_ignore.append(cast_tensor(ignore_indices, self.device).flatten())
+
+            ignored_tensor = cat(to_ignore)
+            mask = torch.ones(self.pop_size, dtype = torch.bool, device = self.device)
+            mask[ignored_tensor] = False
+            eligible_indices = torch.arange(self.pop_size, device = self.device)[mask]
+
         parent_selection_registry = default(self.parent_selection_registry, PARENT_SELECTION_REGISTRY)
         assert selection_type in parent_selection_registry, f'unknown parent selection type {selection_type}'
 
         select_fn = parent_selection_registry[selection_type]
 
+        # single group selection
+
         if num_groups == 1:
+            if exists(eligible_indices):
+                fitnesses = fitnesses[eligible_indices] if fitnesses.shape[-1] == self.pop_size else fitnesses
+                selected = select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **kwargs)
+                return eligible_indices[selected]
+
             return select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **kwargs)
 
+        # island / multi-group selection
+
+        group_size = self.pop_size // num_groups
         fitnesses_grouped = rearrange(fitnesses, '(g p) -> g p', g = num_groups)
         children_per_group = num_children // num_groups
 
+        if exists(eligible_indices):
+            mask = torch.zeros(self.pop_size, dtype = torch.bool, device = self.device)
+            mask[eligible_indices] = True
+            mask_grouped = rearrange(mask, '(g p) -> g p', g = num_groups)
+
+            global_indices_grouped = rearrange(torch.arange(self.pop_size, device = self.device), '(g p) -> g p', g = num_groups)
+
+            eligible_global_indices = rearrange(global_indices_grouped[mask_grouped], '(g p) -> g p', g = num_groups)
+            eligible_fitnesses = rearrange(fitnesses_grouped[mask_grouped], '(g p) -> g p', g = num_groups)
+
+            selected = select_fn(eligible_fitnesses, children_per_group, num_parents_per_child = num_parents_per_child, **kwargs)
+            parents = batched_index_select(eligible_global_indices, selected, dim = 1)
+            return rearrange(parents, 'g c p -> (g c) p')
+
         parents = select_fn(fitnesses_grouped, children_per_group, num_parents_per_child = num_parents_per_child, **kwargs)
 
-        offset = torch.arange(num_groups, device = fitnesses.device) * (self.pop_size // num_groups)
+        offset = torch.arange(num_groups, device = fitnesses.device) * group_size
         parents = parents + rearrange(offset, 'g -> g 1 1')
 
         return rearrange(parents, 'g c p -> (g c) p')

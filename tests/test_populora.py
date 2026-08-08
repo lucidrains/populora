@@ -2,6 +2,7 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
+import torch.nn as nn
 from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
@@ -572,7 +573,7 @@ def test_evolution_step_and_route():
 
     fitnesses = torch.tensor([1.0, 2.0, 0.5, 3.0])
     res = pop.select('deterministic', fitnesses, survive_frac = 0.5, elite_frac = 0.25)
-    parents = pop.select_parents('tournament', fitnesses, num_children = len(res.culled))
+    parents = pop.select_parents('tournament', fitnesses, num_children = len(res.culled), culled = res.culled)
     pop.crossover_('average', parents, res.culled, fitnesses = fitnesses)
     pop.mutate_('full_gaussian', individuals = res.culled)
     assert len(res.survivors) == 2
@@ -633,3 +634,31 @@ def test_select_and_merge_single_individual(kwargs_factory):
 
     out_after_merge = model(x)
     assert allclose(out_best_before_merge, out_after_merge, atol = 1e-5)
+
+def test_culled_excluded_from_parents():
+    pop = Population(
+        get_model(),
+        pop_size = 8,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6])
+    result = pop.select('deterministic', fitnesses, survive_frac = 0.5)
+
+    culled_set = set(result.culled.tolist())
+    survivors_set = set(result.survivors.tolist())
+
+    # test passing culled
+    parents = pop.select_parents('tournament', fitnesses, num_children = len(result.culled), culled = result.culled)
+    parent_set = set(parents.flatten().tolist())
+
+    assert parent_set.isdisjoint(culled_set)
+    assert parent_set.issubset(survivors_set)
+
+    # test passing SelectionResult directly
+    parents_res = pop.select_parents('tournament', fitnesses, num_children = len(result.culled), culled = result)
+    parent_res_set = set(parents_res.flatten().tolist())
+
+    assert parent_res_set.isdisjoint(culled_set)
+    assert parent_res_set.issubset(survivors_set)

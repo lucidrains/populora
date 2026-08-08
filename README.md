@@ -54,7 +54,8 @@ result = pop.select(
 parents = pop.select_parents(
     selection_type = 'tournament',
     fitnesses = fitnesses,
-    num_children = len(result.selected_out_indices)
+    num_children = len(result.selected_out_indices),
+    culled = result.selected_out_indices
 )
 
 # crossover
