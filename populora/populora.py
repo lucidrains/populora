@@ -641,7 +641,9 @@ class Population(Module):
 
         self.weight_down = ParameterDict()
         self.weight_up = ParameterDict()
+
         self._hooks = []
+        self._hooks_registered = False
 
         self.lora_targets = tuple(lora_targets)
 
@@ -658,8 +660,7 @@ class Population(Module):
             init.normal_(self.weight_down[key], std = dim ** -0.5)
             init.normal_(self.weight_up[key], std = low_rank ** -0.5)
 
-            self._hooks.append(linear.register_forward_hook(self._create_hook(key)))
-
+        self.register_hooks()
         self._individual = None
 
     @property
@@ -951,8 +952,36 @@ class Population(Module):
     ):
         return self._route(individual, individuals, all_individuals)
 
+    def register_hooks(self):
+        if self._hooks_registered:
+            return
+
+        for path in self.lora_targets:
+            linear = self.model.get_submodule(path)
+            key = path.replace('.', '_')
+            self._hooks.append(linear.register_forward_hook(self._create_hook(key)))
+
+        self._hooks_registered = True
+
+    register_hooks_ = register_hooks
+
+    def remove_hooks(self):
+        if not self._hooks_registered:
+            return
+
+        for hook in self._hooks:
+            hook.remove()
+
+        self._hooks.clear()
+        self._hooks_registered = False
+
+    remove_hooks_ = remove_hooks
+
     @torch.no_grad()
     def merge_(self, individual = 0):
+        if is_tensor(individual):
+            individual = individual.item()
+
         for path in self.lora_targets:
             linear = self.model.get_submodule(path)
             key = path.replace('.', '_')
@@ -960,9 +989,17 @@ class Population(Module):
             w_up = self.weight_up[key][individual]
             linear.weight.add_(einsum(w_up, w_down, 'e r, d r -> e d'))
 
-        for hook in self._hooks:
-            hook.remove()
-        self._hooks.clear()
+        self.remove_hooks()
+        return self.model
+
+    merge = merge_
+
+    @torch.no_grad()
+    def select_and_merge_best_(self, fitnesses: Tensor):
+        best_idx = fitnesses.argmax()
+        return self.merge_(best_idx)
+
+    select_and_merge_best = select_and_merge_best_
 
     @torch.no_grad()
     def select_and_merge_(
@@ -980,7 +1017,7 @@ class Population(Module):
             assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
 
             topk = default(topk, max(1, self.pop_size // 4))
-            if isinstance(topk, float) and topk < 1.0:
+            if isinstance(topk, float) and topk <= 1.0:
                 topk = max(1, int(self.pop_size * topk))
 
             topk_indices = fitnesses.topk(topk, dim = -1).indices
@@ -1002,9 +1039,9 @@ class Population(Module):
             linear.weight.add_(delta.to(linear.weight.dtype))
 
         if remove_hooks:
-            for hook in self._hooks:
-                hook.remove()
-            self._hooks.clear()
+            self.remove_hooks()
+
+        return self.model
 
     select_and_merge = select_and_merge_
 
@@ -1072,6 +1109,8 @@ class Population(Module):
         eval_and_no_grad: bool = False,
         **kwargs
     ):
+        if not self._hooks_registered:
+            self.register_hooks()
         if all_individuals or exists(individuals):
             ignore = set(ignore_args_kwargs)
             p = self.pop_size if all_individuals else len(individuals)

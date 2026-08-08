@@ -662,3 +662,34 @@ def test_culled_excluded_from_parents():
 
     assert parent_res_set.isdisjoint(culled_set)
     assert parent_res_set.issubset(survivors_set)
+
+def test_select_and_merge_best():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.1, 0.95, 0.3, 0.5])
+    best_idx = fitnesses.argmax().item()
+
+    out_best_before = pop(x, individual = best_idx)
+
+    merged_model = pop.select_and_merge_best(fitnesses)
+
+    # Returns the exact same model reference
+    assert merged_model is model
+
+    # Unhooked base model output matches best individual
+    out_after = model(x)
+    assert allclose(out_best_before, out_after, atol = 1e-5)
+    assert len(pop._hooks) == 0
+
+    # Invoking population forward afterwards auto-registers hooks
+    out_pop_again = pop(x, individual = best_idx)
+    assert len(pop._hooks) > 0
+    assert out_pop_again.shape == (1, 16, 1000)

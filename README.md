@@ -70,7 +70,13 @@ pop.mutate_('full_gaussian', individuals = result.selected_out_indices)
 
 pop.mutate_('full_gaussian', all_individuals = True)
 
-# do the above in a loop
+# do the above in a for loop
+
+# ...
+
+# then pick the highest fitness individual and resume RL or fine-tuning on the base model
+
+model = pop.select_and_merge_best_(fitnesses)
 ```
 
 ## Citations
