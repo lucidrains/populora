@@ -40,6 +40,16 @@ test = [
     "pytest",
     "x-transformers"
 ]
+mario = [
+    "numpy>=2.2.5",
+    "tqdm",
+    "fire",
+    "imageio",
+    "imageio-ffmpeg",
+    "x-mlps-pytorch",
+    "gym-super-mario-bros",
+    "nes-py",
+]
 
 [tool.pytest.ini_options]
 pythonpath = [

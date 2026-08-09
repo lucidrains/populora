@@ -79,6 +79,65 @@ pop.mutate_('full_gaussian', all_individuals = True)
 model = pop.select_and_merge_best_(fitnesses)
 ```
 
+## Distributed Evolution
+
+Evolution parallelizes trivially - each rank evaluates its share of the population against the environment, the fitnesses are gathered, and the evolution step runs identically on every rank
+
+The population is automatically moved to the distributed device (each rank's local GPU) on construction - pass `device` to `Population` to override
+
+```python
+from time import sleep
+
+import torch
+from torch import nn
+from populora import Population, is_main_rank
+
+model = nn.Sequential(
+    nn.Linear(8, 16),
+    nn.ReLU(),
+    nn.Linear(16, 1)
+)
+
+pop = Population(
+    model,
+    pop_size = 16,
+    low_rank = 2,
+    lora_targets = ['0', '2']
+)
+
+x = torch.randn(1, 8)
+
+def eval_env(population, idx):
+    sleep(0.1)
+    with torch.no_grad():
+        return population(x, individual = idx).abs().mean().item() + torch.randn(1).item()
+
+for gen in range(10):
+
+    # distributed evaluation
+
+    fitnesses = pop.evaluate_distributed(eval_env)
+
+    if is_main_rank():
+        print(f'gen {gen:02d} | best: {fitnesses.max():.3f} | mean: {fitnesses.mean():.3f}')
+
+    # evolution step
+
+    pop.evolve_(fitnesses)
+```
+
+run on 4 processes
+
+```bash
+torchrun --standalone --nproc-per-node=4 evolve.py
+```
+
+or across machines
+
+```bash
+torchrun --nnodes=4 --nproc-per-node=1 --rdzv-endpoint=$MASTER_HOST:29500 evolve.py
+```
+
 ## Citations
 
 ```bibtex
@@ -138,17 +197,5 @@ model = pop.select_and_merge_best_(fitnesses)
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2604.20209},
-}
-```
-
-```bibtex
-@misc{fleuret2025freetransformer,
-    title   = {The Free Transformer},
-    author  = {François Fleuret},
-    year    = {2025},
-    eprint  = {2510.17558},
-    archivePrefix = {arXiv},
-    primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2510.17558},
 }
 ```

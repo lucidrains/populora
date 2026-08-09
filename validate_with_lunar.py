@@ -97,6 +97,8 @@ def validate_with_lunar(
         lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2']
     )
 
+    print(f'[PopuLoRA Lunar] population size: {pop_size} | total generations: {max_generations}')
+
     recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
 

@@ -9,7 +9,6 @@ from contextlib import contextmanager
 from collections import namedtuple
 
 import torch
-import torch.distributed as dist
 from torch import Tensor, cat, is_tensor, tensor, atleast_1d
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
@@ -626,6 +625,7 @@ class Population(Module):
         low_rank: int,
         lora_targets: Sequence[str],
         requires_grad: bool = False,
+        device: torch.device | str | None = None,
         selection_registry: dict | None = None,
         parent_selection_registry: dict | None = None,
         crossover_registry: dict | None = None,
@@ -666,6 +666,14 @@ class Population(Module):
 
         self.register_hooks()
         self._individual = None
+
+        if exists(device):
+            self.to(device)
+        else:
+            from populora.distributed import distributed_device, is_distributed
+
+            if is_distributed():
+                self.to(distributed_device())
 
     # save and load
 
@@ -1145,6 +1153,72 @@ class Population(Module):
 
     regularize = regularize_
 
+    @torch.no_grad()
+    def evolve_(
+        self,
+        fitnesses: Tensor,
+        *,
+        survive_frac = 0.5,
+        elite_frac = 0.10,
+        selection_type = 'deterministic',
+        parent_selection_type = 'tournament',
+        crossover_type = 'average',
+        mutation_type = 'full_gaussian',
+        num_groups = 1,
+        epsilon = 0.1,
+        weight_decay = 0.0,
+        soft_threshold = 0.0,
+        **kwargs
+    ):
+        result = self.select(
+            selection_type,
+            fitnesses,
+            survive_frac = survive_frac,
+            elite_frac = elite_frac,
+            num_groups = num_groups,
+            **kwargs
+        )
+
+        parents = self.select_parents(
+            parent_selection_type,
+            fitnesses,
+            num_children = len(result.culled),
+            culled = result.culled,
+            num_groups = num_groups,
+            **kwargs
+        )
+
+        self.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses, **kwargs) \
+            .mutate_(mutation_type, individuals = result.culled, epsilon = epsilon, **kwargs) \
+            .regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
+
+        return result
+
+    evolve = evolve_
+
+    def evaluate_distributed(
+        self,
+        eval_fn,
+        batch_eval = False,
+        device: torch.device | str | None = None,
+        contiguous = False,
+        preserve_rng_state = True,
+        **kwargs
+    ):
+        from populora.distributed import evaluate_population_distributed
+
+        return evaluate_population_distributed(
+            self,
+            eval_fn,
+            batch_eval = batch_eval,
+            device = device,
+            contiguous = contiguous,
+            preserve_rng_state = preserve_rng_state,
+            **kwargs
+        )
+
+    evaluate_distributed_ = evaluate_distributed
+
     @staticmethod
     def adapt_mutation_epsilon(
         epsilon: float,
@@ -1169,7 +1243,7 @@ class Population(Module):
 
     def _create_hook(self, lora_key: str):
         def hook(_, args, output):
-            if self._individual is None:
+            if not exists(self._individual):
                 return output
 
             x = first(args)
@@ -1234,7 +1308,8 @@ class Populations(Module):
         lora_targets: Sequence[str] | dict[str, Sequence[str]],
         model: Module | None = None,
         models: dict[str, Module] | None = None,
-        requires_grad: bool = False
+        requires_grad: bool = False,
+        device: torch.device | str | None = None
     ):
         super().__init__()
 
@@ -1251,7 +1326,8 @@ class Populations(Module):
                 pop_size = pop_size,
                 low_rank = extract_dict(low_ranks, pop_name),
                 lora_targets = extract_dict(lora_targets, pop_name),
-                requires_grad = requires_grad
+                requires_grad = requires_grad,
+                device = device
             )
 
     # save and load
@@ -1313,37 +1389,3 @@ class PopuLoRA(Module):
 
     def forward(self, *args, **kwargs):
         return self.populations(*args, **kwargs)
-
-# distributed population evaluation
-
-def is_distributed():
-    return dist.is_available() and dist.is_initialized()
-
-def evaluate_population_distributed(
-    population: Population,
-    eval_fn: callable,
-    batch_eval: bool = False,
-    device: torch.device | str | None = None
-) -> Tensor:
-
-    pop_size = population.pop_size
-    device = default(device, population.device)
-
-    world_size, rank = (dist.get_world_size(), dist.get_rank()) if is_distributed() else (1, 0)
-    assigned_indices = list(range(rank, pop_size, world_size))
-
-    fitnesses = torch.zeros(pop_size, device = device, dtype = torch.float32)
-
-    if batch_eval:
-        if len(assigned_indices) > 0:
-            res = eval_fn(population, assigned_indices)
-            fitnesses[assigned_indices] = res if is_tensor(res) else torch.tensor(res, device = device, dtype = torch.float32)
-    else:
-        for idx in assigned_indices:
-            fitnesses[idx] = eval_fn(population, idx)
-
-    if not is_distributed():
-        return fitnesses
-
-    dist.all_reduce(fitnesses, op = dist.ReduceOp.SUM)
-    return fitnesses
