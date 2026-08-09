@@ -115,6 +115,8 @@ def record_agent(
     video_path: str,
     img_size: int,
     max_stagnant_steps: int = 180,
+    sample_actions: bool = True,
+    policy_temperature: float = 1.0,
     seed: int | None = None
 ):
     rec_env = make_mario_env(level = level, actions = actions, seed = seed)
@@ -124,7 +126,12 @@ def record_agent(
     while True:
         frames.append(rec_env.render(mode = 'rgb_array').copy())
         with torch.no_grad():
-            action = pop(preprocess(obs, img_size, device = pop.device), individual = individual_idx).argmax(dim = -1).item()
+            logits = pop(preprocess(obs, img_size, device = pop.device), individual = individual_idx)
+            if sample_actions and policy_temperature > 0:
+                probs = F.softmax(logits / policy_temperature, dim = -1)
+                action = torch.multinomial(probs, num_samples = 1).item()
+            else:
+                action = logits.argmax(dim = -1).item()
         obs, reward, done, info = rec_env.step(action)
         obs = obs.copy()
 
@@ -147,7 +154,7 @@ def record_agent(
 def validate_with_mario(
     level: str | int = '1-1',
     actions: str = 'right',
-    pop_size: int = 100,
+    pop_size: int = 150,
     low_rank: int = 4,
     img_size: int = 42,
     max_generations: int = 2000,
@@ -163,6 +170,8 @@ def validate_with_mario(
     es_every_generations: int = 25,
     es_topk: int | float | None = None,
     es_temperature: float = 1.0,
+    sample_actions: bool = True,
+    policy_temperature: float = 1.0,
     render_video: bool = True,
     video_dir: str = "./videos-mario",
     checkpoint_dir: str = "./checkpoints-mario",
@@ -185,7 +194,7 @@ def validate_with_mario(
 
     state_dim = img_size * img_size
     device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-    print(f"level {level_str} | actions: {actions} ({num_actions}) | obs: {state_dim}d | max_stagnant_steps: {max_stagnant_steps} | device: {device}\n")
+    print(f"level {level_str} | actions: {actions} ({num_actions}) | obs: {state_dim}d | max_stagnant_steps: {max_stagnant_steps} | sample_actions: {sample_actions} | device: {device}\n")
 
     pop = Population(
         MLP(state_dim, 512, 256, 128, num_actions),
@@ -216,7 +225,12 @@ def validate_with_mario(
         while not done.all():
             with torch.no_grad():
                 obs_batch = preprocess(obs_list, img_size, device = device)
-                chosen_actions = pop(obs_batch, all_individuals = True).argmax(dim = -1).cpu().numpy()
+                logits = pop(obs_batch, all_individuals = True)
+                if sample_actions and policy_temperature > 0:
+                    probs = F.softmax(logits / policy_temperature, dim = -1)
+                    chosen_actions = torch.multinomial(probs.view(-1, num_actions), num_samples = 1).squeeze(-1).view(pop_size).cpu().numpy()
+                else:
+                    chosen_actions = logits.argmax(dim = -1).cpu().numpy()
 
             for i in range(pop_size):
                 if done[i]:
@@ -247,7 +261,8 @@ def validate_with_mario(
             record_agent(
                 pop, best_player_idx, level_str, actions,
                 f"{video_dir}/gen_{gen:03d}.mp4", img_size = img_size,
-                max_stagnant_steps = max_stagnant_steps, seed = seed
+                max_stagnant_steps = max_stagnant_steps,
+                sample_actions = sample_actions, policy_temperature = policy_temperature, seed = seed
             )
 
         if best_x_this_gen > best_overall_x:
@@ -257,7 +272,8 @@ def validate_with_mario(
                 record_agent(
                     pop, best_player_idx, level_str, actions,
                     f"{video_dir}/mario_{level_str}_highscore.mp4", img_size = img_size,
-                    max_stagnant_steps = max_stagnant_steps, seed = seed
+                    max_stagnant_steps = max_stagnant_steps,
+                    sample_actions = sample_actions, policy_temperature = policy_temperature, seed = seed
                 )
 
         pbar.write(f'gen {gen:03d} | best_reward: {best_reward:8.1f} | mean_reward: {mean_reward:8.1f} | best_x: {best_x_this_gen:5d}')
@@ -270,7 +286,8 @@ def validate_with_mario(
                 record_agent(
                     pop, winning_player, level_str, actions,
                     f"{video_dir}/mario_{level_str}_winner_gen{gen}.mp4", img_size = img_size,
-                    max_stagnant_steps = max_stagnant_steps, seed = seed
+                    max_stagnant_steps = max_stagnant_steps,
+                    sample_actions = sample_actions, policy_temperature = policy_temperature, seed = seed
                 )
             break
 

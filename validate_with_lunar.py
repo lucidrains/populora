@@ -36,7 +36,13 @@ def exists(v):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def evaluate_individual(env: gym.Env, pop: Population, individual_idx: int) -> float:
+def evaluate_individual(
+    env: gym.Env,
+    pop: Population,
+    individual_idx: int,
+    sample_actions: bool = True,
+    action_std: float = 0.10
+) -> float:
     state, _ = env.reset()
     done = False
     total_reward = 0.0
@@ -44,7 +50,11 @@ def evaluate_individual(env: gym.Env, pop: Population, individual_idx: int) -> f
     while not done:
         state_tensor = torch.tensor(state, dtype = torch.float32).unsqueeze(0)
         with torch.no_grad():
-            action = pop(state_tensor, individual = individual_idx).squeeze(0).tanh().numpy()
+            mean_action = pop(state_tensor, individual = individual_idx).squeeze(0).tanh()
+            if sample_actions and action_std > 0.:
+                action = torch.normal(mean_action, action_std).clamp(-1.0, 1.0).numpy()
+            else:
+                action = mean_action.numpy()
 
         state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -59,6 +69,8 @@ def validate_with_lunar(
     low_rank: int = 4,
     max_generations: int = 300,
     seed: int = 42,
+    sample_actions: bool = True,
+    action_std: float = 0.10,
     es_every_generations: int = 25,
     es_topk: int | float | None = None,
     es_temperature: float = 1.0,
@@ -94,7 +106,11 @@ def validate_with_lunar(
         fitnesses = torch.zeros(pop_size)
 
         for i in range(pop_size):
-            fitnesses[i] = evaluate_individual(env, pop, i)
+            fitnesses[i] = evaluate_individual(
+                env, pop, i,
+                sample_actions = sample_actions,
+                action_std = action_std
+            )
 
         result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = 0.5, elite_frac = 0.25)
         best_reward = fitnesses.max().item()
@@ -107,7 +123,11 @@ def validate_with_lunar(
         best_idx = fitnesses.argmax().item()
         record_env = gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array')
         record_env = gym.wrappers.RecordVideo(record_env, video_folder = 'videos', name_prefix = f'gen_{gen:03d}', disable_logger = True)
-        evaluate_individual(record_env, pop, best_idx)
+        evaluate_individual(
+            record_env, pop, best_idx,
+            sample_actions = False, # deterministic video evaluation for best policy
+            action_std = action_std
+        )
         record_env.close()
 
         if len(recent_rewards) >= avg_generations and avg_recent > target_avg_reward:

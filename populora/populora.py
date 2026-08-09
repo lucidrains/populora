@@ -1061,7 +1061,7 @@ class Population(Module):
         fitnesses: Tensor | None = None,
         topk: int | float | None = None,
         temperature: float = 1.0,
-        use_z_score: bool = False,
+        use_z_score: bool = True,
         indices: Tensor | Sequence[int] | int | None = None,
         remove_hooks: bool = False
     ):
