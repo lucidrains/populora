@@ -724,3 +724,25 @@ def test_adapt_mutation_epsilon():
 
     eps_down = Population.adapt_mutation_epsilon(eps, success_rate = 0.10, target_success_rate = 0.20, factor = 1.15)
     assert eps_down < eps
+
+def test_save_and_load(tmp_path):
+    pop = Population(get_model(), pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = 0.5)
+
+    x = torch.randint(0, 256, (1, 16))
+    out = pop(x, all_individuals = True)
+
+    ckpt_path = tmp_path / 'ckpt.pt'
+    pop.save(ckpt_path)
+
+    # test from_checkpoint
+
+    loaded_pop = Population.from_checkpoint(ckpt_path, get_model())
+    assert torch.allclose(out, loaded_pop(x, all_individuals = True))
+
+    # test in-place load
+
+    pop_copy = Population(get_model(), pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+    pop_copy.load(ckpt_path)
+
+    assert torch.allclose(out, pop_copy(x, all_individuals = True))

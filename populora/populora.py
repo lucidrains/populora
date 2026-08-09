@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 from typing import Sequence
 from functools import wraps
 from contextlib import contextmanager
@@ -666,6 +667,49 @@ class Population(Module):
         self.register_hooks()
         self._individual = None
 
+    # save and load
+
+    @torch.no_grad()
+    def state_dict_pkg(self):
+        first_w_down = next(iter(self.weight_down.values()))
+        low_rank = first_w_down.shape[-1]
+
+        return dict(
+            model = self.model.state_dict(),
+            weight_down = self.weight_down.state_dict(),
+            weight_up = self.weight_up.state_dict(),
+            pop_size = self.pop_size,
+            low_rank = low_rank,
+            lora_targets = list(self.lora_targets)
+        )
+
+    @torch.no_grad()
+    def save(self, path: str | Path):
+        path = Path(path)
+        path.parent.mkdir(parents = True, exist_ok = True)
+        torch.save(self.state_dict_pkg(), path)
+        return self
+
+    @torch.no_grad()
+    def load(self, path: str | Path | dict, strict: bool = True):
+        pkg = torch.load(path, map_location = self.device, weights_only = False) if not isinstance(path, dict) else path
+        self.model.load_state_dict(pkg['model'], strict = strict)
+        self.weight_down.load_state_dict(pkg['weight_down'], strict = strict)
+        self.weight_up.load_state_dict(pkg['weight_up'], strict = strict)
+        return self
+
+    @classmethod
+    def from_checkpoint(cls, path: str | Path | dict, model: Module, **kwargs):
+        pkg = torch.load(path, weights_only = False) if not isinstance(path, dict) else path
+        pop = cls(
+            model = model,
+            pop_size = pkg['pop_size'],
+            low_rank = pkg['low_rank'],
+            lora_targets = pkg['lora_targets'],
+            **kwargs
+        )
+        return pop.load(pkg)
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -1210,6 +1254,24 @@ class Populations(Module):
                 requires_grad = requires_grad
             )
 
+    # save and load
+
+    @torch.no_grad()
+    def save(self, path: str | Path):
+        path = Path(path)
+        path.parent.mkdir(parents = True, exist_ok = True)
+        pkg = {pop_name: pop.state_dict_pkg() for pop_name, pop in self.populations.items()}
+        torch.save(pkg, path)
+        return self
+
+    @torch.no_grad()
+    def load(self, path: str | Path | dict, strict: bool = True):
+        pkg = torch.load(path, weights_only = False) if not isinstance(path, dict) else path
+        for pop_name, pop in self.populations.items():
+            if pop_name in pkg:
+                pop.load(pkg[pop_name], strict = strict)
+        return self
+
     def forward(self, *args, pop_name: str, **kwargs):
         assert pop_name in self.populations, f"unknown population {pop_name}"
         return self.populations[pop_name](*args, **kwargs)
@@ -1240,6 +1302,14 @@ class PopuLoRA(Module):
             models = models,
             requires_grad = requires_grad
         )
+
+    # save and load
+
+    def save(self, path: str | Path):
+        return self.populations.save(path)
+
+    def load(self, path: str | Path | dict, strict: bool = True):
+        return self.populations.load(path, strict = strict)
 
     def forward(self, *args, **kwargs):
         return self.populations(*args, **kwargs)
