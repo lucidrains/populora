@@ -207,7 +207,8 @@ def validate_with_mario(
         MLP(state_dim, 512, 256, 128, num_actions),
         pop_size = pop_size,
         low_rank = low_rank,
-        lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2.0', 'layers.3']
+        lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2.0', 'layers.3'],
+        eval_seed = seed
     ).to(device)
 
     if exists(resume_from) and Path(resume_from).exists() and is_main_rank():
@@ -225,6 +226,12 @@ def validate_with_mario(
 
         max_x_seen = np.zeros(num_local, dtype = np.int32)
         stagnant_steps = np.zeros(num_local, dtype = np.int32)
+
+        # reset all envs under the shared seed
+
+        for env in envs:
+            env.seed(pop.eval_seed)
+
         obs_list = [env.reset().copy() for env in envs]
 
         while not done.all():

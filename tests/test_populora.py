@@ -7,7 +7,7 @@ from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
 from einops import rearrange
-from populora import Population, Populations, PopuLoRA, register_mutation
+from populora import Population, Populations, PopuLoRA, evaluate_population_distributed, register_mutation
 
 # helper
 
@@ -701,6 +701,49 @@ def test_select_and_merge_with_z_score():
     fitnesses = torch.randn(16) * 100.0 - 500.0
     merged_model = pop.select_and_merge(fitnesses = fitnesses, use_z_score = True)
     assert merged_model is not None
+
+def test_shared_eval_seed():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(model, pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'], eval_seed = 42)
+
+    def eval_env(population, idx):
+        return population(x, individual = idx).abs().mean()
+
+    for gen in range(3):
+        pop.evaluate_distributed(eval_env)
+        assert pop.eval_seed == 43 + gen
+
+    # shared_seed off - eval seed untouched
+
+    pop2 = Population(model, pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+
+    for _ in range(3):
+        pop2.evaluate_distributed(eval_env, shared_seed = False)
+
+    assert pop2.eval_seed == 0
+
+    # eval_seed None - shared seed disabled
+
+    pop3 = Population(model, pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'], eval_seed = None)
+
+    for _ in range(3):
+        pop3.evaluate_distributed(eval_env)
+
+    assert pop3.eval_seed is None
+
+def test_eval_seed_optional():
+    # objects with _eval_seed = None are unaffected
+
+    class MinimalPopulation:
+        pop_size = 4
+        device = 'cpu'
+        _eval_seed = None
+
+    pop = MinimalPopulation()
+    fitnesses = evaluate_population_distributed(pop, lambda p, idx: float(idx))
+    assert len(fitnesses) == 4
 
 def test_regularize_():
     model = get_model()

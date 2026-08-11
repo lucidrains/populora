@@ -28,6 +28,10 @@ def test_distributed_evolution():
     for gen in range(2):
         fitnesses = pop.evaluate_distributed(eval_env)
 
+        # eval seed auto-synced across ranks
+
+        assert pop.eval_seed > 0
+
         if is_main_rank():
             print(f'gen {gen:02d} | best: {fitnesses.max():.3f} | mean: {fitnesses.mean():.3f}')
 

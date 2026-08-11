@@ -41,9 +41,10 @@ def evaluate_individual(
     pop: Population,
     individual_idx: int,
     sample_actions: bool = True,
-    action_std: float = 0.10
+    action_std: float = 0.10,
+    env_seed: int | None = None
 ) -> float:
-    state, _ = env.reset()
+    state, _ = env.reset(seed = env_seed)
     done = False
     total_reward = 0.0
 
@@ -94,7 +95,8 @@ def validate_with_lunar(
         MLP(state_dim, 64, 64, action_dim),
         pop_size = pop_size,
         low_rank = low_rank,
-        lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2']
+        lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2'],
+        eval_seed = seed
     )
 
     print(f'[PopuLoRA Lunar] population size: {pop_size} | total generations: {max_generations}')
@@ -104,15 +106,17 @@ def validate_with_lunar(
 
     parent_selection_type = 'queen_bee' if queen_bee_mating else 'tournament'
 
-    for gen in pbar:
-        fitnesses = torch.zeros(pop_size)
+    # evaluate the population under a shared per-generation seed
 
-        for i in range(pop_size):
-            fitnesses[i] = evaluate_individual(
-                env, pop, i,
-                sample_actions = sample_actions,
-                action_std = action_std
-            )
+    eval_env = lambda pop, idx: evaluate_individual(
+        env, pop, idx,
+        sample_actions = sample_actions,
+        action_std = action_std,
+        env_seed = pop.eval_seed
+    )
+
+    for gen in pbar:
+        fitnesses = pop.evaluate_distributed(eval_env)
 
         result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = 0.5, elite_frac = 0.25)
         best_reward = fitnesses.max().item()

@@ -625,6 +625,7 @@ class Population(Module):
         low_rank: int,
         lora_targets: Sequence[str],
         requires_grad: bool = False,
+        eval_seed: int | None = 0,
         device: torch.device | str | None = None,
         selection_registry: dict | None = None,
         parent_selection_registry: dict | None = None,
@@ -666,6 +667,7 @@ class Population(Module):
 
         self.register_hooks()
         self._individual = None
+        self._eval_seed = eval_seed
 
         if exists(device):
             self.to(device)
@@ -721,6 +723,11 @@ class Population(Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @property
+    def eval_seed(self):
+        # shared eval seed, auto-synced across ranks - None disables
+        return self._eval_seed
 
     @torch.no_grad()
     def mutate_(
@@ -1203,6 +1210,7 @@ class Population(Module):
         device: torch.device | str | None = None,
         contiguous = False,
         preserve_rng_state = True,
+        shared_seed = True,
         **kwargs
     ):
         from populora.distributed import evaluate_population_distributed
@@ -1214,6 +1222,7 @@ class Population(Module):
             device = device,
             contiguous = contiguous,
             preserve_rng_state = preserve_rng_state,
+            shared_seed = shared_seed,
             **kwargs
         )
 

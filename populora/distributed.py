@@ -187,6 +187,18 @@ def partition_indices(num_items: int, contiguous = False):
 
 # distributed evaluation
 
+def sync_seed_sum(seed):
+    # all reduce the seed across ranks
+
+    if not is_distributed():
+        return seed
+
+    device = distributed_device()
+    use_cuda = device.type == 'cuda' and dist.get_backend() == 'nccl'
+    seed_tensor = tensor(seed, dtype = torch.long, device = device if use_cuda else 'cpu')
+    dist.all_reduce(seed_tensor, op = dist.ReduceOp.SUM)
+    return int(seed_tensor.item())
+
 _synced_populations = set()
 
 def evaluate_population_distributed(
@@ -195,10 +207,16 @@ def evaluate_population_distributed(
     batch_eval = False,
     device: torch.device | str | None = None,
     contiguous = False,
-    preserve_rng_state = True
+    preserve_rng_state = True,
+    shared_seed = True
 ) -> Tensor:
     pop_size = population.pop_size
     device = default(device, population.device)
+
+    # auto-sync the eval seed across ranks
+
+    if shared_seed and exists(population._eval_seed):
+        population._eval_seed = sync_seed_sum(population._eval_seed + 1)
 
     if is_distributed() and id(population) not in _synced_populations:
         sync_population(population)

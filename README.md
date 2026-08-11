@@ -110,6 +110,8 @@ x = torch.randn(1, 8)
 def eval_env(population, idx):
     sleep(0.1)
     with torch.no_grad():
+        # seed the environment with population.eval_seed (shared, auto-synced across ranks)
+
         return population(x, individual = idx).abs().mean().item() + torch.randn(1).item()
 
 for gen in range(10):
