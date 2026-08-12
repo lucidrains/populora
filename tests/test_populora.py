@@ -7,7 +7,7 @@ from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
 from einops import rearrange
-from populora import Population, Populations, PopuLoRA, evaluate_population_distributed, register_mutation
+from populora import Population, Populations, PopuLoRA, LoRA, evaluate_population_distributed, register_mutation
 
 # helper
 
@@ -789,3 +789,95 @@ def test_save_and_load(tmp_path):
     pop_copy.load(ckpt_path)
 
     assert torch.allclose(out, pop_copy(x, all_individuals = True))
+
+def test_evolution_deterministic():
+    x = torch.randint(0, 1000, (1, 16))
+
+    def run_evolution(seed):
+        torch.manual_seed(seed)
+
+        pop = Population(get_model(), pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'], seed = seed)
+
+        for _ in range(3):
+            preds = pop(x, all_individuals = True)
+            fitnesses = preds.abs().mean(dim = (1, 2))
+            pop.evolve_(fitnesses, mutation_type = 'layer_selective_gaussian', survive_frac = 0.5)
+
+        return {k: v.clone() for k, v in pop.weight_down.items()}
+
+    a = run_evolution(42)
+    b = run_evolution(42)
+    c = run_evolution(43)
+
+    for k in a.keys():
+        assert allclose(a[k], b[k])
+
+    assert any(not allclose(a[k], c[k]) for k in a.keys())
+
+def test_to_lora():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(model, pop_size = 4, low_rank = 4, lora_targets = ['attn_layers.layers.0.1.to_q'])
+
+    out_pop = pop(x, individual = 0)
+
+    # to_lora removes the population's hooks, so the delta is not double counted
+
+    lora = pop.to_lora(0)
+    out_lora = lora(x)
+
+    assert not pop._hooks_registered
+    assert allclose(out_pop, out_lora, atol = 1e-5)
+
+    # gradient-trainable
+
+    lora = pop.to_lora(1, requires_grad = True)
+
+    key = 'attn_layers_layers_0_1_to_q'
+    assert lora.weight_down[key].requires_grad
+
+    loss = lora(x).float().sum()
+    loss.backward()
+
+    assert lora.weight_down[key].grad is not None
+    assert lora.weight_up[key].grad is not None
+
+def test_lora_merge_and_save_load(tmp_path):
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(model, pop_size = 4, low_rank = 4, lora_targets = ['attn_layers.layers.0.1.to_q'])
+    out_pop = pop(x, individual = 2)
+
+    lora = pop.to_lora(2)
+
+    # save / load roundtrip
+
+    lora_path = tmp_path / 'lora.pt'
+    lora.save(lora_path)
+    lora.remove_hooks()
+
+    lora_loaded = LoRA.from_checkpoint(lora_path, model)
+    assert allclose(lora_loaded(x), out_pop, atol = 1e-5)
+
+    # merge into base
+
+    model_merged = lora_loaded.merge_()
+    assert allclose(model_merged(x), out_pop, atol = 1e-5)
+
+def test_save_individual_load_individual(tmp_path):
+    key = 'attn_layers_layers_0_1_to_q'
+
+    pop = Population(get_model(), pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+    pop.mutate_('full_gaussian', individual = 0, epsilon = 0.5)
+
+    path = tmp_path / 'individual.pt'
+    pop.save_individual(path, individual = 0)
+
+    pop2 = Population(get_model(), pop_size = 4, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+    pop2.load_individual(path, individual = 0)
+
+    assert allclose(pop.weight_down[key][0], pop2.weight_down[key][0])
+    assert allclose(pop.weight_up[key][0], pop2.weight_up[key][0])
+    assert not allclose(pop2.weight_down[key][1], pop2.weight_down[key][0])

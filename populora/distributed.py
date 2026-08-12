@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import atexit
+import random
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from functools import wraps
@@ -100,6 +101,7 @@ def sync_seed(seed = 0, src = 0):
 
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)

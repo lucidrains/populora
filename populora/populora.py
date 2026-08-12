@@ -45,6 +45,15 @@ maybe_cast_tuple = maybe(cast_tuple)
 def cast_tensor(val, device = None):
     return val if is_tensor(val) else tensor(val, device = device)
 
+def init_lora_weights(pop_size, dim, dim_inner, rank, device = None):
+    w_down = torch.empty(pop_size, dim, rank, device = device)
+    w_up = torch.empty(pop_size, dim_inner, rank, device = device)
+
+    init.normal_(w_down, std = dim ** -0.5)
+    init.normal_(w_up, std = rank ** -0.5)
+
+    return w_down, w_up
+
 # tensor helpers
 
 def _efficient_svd_of_lora(weight_down, weight_up):
@@ -118,7 +127,8 @@ def mutation_layer_selective_gaussian(
     keys = list(population.weight_down.keys())
     num_mutate = max(1, int(f * len(keys)))
 
-    mutate_keys = random.sample(keys, num_mutate)
+    mutate_indices = torch.randperm(len(keys), device = population.device)[:num_mutate]
+    mutate_keys = [keys[i] for i in mutate_indices.tolist()]
 
     for key in mutate_keys:
         weight_down = population.weight_down[key][idx]
@@ -627,6 +637,7 @@ class Population(Module):
         requires_grad: bool = False,
         eval_seed: int | None = 0,
         device: torch.device | str | None = None,
+        seed: int | None = None,
         selection_registry: dict | None = None,
         parent_selection_registry: dict | None = None,
         crossover_registry: dict | None = None,
@@ -652,6 +663,10 @@ class Population(Module):
 
         self.lora_targets = tuple(lora_targets)
 
+        if exists(seed):
+            torch.manual_seed(seed)
+            random.seed(seed)
+
         for path in lora_targets:
             linear = model.get_submodule(path)
             assert isinstance(linear, Linear), f'{path} must point to a Linear module'
@@ -659,11 +674,10 @@ class Population(Module):
             key = path.replace('.', '_')
             dim, dim_inner = linear.in_features, linear.out_features
 
-            self.weight_down[key] = Parameter(torch.empty(pop_size, dim, low_rank), requires_grad = requires_grad)
-            self.weight_up[key] = Parameter(torch.empty(pop_size, dim_inner, low_rank), requires_grad = requires_grad)
+            w_down, w_up = init_lora_weights(pop_size, dim, dim_inner, low_rank)
 
-            init.normal_(self.weight_down[key], std = dim ** -0.5)
-            init.normal_(self.weight_up[key], std = low_rank ** -0.5)
+            self.weight_down[key] = Parameter(w_down, requires_grad = requires_grad)
+            self.weight_up[key] = Parameter(w_up, requires_grad = requires_grad)
 
         self.register_hooks()
         self._individual = None
@@ -681,15 +695,12 @@ class Population(Module):
 
     @torch.no_grad()
     def state_dict_pkg(self):
-        first_w_down = next(iter(self.weight_down.values()))
-        low_rank = first_w_down.shape[-1]
-
         return dict(
             model = self.model.state_dict(),
             weight_down = self.weight_down.state_dict(),
             weight_up = self.weight_up.state_dict(),
             pop_size = self.pop_size,
-            low_rank = low_rank,
+            low_rank = self.low_rank,
             lora_targets = list(self.lora_targets)
         )
 
@@ -720,9 +731,74 @@ class Population(Module):
         )
         return pop.load(pkg)
 
+    @torch.no_grad()
+    def individual_weights(self, individual = 0):
+        # resolved index along with the individual's weight dicts
+
+        if is_tensor(individual):
+            individual = individual.item()
+
+        weight_down = {key: self.weight_down[key][individual] for key in self.weight_down.keys()}
+        weight_up = {key: self.weight_up[key][individual] for key in self.weight_up.keys()}
+
+        return individual, (weight_down, weight_up)
+
+    @torch.no_grad()
+    def save_individual(self, path: str | Path, individual = 0):
+        _, (weight_down, weight_up) = self.individual_weights(individual)
+
+        pkg = dict(
+            low_rank = self.low_rank,
+            lora_targets = list(self.lora_targets),
+            weight_down = {key: weight.clone() for key, weight in weight_down.items()},
+            weight_up = {key: weight.clone() for key, weight in weight_up.items()}
+        )
+
+        path = Path(path)
+        path.parent.mkdir(parents = True, exist_ok = True)
+        torch.save(pkg, path)
+        return self
+
+    @torch.no_grad()
+    def load_individual(self, path: str | Path | dict, individual = 0, strict: bool = True):
+        pkg = torch.load(path, map_location = self.device, weights_only = False) if not isinstance(path, dict) else path
+
+        individual, (weight_down, weight_up) = self.individual_weights(individual)
+
+        for key, w_down in pkg['weight_down'].items():
+            if strict:
+                assert key in self.weight_down, f'unknown lora target {key}'
+                assert w_down.shape == weight_down[key].shape, f'shape mismatch for target {key}'
+
+            weight_down[key].copy_(w_down.to(self.device))
+            weight_up[key].copy_(pkg['weight_up'][key].to(self.device))
+
+        return self
+
+    def to_lora(self, individual = 0, requires_grad: bool = True):
+        # extract an individual as a standalone trainable adapter, removing this population's hooks
+        # so the delta is applied exactly once
+
+        self.remove_hooks()
+
+        _, (weight_down, weight_up) = self.individual_weights(individual)
+
+        return LoRA(
+            model = self.model,
+            low_rank = self.low_rank,
+            lora_targets = self.lora_targets,
+            weight_down = weight_down,
+            weight_up = weight_up,
+            requires_grad = requires_grad
+        )
+
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @property
+    def low_rank(self):
+        return next(iter(self.weight_down.values())).shape[-1]
 
     @property
     def eval_seed(self):
@@ -1307,6 +1383,151 @@ class Population(Module):
 
         with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
             return self.model(*args, **kwargs)
+
+class LoRA(Module):
+    def __init__(
+        self,
+        model: Module,
+        *,
+        low_rank: int,
+        lora_targets: Sequence[str],
+        weight_down: dict | None = None,
+        weight_up: dict | None = None,
+        requires_grad: bool = True,
+        device: torch.device | str | None = None
+    ):
+        super().__init__()
+        self.model = model
+        self.low_rank = low_rank
+        self.lora_targets = tuple(lora_targets)
+
+        self.weight_down = ParameterDict()
+        self.weight_up = ParameterDict()
+
+        for path in lora_targets:
+            linear = model.get_submodule(path)
+            assert isinstance(linear, Linear), f'{path} must point to a Linear module'
+
+            key = path.replace('.', '_')
+            dim, dim_inner = linear.in_features, linear.out_features
+
+            if exists(weight_down) and key in weight_down:
+                w_down = cast_tensor(weight_down[key], device)
+                w_up = cast_tensor(weight_up[key], device)
+
+                assert w_down.shape == (dim, low_rank), f'weight_down for {path} must be {dim, low_rank}'
+                assert w_up.shape == (dim_inner, low_rank), f'weight_up for {path} must be {dim_inner, low_rank}'
+            else:
+                w_down, w_up = init_lora_weights(1, dim, dim_inner, low_rank)
+                w_down, w_up = w_down[0], w_up[0]
+
+            self.weight_down[key] = Parameter(w_down.clone(), requires_grad = requires_grad)
+            self.weight_up[key] = Parameter(w_up.clone(), requires_grad = requires_grad)
+
+        if exists(device):
+            self.to(device)
+
+        self._hooks = []
+        self._hooks_registered = False
+        self.register_hooks()
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def register_hooks(self):
+        if self._hooks_registered:
+            return
+
+        for path in self.lora_targets:
+            linear = self.model.get_submodule(path)
+            key = path.replace('.', '_')
+            self._hooks.append(linear.register_forward_hook(self._create_hook(key)))
+
+        self._hooks_registered = True
+
+    register_hooks_ = register_hooks
+
+    def remove_hooks(self):
+        if not self._hooks_registered:
+            return
+
+        for hook in self._hooks:
+            hook.remove()
+
+        self._hooks.clear()
+        self._hooks_registered = False
+
+    remove_hooks_ = remove_hooks
+
+    def _create_hook(self, lora_key: str):
+        def hook(_, args, output):
+            x = first(args)
+            if not exists(x):
+                return output
+
+            weight_down = self.weight_down[lora_key]
+            weight_up = self.weight_up[lora_key]
+
+            lora_out = einsum(x, weight_down.to(x.dtype), weight_up.to(x.dtype), '... d, d r, e r -> ... e')
+            return output + lora_out.to(output.dtype)
+
+        return hook
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    # save and load
+
+    def state_dict_pkg(self):
+        return dict(
+            low_rank = self.low_rank,
+            lora_targets = list(self.lora_targets),
+            weight_down = {key: weight.clone() for key, weight in self.weight_down.items()},
+            weight_up = {key: weight.clone() for key, weight in self.weight_up.items()}
+        )
+
+    @torch.no_grad()
+    def save(self, path: str | Path):
+        path = Path(path)
+        path.parent.mkdir(parents = True, exist_ok = True)
+        torch.save(self.state_dict_pkg(), path)
+        return self
+
+    @torch.no_grad()
+    def load(self, path: str | Path | dict, strict: bool = True):
+        pkg = torch.load(path, map_location = self.device, weights_only = False) if not isinstance(path, dict) else path
+        self.weight_down.load_state_dict(pkg['weight_down'], strict = strict)
+        self.weight_up.load_state_dict(pkg['weight_up'], strict = strict)
+        return self
+
+    @classmethod
+    def from_checkpoint(cls, path: str | Path | dict, model: Module, **kwargs):
+        pkg = torch.load(path, weights_only = False) if not isinstance(path, dict) else path
+        return cls(
+            model = model,
+            low_rank = pkg['low_rank'],
+            lora_targets = pkg['lora_targets'],
+            weight_down = pkg['weight_down'],
+            weight_up = pkg['weight_up'],
+            **kwargs
+        )
+
+    @torch.no_grad()
+    def merge_(self, model: Module | None = None):
+        model = default(model, self.model)
+
+        for path in self.lora_targets:
+            linear = model.get_submodule(path)
+            key = path.replace('.', '_')
+            w_down = self.weight_down[key]
+            w_up = self.weight_up[key]
+            linear.weight.add_(einsum(w_up, w_down, 'e r, d r -> e d'))
+
+        self.remove_hooks()
+        return model
+
+    merge = merge_
 
 class Populations(Module):
     def __init__(

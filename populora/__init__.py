@@ -2,6 +2,7 @@ from populora.populora import (
     Populations,
     Population,
     PopuLoRA,
+    LoRA,
     register_mutation,
     register_selection,
     register_parent_selection,
