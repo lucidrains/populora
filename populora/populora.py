@@ -290,6 +290,9 @@ def parent_select_tournament(fitnesses, num_children, num_parents_per_child = 2,
     pop_size = fitnesses.shape[-1]
     device = fitnesses.device
 
+    tournament_size = min(tournament_size, pop_size)
+    num_parents_per_child = min(num_parents_per_child, tournament_size)
+
     batch_shape = fitnesses.shape[:-1]
     rand_shape = (*batch_shape, num_children, pop_size)
     contender_ids = torch.randn(rand_shape, device = device).argsort(dim = -1)[..., :tournament_size]
@@ -1080,7 +1083,7 @@ class Population(Module):
         if all_individuals:
             individual = ...
         elif exists(individuals):
-            individual = list(individuals)
+            individual = cast_tensor(individuals, device = self.device)
 
         self._individual = individual
 
@@ -1336,16 +1339,24 @@ class Population(Module):
                 return output
 
             weight_down, weight_up = self.weight_down[lora_key], self.weight_up[lora_key]
+            individual = self._individual
 
-            if isinstance(self._individual, (list, tuple)) or self._individual is ...:
-                weight_down_i, weight_up_i = weight_down[self._individual], weight_up[self._individual]
+            weight_down_i, weight_up_i = weight_down[individual], weight_up[individual]
+
+            # per-sample routing when ids are vectorized (e.g. one individual per env)
+
+            routed_batch = individual is ... or (is_tensor(individual) and individual.ndim > 0)
+
+            if routed_batch:
                 p = weight_down_i.shape[0]
+
+                assert divisible_by(x.shape[0], p), f'batch {x.shape[0]} must be a multiple of routed individuals {p}'
 
                 x = rearrange(x, '(p b) ... -> p b ...', p = p)
                 lora_out = einsum(x, weight_down_i.to(x.dtype), weight_up_i.to(x.dtype), 'p b ... d, p d r, p e r -> p b ... e')
                 lora_out = rearrange(lora_out, 'p b ... -> (p b) ...')
             else:
-                lora_out = einsum(x, weight_down[self._individual].to(x.dtype), weight_up[self._individual].to(x.dtype), '... d, d r, e r -> ... e')
+                lora_out = einsum(x, weight_down_i.to(x.dtype), weight_up_i.to(x.dtype), '... d, d r, e r -> ... e')
 
             return output + lora_out.to(output.dtype)
 
@@ -1368,8 +1379,13 @@ class Population(Module):
             p = self.pop_size if all_individuals else len(individuals)
 
             def maybe_repeat_batch(t):
-                assert t.shape[0] in (1, p), f'batch dimension {t.shape[0]} must be equal to 1 or number of individuals {p}'
-                return repeat(t, '1 ... -> p ...', p = p) if t.shape[0] == 1 else t
+                # broadcast a singleton batch to each individual, otherwise expect a multiple of the batch
+
+                if t.shape[0] == 1:
+                    return repeat(t, '1 ... -> p ...', p = p)
+
+                assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+                return t
 
             args = tuple(
                 tree_map_tensor(maybe_repeat_batch, a) if i not in ignore else a

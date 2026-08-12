@@ -36,6 +36,8 @@ state = torch.randn(1, 4, 2)
 
 # evaluate population against environment
 
+# `individuals` also accepts a list of individual ids (one per sample)
+
 preds = pop(state, all_individuals = True)
 
 labels = torch.randn(1, 4, 1)

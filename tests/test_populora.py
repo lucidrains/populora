@@ -8,6 +8,7 @@ from torch import allclose
 from x_transformers import TransformerWrapper, Decoder
 from einops import rearrange
 from populora import Population, Populations, PopuLoRA, LoRA, evaluate_population_distributed, register_mutation
+from populora.populora import exists
 
 # helper
 
@@ -53,6 +54,67 @@ def test_population():
 
     out_subset = pop(x, individuals = [0, 1])
     assert out_subset.shape == (2, 16, 1000)
+
+def test_per_sample_individual_routing():
+    model = get_model()
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    x = torch.randint(0, 1000, (8, 16))
+    ids = torch.tensor([0, 1, 2, 3, 1, 2, 3, 0])
+
+    # per-sample individual ids aligned with batch dim (e.g. one individual per env)
+
+    out = pop(x, individual = ids)
+    assert out.shape == (*x.shape, 1000)
+
+    # matches scalar routing per sample
+
+    assert all(allclose(out[i], pop(x[i:i + 1], individual = idx)[0]) for i, idx in enumerate(ids.tolist()))
+
+    # same via the `individuals` kwarg
+
+    out_alt = pop(x, individuals = ids)
+    assert allclose(out, out_alt)
+
+    # 0-dim tensor index behaves like an int index
+
+    assert allclose(pop(x[:1], individual = ids[0]), pop(x[:1], individual = int(ids[0])))
+
+    # contiguous (p b) pattern with b > 1
+
+    x_grouped = x[:4].repeat(4, 1)
+    out_grouped = pop(x_grouped, individuals = [0, 1, 2, 3])
+    assert all(allclose(out_grouped[g * 4 + b], pop(x[b:b + 1], individual = g)[0]) for g in range(4) for b in range(4))
+
+def test_per_sample_individual_routing_gradient_flow():
+    model = get_model()
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q'],
+        requires_grad = False
+    )
+
+    x = torch.randint(0, 1000, (4, 16))
+    ids = torch.tensor([0, 1, 2, 3])
+
+    out = pop(x, individual = ids).mean()
+    out.backward()
+
+    # base trainable, adapters frozen
+
+    to_q = model.get_submodule('attn_layers.layers.0.1.to_q')
+    assert exists(to_q.weight.grad)
+    assert not exists(pop.weight_down['attn_layers_layers_0_1_to_q'].grad)
+    assert not exists(pop.weight_up['attn_layers_layers_0_1_to_q'].grad)
 
 def test_populations():
     model = get_model()
@@ -414,6 +476,36 @@ def test_islands_no_influence():
 
     assert (parents // 4 == group_indices).all(), 'parents crossed island boundaries'
 
+def test_parent_select_tournament_small_pool():
+    from populora.populora import parent_select_tournament
+
+    # clamp tournament to pool size for small islands
+
+    fitnesses = torch.tensor([1.0, 2.0])
+
+    parents = parent_select_tournament(
+        fitnesses,
+        num_children = 4,
+        num_parents_per_child = 2,
+        tournament_size = 3
+    )
+
+    assert parents.shape == (4, 2)
+    assert parents.max().item() < fitnesses.shape[-1]
+
+    # multi-group (island) case with one eligible parent per group
+
+    fitnesses_grouped = torch.tensor([[1.0], [3.0]])
+    parents_grouped = parent_select_tournament(
+        fitnesses_grouped,
+        num_children = 1,
+        num_parents_per_child = 2,
+        tournament_size = 3
+    )
+
+    assert parents_grouped.shape == (2, 1, 1)
+    assert parents_grouped.max().item() < fitnesses_grouped.shape[-1]
+
 def test_parent_select_queen_bee():
     pop = Population(
         get_model(),
@@ -700,7 +792,7 @@ def test_select_and_merge_with_z_score():
 
     fitnesses = torch.randn(16) * 100.0 - 500.0
     merged_model = pop.select_and_merge(fitnesses = fitnesses, use_z_score = True)
-    assert merged_model is not None
+    assert exists(merged_model)
 
 def test_shared_eval_seed():
     model = get_model()
@@ -731,7 +823,7 @@ def test_shared_eval_seed():
     for _ in range(3):
         pop3.evaluate_distributed(eval_env)
 
-    assert pop3.eval_seed is None
+    assert not exists(pop3.eval_seed)
 
 def test_eval_seed_optional():
     # objects with _eval_seed = None are unaffected
@@ -840,8 +932,8 @@ def test_to_lora():
     loss = lora(x).float().sum()
     loss.backward()
 
-    assert lora.weight_down[key].grad is not None
-    assert lora.weight_up[key].grad is not None
+    assert exists(lora.weight_down[key].grad)
+    assert exists(lora.weight_up[key].grad)
 
 def test_lora_merge_and_save_load(tmp_path):
     model = get_model()
