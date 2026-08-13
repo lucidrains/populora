@@ -3,6 +3,7 @@ from populora.populora import (
     Population,
     PopuLoRA,
     LoRA,
+    Coevolve,
     register_mutation,
     register_selection,
     register_parent_selection,

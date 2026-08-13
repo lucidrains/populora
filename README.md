@@ -142,6 +142,94 @@ or across machines
 torchrun --nnodes=4 --nproc-per-node=1 --rdzv-endpoint=$MASTER_HOST:29500 evolve.py
 ```
 
+## Coevolution
+
+Wrap multiple populations whose fitnesses derive from one another's outputs - e.g. one population proposes candidates while another judges them, each evolving against the other's current behavior
+
+Each population supplies a `probe` (produces its outputs for a step) and a `fitness` function (scores it). Parameters are injected from the function signature: a parameter named after a population receives that population's outputs (computed once per step, in dependency order)
+
+### Two populations
+
+```python
+import torch
+from torch import nn
+from populora import Population, Coevolve
+
+# the solver fits T(x) = sin(pi x); the proposer proposes test inputs - each is
+# scored by the other's outputs
+
+pop_size = 8
+
+proposer = Population(nn.Sequential(nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1), nn.Tanh()), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+solver = Population(nn.Sequential(nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1)), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+
+def probe_proposer(coevolve):
+    return coevolve.proposer(torch.randn(1, 1), all_individuals = True)  # (P, 1) proposed inputs
+
+def probe_solver(coevolve, proposer_outputs):
+    return coevolve.solver(proposer_outputs.repeat(solver.pop_size, 1), all_individuals = True)  # each solver sees all inputs
+
+def fitness_solver(solver_outputs, proposer_outputs):
+    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
+    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
+    return -errors.mean(dim = 1)  # (S,) accuracy on the proposed inputs
+
+def fitness_proposer(proposer_outputs, solver_outputs):
+    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
+    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
+    return errors.mean(dim = 0)  # (P,) error induced on the solver
+
+coevolve = Coevolve(populations = dict(
+    proposer = dict(population = proposer, probe = probe_proposer, fitness = fitness_proposer),
+    solver = dict(population = solver, probe = probe_solver, fitness = fitness_solver)
+))
+
+for _ in range(100):
+    coevolve.step()  # probes, derives fitnesses, evolves each population
+```
+
+`step` records the best / mean fitness per population in `coevolve.history`; populations are reachable as `coevolve.proposer` / `coevolve['solver']`
+
+### Three populations, in a chain
+
+Append a `judge` that sees every (input, prediction) pair and scores the solver's correctness - the solver must stay accurate while fooling the judge, and the proposer keeps proposing inputs the solver gets wrong
+
+```python
+judge = Population(nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 1)), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+
+def probe_judge(coevolve, solver_outputs, proposer_outputs):
+    pairs = torch.cat((proposer_outputs.repeat(solver.pop_size, 1), solver_outputs), dim = -1)
+    return coevolve.judge(pairs, all_individuals = True)  # (S * P, 1) correctness logits
+
+def fitness_solver(solver_outputs, proposer_outputs, judge_outputs):
+    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
+    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
+    fooled = ((judge_outputs > 0.) & ((solver_outputs - target) ** 2 >= 0.05)).float()  # judge said "correct" on a wrong answer
+    return -errors.mean(dim = 1) + 0.25 * fooled.reshape(solver.pop_size, -1).mean(dim = 1)  # accurate and hard to catch
+
+def fitness_judge(solver_outputs, proposer_outputs, judge_outputs):
+    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
+    correct = (solver_outputs - target) ** 2 < 0.05
+    acc = ((judge_outputs > 0.) == correct).float().reshape(judge.pop_size, -1).mean(dim = 1)
+    return acc  # (J,) how well it catches the solver's mistakes
+
+def fitness_proposer(proposer_outputs, solver_outputs):
+    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
+    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
+    return errors.mean(dim = 0)  # (P,) error its inputs induce on the solver
+
+coevolve = Coevolve(populations = dict(
+    proposer = dict(population = proposer, probe = probe_proposer, fitness = fitness_proposer),
+    solver = dict(population = solver, probe = probe_solver, fitness = fitness_solver),
+    judge = dict(population = judge, probe = probe_judge, fitness = fitness_judge)
+))
+
+for _ in range(100):
+    coevolve.step(distributed = True)  # distribute the probes across ranks
+```
+
+Probes must form a chain - a probe that depends on its own outputs (directly or transitively) raises at construction, reporting the exact cycle (e.g. `proposer -> solver -> proposer`). Fitnesses can close a circle - fitness_A from B's outputs, fitness_B from C's, fitness_C from A's - since every population is probed before any fitness is derived
+
 ## Citations
 
 ```bibtex

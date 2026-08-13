@@ -1,3 +1,5 @@
+import math
+
 import pytest
 param = pytest.mark.parametrize
 
@@ -6,8 +8,8 @@ import torch.nn as nn
 from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
-from einops import rearrange
-from populora import Population, Populations, PopuLoRA, LoRA, evaluate_population_distributed, register_mutation
+from einops import rearrange, repeat
+from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, evaluate_population_distributed, register_mutation
 from populora.populora import exists
 
 # helper
@@ -973,3 +975,427 @@ def test_save_individual_load_individual(tmp_path):
     assert allclose(pop.weight_down[key][0], pop2.weight_down[key][0])
     assert allclose(pop.weight_up[key][0], pop2.weight_up[key][0])
     assert not allclose(pop2.weight_down[key][1], pop2.weight_down[key][0])
+
+# coevolution
+
+def make_mlp(hidden_dim = 32, proposer = False):
+    layers = [nn.Linear(1, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)]
+
+    if proposer:
+        layers.append(nn.Tanh())
+
+    return nn.Sequential(*layers)
+
+def target_fn(x):
+    return torch.sin(math.pi * x)
+
+def make_coevolve(pop_size = 8, hidden_dim = 32, seed = 42):
+    torch.manual_seed(seed)
+
+    archive = []
+    state = {}
+
+    def probe_proposer(coevolve):
+        z = torch.randn(1, 1)
+        x = coevolve.proposer(z, all_individuals = True)  # (P, 1)
+
+        if len(archive) > 0:
+            archive_pts = torch.cat(archive, dim = 0)
+            novelty_dist = (x.unsqueeze(1) - archive_pts.unsqueeze(0)).abs().min(dim = 1).values.squeeze(-1)
+        else:
+            novelty_dist = torch.full((x.shape[0],), float('inf'))
+
+        state['novel'] = novelty_dist > 0.02
+        state['novelty_dist'] = novelty_dist
+
+        for i in range(x.shape[0]):
+            if state['novel'][i]:
+                archive.append(x[i:i + 1].clone())
+
+        return x
+
+    def probe_solver(coevolve, proposer_outputs):
+        x_eval = torch.cat(archive + [proposer_outputs], dim = 0)
+        state['x_eval'] = x_eval
+
+        x_rep = repeat(x_eval, 'a 1 -> (s a) 1', s = pop_size)
+        preds = coevolve.solver(x_rep, all_individuals = True)
+        return rearrange(preds, '(s a) 1 -> s a', s = pop_size)  # (S, A + P)
+
+    def fitness_solver(solver_outputs):
+        errors = (solver_outputs - target_fn(state['x_eval']).T) ** 2  # (S, A + P)
+
+        return -errors.mean(dim = 1)  # (S,) - accuracy over the archive
+
+    def fitness_proposer(proposer_outputs, solver_outputs):
+        x = proposer_outputs
+
+        errors = (solver_outputs - target_fn(state['x_eval']).T) ** 2
+
+        induced = errors[:, -x.shape[0]:].mean(dim = 0)
+        induced = induced * state['novel'].float()  # only genuinely new proposals earn induced error credit
+
+        novelty = 1.0 * state['novelty_dist'].clamp(max = 1.0)
+        spread = 0.5 * (x.unsqueeze(1) - x.unsqueeze(0)).abs().mean(dim = 1).squeeze(-1)
+
+        return induced + novelty + spread  # (P,) - error induced + novelty + spread
+
+    return Coevolve(
+        populations = dict(
+            proposer = dict(
+                population = Population(make_mlp(hidden_dim, proposer = True), pop_size = pop_size, low_rank = 4, lora_targets = ['0', '2']),
+                probe = probe_proposer,
+                fitness = fitness_proposer
+            ),
+            solver = dict(
+                population = Population(make_mlp(hidden_dim), pop_size = pop_size, low_rank = 4, lora_targets = ['0', '2']),
+                probe = probe_solver,
+                fitness = fitness_solver
+            )
+        ),
+        evolve_kwargs = dict(
+            proposer = dict(survive_frac = 0.5, elite_frac = 0.2),
+            solver = dict(survive_frac = 0.5, elite_frac = 0.2)
+        )
+    )
+
+def evaluate_grid(coevolve, pop_size, grid = None):
+    grid = torch.linspace(-1, 1, 129).reshape(1, -1) if grid is None else grid
+
+    grid_rep = repeat(grid, '1 n -> (s n) 1', s = pop_size)
+    preds = coevolve.solver(grid_rep, all_individuals = True)
+    preds = rearrange(preds, '(s n) 1 -> s n', s = pop_size)
+
+    return (preds - target_fn(grid)) ** 2  # (S, n)
+
+def test_coevolve_api():
+    pop_size = 8
+    coevolve = make_coevolve(pop_size = pop_size)
+
+    assert set(coevolve.populations.keys()) == {'proposer', 'solver'}
+    assert len(coevolve) == 2
+    assert coevolve.generation == 0
+    assert coevolve.history['proposer'] == []
+
+    fitnesses = coevolve.step()
+
+    assert coevolve.generation == 1
+    assert set(fitnesses.keys()) == {'proposer', 'solver'}
+    assert fitnesses['proposer'].shape == (pop_size,)
+    assert fitnesses['solver'].shape == (pop_size,)
+    assert len(coevolve.history['proposer']) == 1
+    assert len(coevolve.history['solver']) == 1
+
+    # fitnesses derived from the other population's outputs - a solver facing a fresh
+    # proposer cannot have positive fitness, and a fresh proposer induces error
+
+    assert fitnesses['solver'].max() < 0.
+    assert fitnesses['proposer'].max() > 0.
+
+    for _ in range(4):
+        fitnesses = coevolve.step()
+
+    assert coevolve.generation == 5
+    assert len(coevolve.history['solver']) == 5
+
+    # per-step fitness function override
+
+    fitnesses = coevolve.step(fitness_fns = dict(
+        proposer = lambda proposer_outputs: torch.zeros(pop_size),
+        solver = lambda solver_outputs: torch.zeros(pop_size)
+    ))
+
+    assert coevolve.generation == 6
+
+    # attribute and indexing access to populations, individual forward
+
+    x = coevolve.proposer(torch.randn(1, 1), individual = 0)
+    assert x.shape == (1, 1)
+    assert coevolve['proposer'] is coevolve.populations['proposer']
+    assert coevolve.proposer is coevolve.populations['proposer']
+
+def test_coevolve_signature_di():
+    # dependencies are detected from the function signatures - parameters named after
+    # populations receive their outputs, computed once per step in dependency order;
+    # `coevolve`, `generation`, and `pop` are injected from the container
+
+    calls = []
+
+    def probe_A(coevolve, generation):
+        calls.append(('probe_A', generation))
+        return coevolve.A(torch.randn(1, 1), all_individuals = True)
+
+    def probe_B(coevolve, A_outputs):
+        calls.append(('probe_B', A_outputs.shape))
+        return coevolve.B(torch.randn(1, 1), all_individuals = True)
+
+    def fitness_A(A_outputs, B_outputs, pop):
+        calls.append(('fitness_A', pop.pop_size))
+        return torch.randn(pop.pop_size)
+
+    def fitness_B(B_outputs, A_outputs, generation):
+        calls.append(('fitness_B', generation))
+        return torch.randn(B_outputs.shape[0])
+
+    coevolve = Coevolve(
+        populations = dict(
+            A = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = probe_A, fitness = fitness_A),
+            B = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = probe_B, fitness = fitness_B)
+        )
+    )
+
+    fitnesses = coevolve.step()
+
+    assert set(fitnesses.keys()) == {'A', 'B'}
+    assert fitnesses['A'].shape == (8,)
+    assert fitnesses['B'].shape == (8,)
+
+    # probes run in dependency order (B's probe names A's outputs, so A is probed
+    # first), each population probed exactly once, then the fitness functions
+
+    assert calls[0] == ('probe_A', 0)
+    assert calls[1] == ('probe_B', (8, 1))
+    assert {call[0] for call in calls[2:]} == {'fitness_A', 'fitness_B'}
+
+    assert calls[1][0] == 'probe_B'
+
+    # generation advanced for the next step
+
+    coevolve.step()
+
+    assert calls[4][0] == 'probe_A'
+    assert calls[4][1] == 1
+
+def test_coevolve_arms_race():
+    pop_size = 8
+    coevolve = make_coevolve(pop_size = pop_size, seed = 42)
+
+    initial_grid_mse = evaluate_grid(coevolve, pop_size).mean(dim = 1).min().item()
+    hardnesses = []
+
+    for gen in range(150):
+        eps = 0.15 * (0.995 ** gen)
+        fitnesses = coevolve.step(evolve_kwargs = dict(
+            proposer = dict(epsilon = eps),
+            solver = dict(epsilon = eps)
+        ))
+        hardnesses.append(fitnesses['proposer'].max().item())
+
+    final_grid_mse = evaluate_grid(coevolve, pop_size).mean(dim = 1).min().item()
+
+    # the arms race should drive the solver to a good global fit ...
+
+    assert final_grid_mse < initial_grid_mse / 2, f'no improvement: {initial_grid_mse} -> {final_grid_mse}'
+    assert final_grid_mse < 0.1, f'coevolution did not converge, final grid mse {final_grid_mse}'
+
+    # ... while proposers keep finding weak spots (game does not collapse)
+
+    assert max(hardnesses[-10:]) > 0.02, 'proposer population collapsed, no hardness induced'
+
+def test_coevolve_uneven_pop_sizes():
+    def probe_solver(coevolve, proposer_outputs):
+        # each of the 8 solvers sees all 4 proposed points
+
+        preds = coevolve.solver(repeat(proposer_outputs, 'p 1 -> (s p) 1', s = 8), all_individuals = True)
+        preds = rearrange(preds, '(s p) 1 -> s p', s = 8)
+        assert preds.shape == (8, 4)
+        return preds
+
+    coevolve = Coevolve(
+        populations = dict(
+            proposer = dict(
+                population = Population(make_mlp(proposer = True), pop_size = 4, low_rank = 2, lora_targets = ['0', '2']),
+                probe = lambda coevolve: coevolve.proposer(torch.randn(1, 1), all_individuals = True),
+                fitness = lambda proposer_outputs, solver_outputs: torch.randn(4)
+            ),
+            solver = dict(
+                population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']),
+                probe = probe_solver,
+                fitness = lambda solver_outputs: torch.randn(8)
+            )
+        )
+    )
+
+    fitnesses = coevolve.step()
+    assert fitnesses['proposer'].shape == (4,)
+    assert fitnesses['solver'].shape == (8,)
+
+def test_coevolve_save_load():
+    pop_size = 4
+    coevolve = make_coevolve(pop_size = pop_size, seed = 0)
+
+    coevolve.step()
+
+    x = torch.randn(1, 1)
+    preds_before = coevolve.proposer(x, all_individuals = True)
+
+    coevolve.save('/tmp/coevolve_test.pt')
+
+    coevolve2 = make_coevolve(pop_size = pop_size, seed = 1)
+    coevolve2.load('/tmp/coevolve_test.pt')
+
+    preds_after = coevolve2.proposer(x, all_individuals = True)
+
+    assert allclose(preds_before, preds_after)
+
+def test_coevolve_missing_probe():
+    # outputs of a population are requested by name but it has no probe - caught at
+    # registration time
+
+    with pytest.raises(AssertionError, match = 'has no probe'):
+        Coevolve(
+            populations = dict(
+                A = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), fitness = lambda A_outputs: torch.randn(8)),
+                B = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = lambda: torch.randn(8), fitness = lambda A_outputs, B_outputs: torch.randn(8))
+            )
+        )
+
+def test_coevolve_missing_fitness():
+    coevolve = Coevolve(
+        populations = dict(
+            proposer = dict(population = Population(make_mlp(proposer = True), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = lambda: torch.randn(8)),
+            solver = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = lambda: torch.randn(8), fitness = lambda: torch.randn(8))
+        )
+    )
+
+    with pytest.raises(AssertionError):
+        coevolve.step()
+
+def test_coevolve_unknown_parameter():
+    with pytest.raises(TypeError, match = 'cannot resolve parameter'):
+        Coevolve(
+            populations = dict(
+                A = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = lambda: torch.randn(8), fitness = lambda nonsense: torch.randn(8))
+            )
+        )
+
+    # the same applies to probes
+
+    with pytest.raises(TypeError, match = 'cannot resolve parameter'):
+        Coevolve(
+            populations = dict(
+                proposer = dict(
+                    population = Population(make_mlp(proposer = True), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']),
+                    probe = lambda solver_ouputs: torch.randn(8),
+                    fitness = lambda proposer_outputs: torch.randn(8)
+                )
+            )
+        )
+
+def test_coevolve_circular_probe_dependencies():
+    # probes that transitively depend on their own outputs raise at registration,
+    # with the full cycle path reported
+
+    def make(populations):
+        return Coevolve(populations = populations)
+
+    def pop(name, probe, fitness):
+        return dict(
+            population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']),
+            probe = probe,
+            fitness = fitness
+        )
+
+    # two-population cycle
+
+    with pytest.raises(RuntimeError, match = 'A -> B -> A'):
+        make(dict(
+            A = pop('A', lambda B_outputs: torch.randn(8), lambda A_outputs: torch.randn(8)),
+            B = pop('B', lambda A_outputs: torch.randn(8), lambda B_outputs: torch.randn(8))
+        ))
+
+    # three-population cycle reports the whole path, not just the re-entered node
+
+    with pytest.raises(RuntimeError, match = 'A -> B -> C -> A'):
+        make(dict(
+            A = pop('A', lambda B_outputs: torch.randn(8), lambda A_outputs: torch.randn(8)),
+            B = pop('B', lambda C_outputs: torch.randn(8), lambda B_outputs: torch.randn(8)),
+            C = pop('C', lambda A_outputs: torch.randn(8), lambda C_outputs: torch.randn(8))
+        ))
+
+    # a probe depending on its own outputs directly
+
+    with pytest.raises(RuntimeError, match = 'A -> A'):
+        make(dict(
+            A = pop('A', lambda A_outputs: torch.randn(8), lambda A_outputs: torch.randn(8))
+        ))
+
+    # fitness circles stay allowed - every population is probed before any fitness is
+    # derived, so fitness_A may score B's outputs and fitness_B may score A's
+
+    def probe_A(coevolve):
+        return coevolve.A(torch.randn(1, 1), all_individuals = True)
+
+    def probe_B(coevolve):
+        return coevolve.B(torch.randn(1, 1), all_individuals = True)
+
+    coevolve = make(dict(
+        A = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = probe_A, fitness = lambda A_outputs, B_outputs: torch.randn(8)),
+        B = dict(population = Population(make_mlp(), pop_size = 8, low_rank = 2, lora_targets = ['0', '2']), probe = probe_B, fitness = lambda A_outputs, B_outputs: torch.randn(8))
+    ))
+
+    coevolve.step()
+
+def test_coevolve_chain_three_populations():
+    # three populations in a chain - proposer -> solver -> judge. each population's
+    # probe consumes the previous one's outputs, so probes run proposer, solver,
+    # judge in order, and every fitness sees every population's outputs
+
+    pop_size = 6
+    torch.manual_seed(0)
+
+    proposer = Population(make_mlp(16, proposer = True), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+    solver = Population(make_mlp(16), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+    judge = Population(make_mlp(16), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+
+    calls = []
+
+    def probe_proposer(coevolve):
+        calls.append('probe_proposer')
+        return coevolve.proposer(torch.randn(1, 1), all_individuals = True)  # (P, 1)
+
+    def probe_solver(coevolve, proposer_outputs):
+        calls.append('probe_solver')
+        return coevolve.solver(proposer_outputs.repeat(solver.pop_size, 1), all_individuals = True)  # (S * P, 1)
+
+    def probe_judge(coevolve, solver_outputs):
+        calls.append('probe_judge')
+        return coevolve.judge(solver_outputs, all_individuals = True)  # (J * S * P, 1)
+
+    def fitness_judge(judge_outputs):
+        return torch.zeros(pop_size)
+
+    def fitness_solver(solver_outputs):
+        return torch.zeros(pop_size)
+
+    def fitness_proposer(proposer_outputs, solver_outputs, judge_outputs):
+        assert proposer_outputs.shape == (pop_size, 1)
+        assert solver_outputs.shape == (pop_size * pop_size, 1)
+        assert judge_outputs.shape == (pop_size * pop_size, 1)
+        return torch.zeros(pop_size)
+
+    coevolve = Coevolve(
+        populations = dict(
+            proposer = dict(population = proposer, probe = probe_proposer, fitness = fitness_proposer),
+            solver = dict(population = solver, probe = probe_solver, fitness = fitness_solver),
+            judge = dict(population = judge, probe = probe_judge, fitness = fitness_judge)
+        )
+    )
+
+    coevolve.step()
+
+    # probes run down the chain, each exactly once, before the fitnesses
+
+    assert calls == ['probe_proposer', 'probe_solver', 'probe_judge']
+
+    # every fitness function sees every population's outputs (a fitness circle closes
+    # over the chain - the proposer is scored by the judge's verdicts)
+
+    fitnesses = coevolve.step(fitness_fns = dict(
+        proposer = lambda proposer_outputs, solver_outputs, judge_outputs: torch.ones(pop_size),
+        solver = lambda proposer_outputs, solver_outputs, judge_outputs: torch.ones(pop_size),
+        judge = lambda proposer_outputs, solver_outputs, judge_outputs: torch.ones(pop_size)
+    ))
+
+    assert fitnesses['proposer'].shape == (pop_size,)
+    assert coevolve.generation == 2
