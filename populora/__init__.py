@@ -19,6 +19,7 @@ from populora.populora import (
 )
 from populora.distributed import (
     DistributedInfo,
+    broadcast_object,
     distributed,
     distributed_device,
     distributed_rank,

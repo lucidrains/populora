@@ -1291,6 +1291,7 @@ class Population(Module):
         contiguous = False,
         preserve_rng_state = True,
         shared_seed = True,
+        sync_base_model = False,
         **kwargs
     ):
         from populora.distributed import evaluate_population_distributed
@@ -1303,6 +1304,7 @@ class Population(Module):
             contiguous = contiguous,
             preserve_rng_state = preserve_rng_state,
             shared_seed = shared_seed,
+            sync_base_model = sync_base_model,
             **kwargs
         )
 
@@ -1853,12 +1855,13 @@ class Coevolve(Module):
 
     @torch.no_grad()
     def _compute_outputs_distributed(self, order):
-        # each rank evaluates its share of the populations (round-robin, in dependency
-        # order) and the outputs are broadcast, so every rank ends with all of them.
-        # probe noise is drawn under a preserved rng so evolution stays in sync
+        # each rank evaluates its share of the populations (round-robin, in
+        # dependency order) and the outputs are broadcast, so every rank ends
+        # with all of them. probe noise is drawn under a preserved rng so the
+        # evolution stays in sync. tensor outputs are broadcast raw - much
+        # cheaper than pickling - with a pickled fallback for anything else
 
-        from populora.distributed import distributed_rank, distributed_world_size, preserve_rng
-        import torch.distributed as dist
+        from populora.distributed import broadcast_object, distributed_rank, distributed_world_size, preserve_rng
 
         world_size = distributed_world_size()
         outputs = dict()
@@ -1866,10 +1869,9 @@ class Coevolve(Module):
         with preserve_rng():
             for i, name in enumerate(order):
                 owner = i % world_size
-
-                payload = [self._inject(self.probes[name], name, outputs) if distributed_rank() == owner else None]
-                dist.broadcast_object_list(payload, src = owner)
-                outputs[name] = payload[0]
+                is_owner = distributed_rank() == owner
+                value = self._inject(self.probes[name], name, outputs) if is_owner else None
+                outputs[name] = broadcast_object(value, src = owner)
 
         return outputs
 

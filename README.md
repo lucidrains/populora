@@ -85,7 +85,7 @@ model = pop.select_and_merge_best_(fitnesses)
 
 Evolution parallelizes trivially - each rank evaluates its share of the population against the environment, the fitnesses are gathered, and the evolution step runs identically on every rank
 
-The population is automatically moved to the distributed device (each rank's local GPU) on construction - pass `device` to `Population` to override
+The population is automatically moved to the distributed device (each rank's local GPU) on construction - pass `device` to `Population` to override. Before the first evaluation, only the LoRA weights are synced across ranks (the base model is shared and identical on every rank) - pass `sync_base_model = True` to `evaluate_distributed` to also broadcast the base model
 
 ```python
 from time import sleep
@@ -229,6 +229,8 @@ for _ in range(100):
 ```
 
 Probes must form a chain - a probe that depends on its own outputs (directly or transitively) raises at construction, reporting the exact cycle (e.g. `proposer -> solver -> proposer`). Fitnesses can close a circle - fitness_A from B's outputs, fitness_B from C's, fitness_C from A's - since every population is probed before any fitness is derived
+
+With `step(distributed = True)`, probes are split across ranks (one per rank, round-robin) and their outputs are broadcast - tensor outputs go over a single raw broadcast, far cheaper than pickling, so each rank derives the same fitnesses and evolves in lockstep. Probes must be pure - only their return value is shared, so side effects (state mutations, logging) happen only on the owning rank and silently diverge across ranks
 
 ## Citations
 

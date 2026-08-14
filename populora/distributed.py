@@ -6,15 +6,15 @@ import random
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from functools import wraps
+from weakref import WeakKeyDictionary
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
 from torch import Tensor, tensor
-from torch.nn import Module
 
-from populora.populora import cast_tensor, default, exists, is_tensor
+from populora.populora import Population, cast_tensor, default, exists, is_tensor
 
 # process group
 
@@ -87,16 +87,44 @@ def default_backend(device = None):
         return 'nccl' if torch.device(device).type == 'cuda' else 'gloo'
     return 'nccl' if torch.cuda.is_available() else 'gloo'
 
+# collectives
+
+def _collective_device():
+    # tensors must live on this device to take part in the process group's collectives.
+    # the current device is only set inside the `distributed()` context - use each
+    # rank's local device directly so collectives work under plain torchrun too
+
+    return distributed_device() if dist.get_backend() == 'nccl' else torch.device('cpu')
+
+@torch.no_grad()
+def _tensor_collective(tensor, fn, copy_back = True):
+    # run a collective `fn` on a tensor, moving it to the backend's device when
+    # needed and copying the result back when it was moved and `copy_back`
+
+    device = _collective_device()
+
+    if tensor.device.type == device.type:
+        fn(tensor)
+    else:
+        moved = tensor.to(device)
+        fn(moved)
+
+        if copy_back:
+            tensor.copy_(moved)
+
+    return tensor
+
+def _broadcast_tensor(tensor, src = 0):
+    return _tensor_collective(tensor, lambda t: dist.broadcast(t, src = src), copy_back = distributed_rank() != src)
+
 # seeds
 
 def sync_seed(seed = 0, src = 0):
     _ensure_process_group()
 
     if is_distributed():
-        device = distributed_device()
-        use_cuda = device.type == 'cuda' and dist.get_backend() == 'nccl'
-        seed_tensor = tensor(seed, dtype = torch.long, device = device if use_cuda else 'cpu')
-        dist.broadcast(seed_tensor, src = src)
+        seed_tensor = tensor(seed, dtype = torch.long)
+        _broadcast_tensor(seed_tensor, src = src)
         seed = int(seed_tensor.item())
 
     torch.manual_seed(seed)
@@ -145,31 +173,54 @@ def preserve_rng():
             torch.cuda.set_rng_state_all(cuda_states)
         np.random.set_state(np_state)
 
+# broadcast helpers
+
+def broadcast_object(value, src = 0):
+    # broadcast a tensor, or any picklable value. tensors travel raw - far cheaper
+    # than pickling - announced by their (shape, dtype) on the object broadcast;
+    # anything else (dicts, lists, small payloads, ...) is pickled in the same
+    # call. `value` is only used on the `src` rank
+
+    if not is_distributed():
+        return value
+
+    is_src = distributed_rank() == src
+
+    meta = [None, None]
+
+    if is_src:
+        if is_tensor(value):
+            value = value.contiguous()  # the raw broadcast needs contiguous storage
+            meta = [value.dtype, value.shape]
+        else:
+            meta = ['pickle', value]
+
+    dist.broadcast_object_list(meta, src = src)
+    tag, payload = meta
+
+    if tag == 'pickle':
+        return payload
+
+    tensor = value if is_src else torch.empty(payload, dtype = tag, device = _collective_device())
+    return _broadcast_tensor(tensor, src = src)
+
 # sync population
 
 @torch.no_grad()
-def sync_population(population: Module, src = 0):
+def sync_population(population: Population, src = 0, sync_base_model = False):
     if not is_distributed():
         return population
 
-    backend = dist.get_backend()
+    # only the lora weights are broadcast by default - the base model is shared and
+    # identical on every rank by construction. opt in to sync it too
 
-    for tensor in population.state_dict().values():
-        if not is_tensor(tensor):
-            continue
+    lora_params = [*population.weight_down.values(), *population.weight_up.values()]
+    params = [*lora_params, *population.model.state_dict().values()] if sync_base_model else lora_params
 
-        if backend == 'nccl' and not tensor.is_cuda:
-            tensor_cuda = tensor.cuda()
-            dist.broadcast(tensor_cuda, src = src)
-            tensor.copy_(tensor_cuda.cpu())
-        elif tensor.device.type == 'cpu':
-            dist.broadcast(tensor, src = src)
-        else:
-            tensor_cpu = tensor.cpu()
-            dist.broadcast(tensor_cpu, src = src)
-            tensor.copy_(tensor_cpu)
+    for param in params:
+        if is_tensor(param):
+            _broadcast_tensor(param, src = src)
 
-    dist.barrier()
     return population
 
 # partition indices
@@ -195,22 +246,21 @@ def sync_seed_sum(seed):
     if not is_distributed():
         return seed
 
-    device = distributed_device()
-    use_cuda = device.type == 'cuda' and dist.get_backend() == 'nccl'
-    seed_tensor = tensor(seed, dtype = torch.long, device = device if use_cuda else 'cpu')
-    dist.all_reduce(seed_tensor, op = dist.ReduceOp.SUM)
+    seed_tensor = tensor(seed, dtype = torch.long)
+    _tensor_collective(seed_tensor, lambda t: dist.all_reduce(t, op = dist.ReduceOp.SUM))
     return int(seed_tensor.item())
 
-_synced_populations = set()
+_synced_populations = WeakKeyDictionary()
 
 def evaluate_population_distributed(
-    population,
+    population: Population,
     eval_fn,
     batch_eval = False,
     device: torch.device | str | None = None,
     contiguous = False,
     preserve_rng_state = True,
-    shared_seed = True
+    shared_seed = True,
+    sync_base_model = False
 ) -> Tensor:
     pop_size = population.pop_size
     device = default(device, population.device)
@@ -220,9 +270,15 @@ def evaluate_population_distributed(
     if shared_seed and exists(population._eval_seed):
         population._eval_seed = sync_seed_sum(population._eval_seed + 1)
 
-    if is_distributed() and id(population) not in _synced_populations:
-        sync_population(population)
-        _synced_populations.add(id(population))
+    if is_distributed():
+        # keyed by the population itself (not id, which is reused after gc), and
+        # tracking the base model flag so a later opt-in is not silently dropped
+
+        synced_base_model = _synced_populations.get(population)
+
+        if synced_base_model is None or (sync_base_model and not synced_base_model):
+            sync_population(population, sync_base_model = sync_base_model)
+            _synced_populations[population] = sync_base_model
 
     assigned_indices = partition_indices(pop_size, contiguous = contiguous)
 
@@ -242,15 +298,6 @@ def evaluate_population_distributed(
                 fitnesses[idx] = cast_tensor(eval_fn(population, idx), device = device).to(dtype = torch.float32)
 
     if is_distributed():
-        if dist.get_backend() == 'nccl' and not fitnesses.is_cuda:
-            fitnesses_cuda = fitnesses.cuda()
-            dist.all_reduce(fitnesses_cuda, op = dist.ReduceOp.SUM)
-            fitnesses.copy_(fitnesses_cuda.cpu())
-        elif fitnesses.device.type == 'cpu':
-            dist.all_reduce(fitnesses, op = dist.ReduceOp.SUM)
-        else:
-            fitnesses_cpu = fitnesses.cpu()
-            dist.all_reduce(fitnesses_cpu, op = dist.ReduceOp.SUM)
-            fitnesses.copy_(fitnesses_cpu)
+        _tensor_collective(fitnesses, lambda t: dist.all_reduce(t, op = dist.ReduceOp.SUM))
 
     return fitnesses
