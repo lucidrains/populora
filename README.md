@@ -142,6 +142,66 @@ or across machines
 torchrun --nnodes=4 --nproc-per-node=1 --rdzv-endpoint=$MASTER_HOST:29500 evolve.py
 ```
 
+## Environment Evolution
+
+`evolve_with_env` accepts any environment - from any simulator, vectorized or not, a list of environments, or even an env factory - and evolves a model against it in one call, returning the merged best policy. It leverages [env-ssl-wrapper](https://pypi.org/project/env-ssl-wrapper/) so the same code works for gymnasium, dm_control, isaac, maniskill, pybullet, pufferlib, and anything else that resembles an MDP
+
+```python
+from torch import nn
+from dm_control import suite
+from populora import evolve_with_env
+
+env = suite.load('cartpole', 'balance')  # any env from any sim
+
+# evolve the population in one call - `action` maps the model's outputs to the
+# env's actions; `lora_targets` auto-discovers every Linear layer when omitted.
+# pass `target_fitness` to stop early once it is reached, and
+# `return_history = True` for the per-generation best / mean
+
+policy, history = evolve_with_env(
+    [env for _ in range(16)],             # one env, a list, a vector env, or a factory
+    nn.Sequential(nn.Linear(5, 32), nn.ReLU(), nn.Linear(32, 2)),
+    pop_size = 16,
+    low_rank = 16,
+    action = lambda logits: logits.argmax(-1) * 2 - 1,  # discrete bang-bang
+    num_generations = 25,
+    horizon = 1000,
+    seed = 0,
+    progress = True
+)
+```
+
+`interact_with_env` builds the underlying `EnvInteractor` - each individual plays every environment (or its share of the slots, tiled or strided so all slots stay busy), the population is evaluated in a single routed forward per timestep, and with `torchrun` the individuals are partitioned across ranks automatically - the evolution runs in lockstep everywhere
+
+The underlying pieces are also exposed for custom loops:
+
+```python
+from populora import interact_with_env
+
+interactor = interact_with_env(
+    [env for _ in range(16)],
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+)
+
+population = interactor.population(backbone, pop_size = 16, low_rank = 16)
+
+for gen in range(num_generations):
+    fitnesses = interactor.evaluate(
+        population,
+        action = lambda logits: logits.argmax(-1) * 2 - 1,
+        horizon = 1000,
+        num_episodes = 1
+    )
+
+    population.evolve_(fitnesses, survive_frac = 0.5, elite_frac = 0.2, mutation_type = 'full_gaussian', epsilon = 0.2)
+
+policy = population.select_and_merge_best_(fitnesses)
+```
+
+Custom fitness functions are accepted in three signatures, detected automatically - `fitness(population, individuals = ...)` (distributed per-rank batch evaluation), `fitness(population, idx)` (per-index), and `fitness(population)` (all at once, evaluated on the main rank and broadcast)
+
+Episodes are seeded deterministically from the shared, auto-synced eval seed, so every run is reproducible and every rank evolves in lockstep
+
 ## Coevolution
 
 Wrap multiple populations whose fitnesses derive from one another's outputs - e.g. one population proposes candidates while another judges them, each evolving against the other's current behavior

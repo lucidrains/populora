@@ -33,3 +33,9 @@ from populora.distributed import (
     sync_population,
     sync_seed,
 )
+from populora.interact import (
+    EnvInteractor,
+    evolve_with_env,
+    interact_with_env,
+    linear_layer_paths,
+)
