@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -367,11 +368,15 @@ class EnvInteractor:
                 reward = _flatten_batch(reward)
                 done = _flatten_batch(terminated) | _flatten_batch(truncated)
 
+                # some envs return no reward on terminal / reset transitions
+                # (e.g. dm_control) - treat those steps as zero reward
+
                 for k in e_slots:
                     local = k - env_slot_offsets[e]
                     idx = tours[k][cursor[k]]
 
-                    current_return[idx] += float(reward[local])
+                    r = reward[local]
+                    current_return[idx] += float(r) if r is not None else 0.
                     steps_used[k] += 1
 
                     if not bool(done[local]):
@@ -513,7 +518,11 @@ class EnvInteractor:
         target_fitness: float | None = None,
         return_history: bool = False,
         evolve_kwargs: dict | None = None,
-        evaluate_kwargs: dict | None = None
+        evaluate_kwargs: dict | None = None,
+        checkpoint_dir: str | Path | None = None,
+        checkpoint_every: int | None = None,
+        resume: bool = False,
+        exact_resume: bool = False
     ):
         if isinstance(model, Population):
             population = model
@@ -530,11 +539,27 @@ class EnvInteractor:
         evolve_kwargs = default(evolve_kwargs, dict())
         evaluate_kwargs = default(evaluate_kwargs, dict())
 
+        checkpoint_dir = Path(checkpoint_dir) if exists(checkpoint_dir) else None
+
+        if exists(checkpoint_dir):
+            checkpoint_every = default(checkpoint_every, 1)
+
         best_fitness = float('-inf')
         best_index = 0
         history = []
+        start_generation = 0
 
-        for _ in _maybe_progress(range(num_generations), progress, desc = 'evolving'):
+        # resume from the latest checkpoint, so a killed run picks up where it
+        # left off - with exact_resume, the rng state is restored too, making
+        # the resumed run identical to an uninterrupted one
+
+        if exists(checkpoint_dir) and resume:
+            resumed = self._resume_checkpoint(population, checkpoint_dir, exact_resume)
+
+            if exists(resumed):
+                start_generation, best_fitness, best_index, history = resumed
+
+        for generation in _maybe_progress(range(start_generation, num_generations), progress, desc = 'evolving'):
             fitnesses = self.evaluate(
                 population,
                 action = action,
@@ -545,8 +570,9 @@ class EnvInteractor:
             )
 
             gen_best_fitness = float(fitnesses.max())
+            is_best = gen_best_fitness > best_fitness
 
-            if gen_best_fitness > best_fitness:
+            if is_best:
                 best_fitness = gen_best_fitness
                 best_index = int(fitnesses.argmax())
 
@@ -560,12 +586,78 @@ class EnvInteractor:
 
             population.evolve_(fitnesses, **evolve_kwargs)
 
+            if exists(checkpoint_dir) and ((generation + 1) % checkpoint_every == 0 or generation == num_generations - 1):
+                self._save_checkpoint(
+                    population,
+                    checkpoint_dir,
+                    generation = generation,
+                    best_fitness = best_fitness,
+                    best_index = best_index,
+                    history = history,
+                    exact_resume = exact_resume,
+                    as_best = is_best
+                )
+
         policy = population.merge_(best_index)
 
         if return_history:
             return policy, history
 
         return policy
+
+    def _resume_checkpoint(self, population, checkpoint_dir, exact_resume):
+        # the loop state to pick up from - (generation, best_fitness, best_index,
+        # history) - or None when there is nothing to resume
+
+        path = Path(checkpoint_dir) / 'latest.pt'
+
+        if not path.exists():
+            return None
+
+        pkg = torch.load(path, map_location = population.device, weights_only = False)
+        population.load(pkg['population'])
+
+        if 'eval_seed' in pkg:
+            population._eval_seed = pkg['eval_seed']
+
+        if exact_resume:
+            torch.random.set_rng_state(pkg['rng_state'].to('cpu'))
+
+        return pkg['generation'] + 1, pkg['best_fitness'], pkg['best_index'], pkg['history']
+
+    def _save_checkpoint(
+        self,
+        population,
+        checkpoint_dir,
+        *,
+        generation,
+        best_fitness,
+        best_index,
+        history,
+        exact_resume,
+        as_best
+    ):
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents = True, exist_ok = True)
+
+        pkg = dict(
+            population = population.state_dict_pkg(),
+            generation = generation,
+            best_fitness = best_fitness,
+            best_index = best_index,
+            history = history,
+            eval_seed = population.eval_seed
+        )
+
+        if exact_resume:
+            pkg['rng_state'] = torch.random.get_rng_state().clone()
+
+        torch.save(pkg, checkpoint_dir / 'latest.pt')
+
+        if as_best:
+            torch.save(pkg, checkpoint_dir / 'best.pt')
+
+        return self
 
     # evaluate a final policy (merged model / LoRA / plain module) - mean
     # episode return over every environment, used for post-evolution reporting

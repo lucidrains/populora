@@ -1,6 +1,6 @@
 ## PopuLoRA (wip)
 
-Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727v1), [Co-Evolving LLM Populations for Reasoning Self-Play](https://vmax.ai/team/populora-co-evolving-llm-populations-for-reasoning-self-play), from Roger Castanyer et al at [vmax.ai](https://vmax.ai/)
+Implementation of [PopuLoRA: Co-Evolving LLM Populations for Reasoning Self-Play](https://arxiv.org/abs/2605.16727v1) (Roger Castanyer et al., [vmax.ai](https://vmax.ai/)). Maintains a population of LoRA adapters on a shared base model, evolves them via selection, crossover, and mutation, and merges the best individual back into the base model.
 
 ## Install
 
@@ -8,215 +8,133 @@ Implementation and explorations into [PopuLoRA](https://arxiv.org/abs/2605.16727
 pip install populora
 ```
 
-## Usage
+## Quick start
 
 ```python
 import torch
 import torch.nn as nn
 from populora import Population
 
-# 2-layer MLP
+model = nn.Sequential(nn.Linear(2, 8), nn.ReLU(), nn.Linear(8, 1))
 
-model = nn.Sequential(
-    nn.Linear(2, 8),
-    nn.ReLU(),
-    nn.Linear(8, 1)
-)
-
-# wrap with Population
-
-pop = Population(
-    model,
-    pop_size = 16,
-    low_rank = 4,
-    lora_targets = ['0', '2']
-)
+pop = Population(model, pop_size = 16, low_rank = 4, lora_targets = ['0', '2'])
 
 state = torch.randn(1, 4, 2)
-
-# evaluate population against environment
-
-# `individuals` also accepts a list of individual ids (one per sample)
-
-preds = pop(state, all_individuals = True)
+preds = pop(state, all_individuals = True)  # one routed forward over every individual
 
 labels = torch.randn(1, 4, 1)
-fitnesses = -((preds - labels ) ** 2).reshape(16, -1).mean(dim = -1)
+fitnesses = -((preds - labels) ** 2).reshape(16, -1).mean(dim = -1)
 
-# selection
-
-result = pop.select(
-    selection_type = 'deterministic',
-    fitnesses = fitnesses,
-    survive_frac = 0.5
-)
-
-# parent selection
+result = pop.select('deterministic', fitnesses, survive_frac = 0.5)
 
 parents = pop.select_parents(
-    selection_type = 'tournament',
-    fitnesses = fitnesses,
+    'tournament',
+    fitnesses,
     num_children = len(result.selected_out_indices),
-    culled = result.selected_out_indices
+    culled = result.selected_out_indices  # parents come from the survivors
 )
 
-# crossover
-
-pop.crossover_('average', parents, result.selected_out_indices)
-
-# mutate newly generated offspring, preserving surviving elite parents
-
+pop.crossover_('average', parents, result.selected_out_indices)  # offspring overwrite the culled
 pop.mutate_('full_gaussian', individuals = result.selected_out_indices)
 
-# alternatively, mutate the entire population
-
-pop.mutate_('full_gaussian', all_individuals = True)
-
-# do the above in a for loop
-
-# ...
-
-# then pick the highest fitness individual and resume RL or fine-tuning on the base model
-
-model = pop.select_and_merge_best_(fitnesses)
+model = pop.select_and_merge_best_(fitnesses)  # merge the best individual back in
 ```
 
-## Distributed Evolution
+`pop.evolve_(fitnesses)` runs selection, parent selection, crossover, and mutation in one step. Batch evaluation also supports `pop(x, individuals = [ids])` to route each sample to its own individual.
 
-Evolution parallelizes trivially - each rank evaluates its share of the population against the environment, the fitnesses are gathered, and the evolution step runs identically on every rank
+## Distributed evolution
 
-The population is automatically moved to the distributed device (each rank's local GPU) on construction - pass `device` to `Population` to override. Before the first evaluation, only the LoRA weights are synced across ranks (the base model is shared and identical on every rank) - pass `sync_base_model = True` to `evaluate_distributed` to also broadcast the base model
+Each rank evaluates its share of the population and the fitnesses are gathered, so every rank evolves in lockstep. The population is moved to the local device on construction.
 
 ```python
-from time import sleep
-
 import torch
 from torch import nn
 from populora import Population, is_main_rank
 
-model = nn.Sequential(
-    nn.Linear(8, 16),
-    nn.ReLU(),
-    nn.Linear(16, 1)
-)
-
 pop = Population(
-    model,
+    nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 1)),
     pop_size = 16,
     low_rank = 2,
     lora_targets = ['0', '2']
 )
 
-x = torch.randn(1, 8)
-
 def eval_env(population, idx):
-    sleep(0.1)
-    with torch.no_grad():
-        # seed the environment with population.eval_seed (shared, auto-synced across ranks)
-
-        return population(x, individual = idx).abs().mean().item() + torch.randn(1).item()
+    return population(torch.randn(1, 8), individual = idx).abs().mean().item()
 
 for gen in range(10):
-
-    # distributed evaluation
-
     fitnesses = pop.evaluate_distributed(eval_env)
 
     if is_main_rank():
         print(f'gen {gen:02d} | best: {fitnesses.max():.3f} | mean: {fitnesses.mean():.3f}')
 
-    # evolution step
-
     pop.evolve_(fitnesses)
 ```
-
-run on 4 processes
 
 ```bash
 torchrun --standalone --nproc-per-node=4 evolve.py
 ```
 
-or across machines
+Only the LoRA weights are synced across ranks before evaluation (the base model is shared) — pass `sync_base_model = True` to `evaluate_distributed` to broadcast it too.
 
-```bash
-torchrun --nnodes=4 --nproc-per-node=1 --rdzv-endpoint=$MASTER_HOST:29500 evolve.py
-```
+## Environment evolution
 
-## Environment Evolution
-
-`evolve_with_env` accepts any environment - from any simulator, vectorized or not, a list of environments, or even an env factory - and evolves a model against it in one call, returning the merged best policy. It leverages [env-ssl-wrapper](https://pypi.org/project/env-ssl-wrapper/) so the same code works for gymnasium, dm_control, isaac, maniskill, pybullet, pufferlib, and anything else that resembles an MDP
+`evolve_with_env` evolves a population against any MDP-style environment in one call — gymnasium, dm_control, isaac, maniskill, pybullet, pufferlib, or any simulator — and returns the merged best policy.
 
 ```python
 from torch import nn
 from dm_control import suite
 from populora import evolve_with_env
 
-env = suite.load('cartpole', 'balance')  # any env from any sim
-
-# evolve the population in one call - `action` maps the model's outputs to the
-# env's actions; `lora_targets` auto-discovers every Linear layer when omitted.
-# pass `target_fitness` to stop early once it is reached, and
-# `return_history = True` for the per-generation best / mean
-
 policy, history = evolve_with_env(
-    [env for _ in range(16)],             # one env, a list, a vector env, or a factory
+    [suite.load('cartpole', 'balance') for _ in range(16)],  # envs, a list, a vector env, or a factory
     nn.Sequential(nn.Linear(5, 32), nn.ReLU(), nn.Linear(32, 2)),
     pop_size = 16,
     low_rank = 16,
-    action = lambda logits: logits.argmax(-1) * 2 - 1,  # discrete bang-bang
+    action = lambda logits: logits.argmax(-1) * 2 - 1,
     num_generations = 25,
     horizon = 1000,
     seed = 0,
-    progress = True
+    progress = True,
+    return_history = True  # per-generation best / mean
 )
 ```
 
-`interact_with_env` builds the underlying `EnvInteractor` - each individual plays every environment (or its share of the slots, tiled or strided so all slots stay busy), the population is evaluated in a single routed forward per timestep, and with `torchrun` the individuals are partitioned across ranks automatically - the evolution runs in lockstep everywhere
+`lora_targets` auto-discovers every `Linear` layer when omitted. Pass `target_fitness` to stop early, `checkpoint_dir` to write `latest.pt` (every `checkpoint_every` generations) and `best.pt` (on new bests), and `resume = True` to pick up from the latest checkpoint.
 
-The underlying pieces are also exposed for custom loops:
+For a custom loop, `interact_with_env` exposes the underlying `EnvInteractor` — one routed forward over the active slots per timestep, distributed across ranks under `torchrun`:
 
 ```python
+from torch import nn
+from dm_control import suite
 from populora import interact_with_env
 
-interactor = interact_with_env(
-    [env for _ in range(16)],
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-)
+interactor = interact_with_env([suite.load('cartpole', 'balance') for _ in range(16)])
 
+backbone = nn.Sequential(nn.Linear(5, 32), nn.ReLU(), nn.Linear(32, 2))
 population = interactor.population(backbone, pop_size = 16, low_rank = 16)
 
-for gen in range(num_generations):
+for gen in range(25):
     fitnesses = interactor.evaluate(
         population,
         action = lambda logits: logits.argmax(-1) * 2 - 1,
-        horizon = 1000,
-        num_episodes = 1
+        horizon = 1000
     )
 
-    population.evolve_(fitnesses, survive_frac = 0.5, elite_frac = 0.2, mutation_type = 'full_gaussian', epsilon = 0.2)
+    population.evolve_(fitnesses)
 
 policy = population.select_and_merge_best_(fitnesses)
 ```
 
-Custom fitness functions are accepted in three signatures, detected automatically - `fitness(population, individuals = ...)` (distributed per-rank batch evaluation), `fitness(population, idx)` (per-index), and `fitness(population)` (all at once, evaluated on the main rank and broadcast)
-
-Episodes are seeded deterministically from the shared, auto-synced eval seed, so every run is reproducible and every rank evolves in lockstep
+Custom fitness functions may take `(population, individuals)` (batched), `(population, idx)` (per index), or `(population)` (all at once) — detected automatically.
 
 ## Coevolution
 
-Wrap multiple populations whose fitnesses derive from one another's outputs - e.g. one population proposes candidates while another judges them, each evolving against the other's current behavior
-
-Each population supplies a `probe` (produces its outputs for a step) and a `fitness` function (scores it). Parameters are injected from the function signature: a parameter named after a population receives that population's outputs (computed once per step, in dependency order)
-
-### Two populations
+Wrap populations whose fitnesses derive from one another's outputs — e.g. a proposer proposes test inputs while a solver is scored on them, and vice versa. Each population supplies a `probe` (produces its outputs for a step) and a `fitness` (scores it); parameters named after a population receive its outputs, computed once per step in dependency order.
 
 ```python
 import torch
 from torch import nn
 from populora import Population, Coevolve
-
-# the solver fits T(x) = sin(pi x); the proposer proposes test inputs - each is
-# scored by the other's outputs
 
 pop_size = 8
 
@@ -227,17 +145,15 @@ def probe_proposer(coevolve):
     return coevolve.proposer(torch.randn(1, 1), all_individuals = True)  # (P, 1) proposed inputs
 
 def probe_solver(coevolve, proposer_outputs):
-    return coevolve.solver(proposer_outputs.repeat(solver.pop_size, 1), all_individuals = True)  # each solver sees all inputs
+    return coevolve.solver(proposer_outputs.repeat(solver.pop_size, 1), all_individuals = True)
 
 def fitness_solver(solver_outputs, proposer_outputs):
     target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
-    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
-    return -errors.mean(dim = 1)  # (S,) accuracy on the proposed inputs
+    return -((solver_outputs - target) ** 2).reshape(solver.pop_size, -1).mean(dim = 1)
 
 def fitness_proposer(proposer_outputs, solver_outputs):
     target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
-    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
-    return errors.mean(dim = 0)  # (P,) error induced on the solver
+    return ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1).mean(dim = 0)
 
 coevolve = Coevolve(populations = dict(
     proposer = dict(population = proposer, probe = probe_proposer, fitness = fitness_proposer),
@@ -245,52 +161,46 @@ coevolve = Coevolve(populations = dict(
 ))
 
 for _ in range(100):
-    coevolve.step()  # probes, derives fitnesses, evolves each population
+    coevolve.step()
 ```
 
-`step` records the best / mean fitness per population in `coevolve.history`; populations are reachable as `coevolve.proposer` / `coevolve['solver']`
+`coevolve.history` records the best / mean fitness per population; `coevolve.step(distributed = True)` splits the probes across ranks (round-robin, outputs broadcast raw). Probes must form a chain — a probe depending on its own outputs raises at construction; only fitnesses may close a circle, since every population is probed before any fitness is derived.
 
-### Three populations, in a chain
+## Generation
 
-Append a `judge` that sees every (input, prediction) pair and scores the solver's correctness - the solver must stay accurate while fooling the judge, and the proposer keeps proposing inputs the solver gets wrong
+Autoregressively decode from the population in one batched loop — one routed forward per step over the samples still active.
 
 ```python
-judge = Population(nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 1)), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
+import torch
+from x_transformers import TransformerWrapper, Decoder
+from populora import Population, generate
 
-def probe_judge(coevolve, solver_outputs, proposer_outputs):
-    pairs = torch.cat((proposer_outputs.repeat(solver.pop_size, 1), solver_outputs), dim = -1)
-    return coevolve.judge(pairs, all_individuals = True)  # (S * P, 1) correctness logits
+model = TransformerWrapper(
+    num_tokens = 256,
+    max_seq_len = 128,
+    attn_layers = Decoder(dim = 128, depth = 2, heads = 2)
+)
 
-def fitness_solver(solver_outputs, proposer_outputs, judge_outputs):
-    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
-    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
-    fooled = ((judge_outputs > 0.) & ((solver_outputs - target) ** 2 >= 0.05)).float()  # judge said "correct" on a wrong answer
-    return -errors.mean(dim = 1) + 0.25 * fooled.reshape(solver.pop_size, -1).mean(dim = 1)  # accurate and hard to catch
+pop = Population(
+    model,
+    pop_size = 8,
+    low_rank = 4,
+    lora_targets = ['attn_layers.layers.0.1.to_q', 'attn_layers.layers.0.1.to_k', 'attn_layers.layers.0.1.to_v']
+)
 
-def fitness_judge(solver_outputs, proposer_outputs, judge_outputs):
-    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
-    correct = (solver_outputs - target) ** 2 < 0.05
-    acc = ((judge_outputs > 0.) == correct).float().reshape(judge.pop_size, -1).mean(dim = 1)
-    return acc  # (J,) how well it catches the solver's mistakes
+prompts = torch.randint(0, 256, (8, 16))  # one prompt per individual
 
-def fitness_proposer(proposer_outputs, solver_outputs):
-    target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
-    errors = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1)
-    return errors.mean(dim = 0)  # (P,) error its inputs induce on the solver
-
-coevolve = Coevolve(populations = dict(
-    proposer = dict(population = proposer, probe = probe_proposer, fitness = fitness_proposer),
-    solver = dict(population = solver, probe = probe_solver, fitness = fitness_solver),
-    judge = dict(population = judge, probe = probe_judge, fitness = fitness_judge)
-))
-
-for _ in range(100):
-    coevolve.step(distributed = True)  # distribute the probes across ranks
+seqs = generate(
+    pop,
+    prompts,
+    all_individuals = True,
+    max_len = 64,
+    eos_token = 255,
+    cache_kwargs = dict(return_intermediates = True)
+)
 ```
 
-Probes must form a chain - a probe that depends on its own outputs (directly or transitively) raises at construction, reporting the exact cycle (e.g. `proposer -> solver -> proposer`). Fitnesses can close a circle - fitness_A from B's outputs, fitness_B from C's, fitness_C from A's - since every population is probed before any fitness is derived
-
-With `step(distributed = True)`, probes are split across ranks (one per rank, round-robin) and their outputs are broadcast - tensor outputs go over a single raw broadcast, far cheaper than pickling, so each rank derives the same fitnesses and evolves in lockstep. Probes must be pure - only their return value is shared, so side effects (state mutations, logging) happen only on the owning rank and silently diverge across ranks
+Samples can be routed to explicit individuals (`individual = 3` or `individuals = [...]`, one id per prompt). Early finishers (`eos_token`, or a `stop_fn(tokens, logits, step)`) are compacted out of the batch. Huggingface-style caching works too (`cache_kwarg = 'past_key_values'`, `cache_last_token = True`), and `micro_batch` chunks the routed forward to cap the p-fold activation blowup.
 
 ## Citations
 

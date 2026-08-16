@@ -285,6 +285,58 @@ def test_interact_evolve_high_level():
     assert isinstance(policy, nn.Module)
     assert interactor.evaluate_policy(policy, action = lambda logits: torch.tanh(logits), num_episodes = 5) > 40.
 
+def test_interact_evolve_checkpoint_resume(tmp_path):
+    # a killed run resumes from its checkpoint and, with exact_resume, finishes
+    # bit-identically to an uninterrupted run - latest and best checkpoints are
+    # both written
+
+    if is_distributed():
+        return
+
+    def run(num_generations, checkpoint_dir = None, resume = False, return_history = True):
+        # the base model's init consumes the process rng, so it is seeded here
+        # to keep every run identical
+
+        torch.manual_seed(0)
+        interactor = interact_with_env(ActionAimMockEnv(), seed = 0)
+
+        return interactor.evolve(
+            make_policy(zero_last = True),
+            pop_size = 16,
+            low_rank = 4,
+            num_generations = num_generations,
+            horizon = 60,
+            action = lambda logits: torch.tanh(logits),
+            seed = 0,
+            return_history = return_history,
+            evolve_kwargs = dict(
+                survive_frac = 0.5,
+                elite_frac = 0.2,
+                mutation_type = 'full_gaussian',
+                epsilon = 0.2
+            ),
+            checkpoint_dir = checkpoint_dir,
+            checkpoint_every = 1,
+            resume = resume,
+            exact_resume = True
+        )
+
+    checkpoint_dir = tmp_path / 'checkpoints'
+
+    _, partial_history = run(5, checkpoint_dir = checkpoint_dir)
+    assert len(partial_history) == 5
+    assert (checkpoint_dir / 'latest.pt').exists()
+    assert (checkpoint_dir / 'best.pt').exists()
+
+    resumed_policy, resumed_history = run(10, checkpoint_dir = checkpoint_dir, resume = True)
+    _, full_history = run(10)
+
+    assert len(resumed_history) == 10
+    assert resumed_history == full_history
+
+    full_policy = run(10, return_history = False)
+    assert allclose(resumed_policy.state_dict()['2.weight'], full_policy.state_dict()['2.weight'])
+
 def test_evolve_with_env():
     # the one-call wrapper - env + model in, merged best policy out, with a
     # per-generation best / mean history. like the high-level evolve, the

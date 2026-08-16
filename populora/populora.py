@@ -78,6 +78,43 @@ def _efficient_svd_of_lora(weight_down, weight_up):
 def skew_symmetrize(t):
     return (t - rearrange(t, 'i j -> j i')) / 2
 
+def _concat_chunked_outputs(outputs, batch_size):
+    first_output = outputs[0]
+
+    if is_tensor(first_output):
+        return cat(outputs, dim = 0) if first_output.ndim > 0 and first_output.shape[0] == batch_size else first_output
+
+    if isinstance(first_output, (tuple, list)):
+        return type(first_output)((_concat_chunked_outputs([output[i] for output in outputs], batch_size) for i in range(len(first_output))))
+
+    return outputs[-1]
+
+def _slice_batch(t, start, end, batch_size):
+    return t[start:end] if is_tensor(t) and t.ndim > 0 and t.shape[0] == batch_size else t
+
+def _chunked_forward(model, args, kwargs, ignore, chunk_size, batch_size):
+    # run the model over the batch in chunks, concatenating the outputs -
+    # caps the activation blowup on large models
+
+    outputs = []
+
+    for start in range(0, batch_size, chunk_size):
+        end = min(start + chunk_size, batch_size)
+
+        chunk_args = tuple(
+            _slice_batch(a, start, end, batch_size) if i not in ignore else a
+            for i, a in enumerate(args)
+        )
+
+        chunk_kwargs = {
+            key: _slice_batch(value, start, end, batch_size) if key not in ignore else value
+            for key, value in kwargs.items()
+        }
+
+        outputs.append(model(*chunk_args, **chunk_kwargs))
+
+    return _concat_chunked_outputs(outputs, batch_size)
+
 # mutations
 
 MUTATION_REGISTRY = dict()
@@ -1373,6 +1410,7 @@ class Population(Module):
         all_individuals: bool = False,
         ignore_args_kwargs: Sequence[int | str] = tuple(),
         eval_and_no_grad: bool = False,
+        micro_batch: int | None = None,
         **kwargs
     ):
         if not self._hooks_registered:
@@ -1380,14 +1418,19 @@ class Population(Module):
         if all_individuals or exists(individuals):
             ignore = set(ignore_args_kwargs)
             p = self.pop_size if all_individuals else len(individuals)
+            batch_size = 0
 
             def maybe_repeat_batch(t):
                 # broadcast a singleton batch to each individual, otherwise expect a multiple of the batch
 
-                if t.shape[0] == 1:
-                    return repeat(t, '1 ... -> p ...', p = p)
+                nonlocal batch_size
 
-                assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+                if t.shape[0] == 1:
+                    t = repeat(t, '1 ... -> p ...', p = p)
+                else:
+                    assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+
+                batch_size = t.shape[0]
                 return t
 
             args = tuple(
@@ -1399,6 +1442,16 @@ class Population(Module):
                 k: tree_map_tensor(maybe_repeat_batch, v) if k not in ignore else v
                 for k, v in kwargs.items()
             }
+
+            # with `micro_batch`, run the expanded batch through the model in
+            # chunks, each a multiple of the population size so the per-sample
+            # routing stays intact
+
+            if exists(micro_batch) and all_individuals and batch_size > 0:
+                assert divisible_by(micro_batch, self.pop_size), f'micro_batch {micro_batch} must be a multiple of the population size {self.pop_size}'
+
+                with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
+                    return _chunked_forward(self.model, args, kwargs, ignore, micro_batch, batch_size)
 
         with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
             return self.model(*args, **kwargs)
@@ -1974,7 +2027,10 @@ class Coevolve(Module):
 
     @torch.no_grad()
     def state_dict_pkg(self):
-        return {name: pop.state_dict_pkg() for name, pop in self.populations.items()}
+        pkg = {name: pop.state_dict_pkg() for name, pop in self.populations.items()}
+        pkg['_generation'] = self.generation
+        pkg['_history'] = self.history
+        return pkg
 
     @torch.no_grad()
     def save(self, path: str | Path):
@@ -1990,5 +2046,10 @@ class Coevolve(Module):
         for name, pop in self.populations.items():
             if name in pkg:
                 pop.load(pkg[name], strict = strict)
+
+        if '_generation' in pkg:
+            self.generation = pkg['_generation']
+        if '_history' in pkg:
+            self.history = pkg['_history']
 
         return self

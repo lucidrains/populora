@@ -1238,6 +1238,25 @@ def test_coevolve_save_load():
 
     assert allclose(preds_before, preds_after)
 
+def test_coevolve_save_load_history():
+    # generation counter and per-population history are checkpointed alongside
+    # the weights, so an evolution can be resumed
+
+    pop_size = 4
+    coevolve = make_coevolve(pop_size = pop_size, seed = 0)
+
+    for _ in range(3):
+        coevolve.step()
+
+    coevolve.save('/tmp/coevolve_history_test.pt')
+
+    coevolve2 = make_coevolve(pop_size = pop_size, seed = 1)
+    coevolve2.load('/tmp/coevolve_history_test.pt')
+
+    assert coevolve2.generation == 3
+    assert coevolve2.history == coevolve.history
+    assert len(coevolve2.history['proposer']) == 3
+
 def test_coevolve_missing_probe():
     # outputs of a population are requested by name but it has no probe - caught at
     # registration time
