@@ -6,10 +6,11 @@ from typing import Sequence
 
 import numpy as np
 import torch
-from torch import is_tensor, nn
+from torch import atleast_1d, is_tensor, nn
 
 from env_ssl_wrapper import AutoBatchedWrapper, DoneTrackerWrapper, StandardizeWrapper
 from env_ssl_wrapper.utils import parse_wrapper
+from torch_einops_utils import temp_eval
 
 from populora.distributed import (
     broadcast_object,
@@ -351,25 +352,21 @@ class EnvInteractor:
 
             if memory_wrapped:
                 active_mem = memories[active_slots]
-                outputs = population(active_mem, obs_batch, individuals = individuals_batch)
+                outputs = population(active_mem, obs_batch, individuals = individuals_batch, eval_and_no_grad = True)
                 policy_out, mem_next = outputs
 
                 mem_next = cast_tensor(mem_next, device)
-
-                if mem_next.ndim == 0:
-                    mem_next = mem_next.reshape(1)
+                mem_next = atleast_1d(mem_next)
 
                 assert mem_next.shape == memories[active_slots].shape, f'network emitted memory {tuple(mem_next.shape)} does not match the carried memory {tuple(memories[active_slots].shape)}'
                 memories[active_slots] = mem_next
             else:
-                outputs = population(obs_batch, individuals = individuals_batch)
+                outputs = population(obs_batch, individuals = individuals_batch, eval_and_no_grad = True)
                 policy_out = outputs
 
             actions = action(policy_out) if exists(action) else policy_out
             actions = actions if is_tensor(actions) else torch.as_tensor(actions)
-
-            if actions.ndim == 0:
-                actions = actions.reshape(1)
+            actions = atleast_1d(actions)
 
             # step every environment with active slots; inactive sub-envs of a
             # vector env still have to step along, so they get zero actions
@@ -712,58 +709,56 @@ class EnvInteractor:
         policy = policy.to(device)
         memory_wrapped = isinstance(policy, Memory)
 
-        for j, env in enumerate(self.envs):
-            num_env_slots = env.num_envs
+        with temp_eval(policy):
+            for j, env in enumerate(self.envs):
+                num_env_slots = env.num_envs
 
-            for episode in range(num_episodes):
-                _try_seed(env, _mix_seed(seed, j, episode))
-                obs, _ = env.reset()
-
-                if memory_wrapped:
-                    init_memories = init_memory_tensor(policy.init_memory, num_env_slots, device = device)
-                    mem = init_memories.clone()
-
-                episode_returns = np.zeros(num_env_slots)
-                completed = np.zeros(num_env_slots, dtype = bool)
-                steps = 0
-
-                while steps < horizon and not completed.all():
-                    obs_t = obs.to(device) if is_tensor(obs) else torch.as_tensor(obs).to(device)
+                for episode in range(num_episodes):
+                    _try_seed(env, _mix_seed(seed, j, episode))
+                    obs, _ = env.reset()
 
                     if memory_wrapped:
-                        policy_out, mem = policy(mem, obs_t)
+                        init_memories = init_memory_tensor(policy.init_memory, num_env_slots, device = device)
+                        mem = init_memories.clone()
 
-                        mem = cast_tensor(mem, device)
+                    episode_returns = np.zeros(num_env_slots)
+                    completed = np.zeros(num_env_slots, dtype = bool)
+                    steps = 0
 
-                        if mem.ndim == 0:
-                            mem = mem.reshape(1)
+                    while steps < horizon and not completed.all():
+                        obs_t = obs.to(device) if is_tensor(obs) else torch.as_tensor(obs).to(device)
 
-                        assert mem.shape == init_memories.shape, f'network emitted memory {tuple(mem.shape)} does not match the carried memory {tuple(init_memories.shape)}'
-                    else:
-                        policy_out = policy(obs_t)
+                        if memory_wrapped:
+                            policy_out, mem = policy(mem, obs_t)
 
-                    actions = action(policy_out) if exists(action) else policy_out
-                    actions = actions if is_tensor(actions) else torch.as_tensor(actions)
+                            mem = cast_tensor(mem, device)
+                            mem = atleast_1d(mem)
 
-                    if actions.ndim == 0:
-                        actions = actions.reshape(1)
+                            assert mem.shape == init_memories.shape, f'network emitted memory {tuple(mem.shape)} does not match the carried memory {tuple(init_memories.shape)}'
+                        else:
+                            policy_out = policy(obs_t)
 
-                    obs, reward, terminated, truncated, info = env.step(actions)
+                        actions = action(policy_out) if exists(action) else policy_out
+                        actions = actions if is_tensor(actions) else torch.as_tensor(actions)
+                        actions = atleast_1d(actions)
 
-                    reward = _flatten_batch(reward)
-                    done = _flatten_batch(terminated) | _flatten_batch(truncated)
+                        obs, reward, terminated, truncated, info = env.step(actions)
 
-                    for k in range(num_env_slots):
-                        if not completed[k]:
-                            episode_returns[k] += float(reward[k])
-                            completed[k] = bool(done[k])
+                        reward = _flatten_batch(reward)
+                        done = _flatten_batch(terminated) | _flatten_batch(truncated)
 
-                            if completed[k] and memory_wrapped:
-                                mem[k] = init_memories[k]
+                        for k in range(num_env_slots):
+                            if not completed[k]:
+                                reward_k = reward[k]
+                                episode_returns[k] += float(reward_k) if reward_k is not None else 0.
+                                completed[k] = bool(done[k])
 
-                    steps += 1
+                                if completed[k] and memory_wrapped:
+                                    mem[k] = init_memories[k]
 
-                returns.append(episode_returns.mean())
+                        steps += 1
+
+                    returns.append(episode_returns.mean())
 
         return float(np.mean(returns))
 

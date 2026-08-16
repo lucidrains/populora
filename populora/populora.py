@@ -1204,8 +1204,11 @@ class Population(Module):
             assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
 
             topk = default(topk, max(1, self.pop_size // 4))
-            if isinstance(topk, float) and topk <= 1.0:
+
+            if isinstance(topk, float):
                 topk = max(1, int(self.pop_size * topk))
+
+            topk = min(topk, self.pop_size)
 
             topk_indices = fitnesses.topk(topk, dim = -1).indices
             topk_fitnesses = fitnesses[topk_indices]
