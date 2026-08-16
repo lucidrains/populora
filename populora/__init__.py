@@ -39,4 +39,5 @@ from populora.interact import (
     interact_with_env,
     linear_layer_paths,
 )
+from populora.memory import Memory
 from populora.generate import generate

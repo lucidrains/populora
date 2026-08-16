@@ -18,6 +18,7 @@ from populora.distributed import (
     is_main_rank,
     preserve_rng,
 )
+from populora.memory import Memory, init_memory_tensor
 from populora.populora import Population, cast_tensor, default, exists
 
 # helpers
@@ -283,6 +284,18 @@ class EnvInteractor:
         num_slots = sum(env.num_envs for env in envs)
         assert num_slots > 0, 'interact_with_env requires at least one environment'
 
+        # memory threading - when the policy is wrapped in Memory, each slot
+        # carries the memory emitted by the previous timestep, fed back in on
+        # the next, initialized to the researcher's init and reset to it
+        # wherever episodes reset
+
+        memory_wrapped = isinstance(population.model, Memory)
+        memories = None
+
+        if memory_wrapped:
+            init_memories = init_memory_tensor(population.model.init_memory, num_slots, device = device)
+            memories = init_memories.clone()
+
         slot_to_env = []
         env_slot_offsets = []
 
@@ -336,8 +349,23 @@ class EnvInteractor:
             ]).to(device)
             individuals_batch = torch.tensor(active_individuals, device = device)
 
-            outputs = population(obs_batch, individuals = individuals_batch)
-            actions = action(outputs) if exists(action) else outputs
+            if memory_wrapped:
+                active_mem = memories[active_slots]
+                outputs = population(active_mem, obs_batch, individuals = individuals_batch)
+                policy_out, mem_next = outputs
+
+                mem_next = cast_tensor(mem_next, device)
+
+                if mem_next.ndim == 0:
+                    mem_next = mem_next.reshape(1)
+
+                assert mem_next.shape == memories[active_slots].shape, f'network emitted memory {tuple(mem_next.shape)} does not match the carried memory {tuple(memories[active_slots].shape)}'
+                memories[active_slots] = mem_next
+            else:
+                outputs = population(obs_batch, individuals = individuals_batch)
+                policy_out = outputs
+
+            actions = action(policy_out) if exists(action) else policy_out
             actions = actions if is_tensor(actions) else torch.as_tensor(actions)
 
             if actions.ndim == 0:
@@ -388,6 +416,9 @@ class EnvInteractor:
                     episodes_done[k] += 1
                     episode_counter[k] += 1
 
+                    if memory_wrapped:
+                        memories[k] = init_memories[k]
+
                     if episodes_done[k] >= num_episodes:
                         cursor[k] += 1
                         episodes_done[k] = 0
@@ -411,6 +442,9 @@ class EnvInteractor:
                     for k in e_slots:
                         if cursor[k] < len(tours[k]):
                             current_return[tours[k][cursor[k]]] = 0.
+
+                            if memory_wrapped:
+                                memories[k] = init_memories[k]
 
                     _try_seed(env, _mix_seed(base_seed, e, env_reset_count[e]))
                     env_reset_count[e] += 1
@@ -676,6 +710,7 @@ class EnvInteractor:
         returns = []
 
         policy = policy.to(device)
+        memory_wrapped = isinstance(policy, Memory)
 
         for j, env in enumerate(self.envs):
             num_env_slots = env.num_envs
@@ -684,14 +719,30 @@ class EnvInteractor:
                 _try_seed(env, _mix_seed(seed, j, episode))
                 obs, _ = env.reset()
 
+                if memory_wrapped:
+                    init_memories = init_memory_tensor(policy.init_memory, num_env_slots, device = device)
+                    mem = init_memories.clone()
+
                 episode_returns = np.zeros(num_env_slots)
                 completed = np.zeros(num_env_slots, dtype = bool)
                 steps = 0
 
                 while steps < horizon and not completed.all():
                     obs_t = obs.to(device) if is_tensor(obs) else torch.as_tensor(obs).to(device)
-                    outputs = policy(obs_t)
-                    actions = action(outputs) if exists(action) else outputs
+
+                    if memory_wrapped:
+                        policy_out, mem = policy(mem, obs_t)
+
+                        mem = cast_tensor(mem, device)
+
+                        if mem.ndim == 0:
+                            mem = mem.reshape(1)
+
+                        assert mem.shape == init_memories.shape, f'network emitted memory {tuple(mem.shape)} does not match the carried memory {tuple(init_memories.shape)}'
+                    else:
+                        policy_out = policy(obs_t)
+
+                    actions = action(policy_out) if exists(action) else policy_out
                     actions = actions if is_tensor(actions) else torch.as_tensor(actions)
 
                     if actions.ndim == 0:
@@ -706,6 +757,9 @@ class EnvInteractor:
                         if not completed[k]:
                             episode_returns[k] += float(reward[k])
                             completed[k] = bool(done[k])
+
+                            if completed[k] and memory_wrapped:
+                                mem[k] = init_memories[k]
 
                     steps += 1
 
