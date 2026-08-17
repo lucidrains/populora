@@ -8,8 +8,9 @@ from torch import Tensor, cat, is_tensor
 
 from einops import repeat
 
+from populora._utils import cast_tensor, default, divisible_by, exists
 from populora.distributed import preserve_rng
-from populora.populora import Population, cast_tensor, default, divisible_by, exists
+from populora.population import Population
 
 # helpers
 

@@ -7,7 +7,9 @@ from collections import namedtuple
 import torch
 from torch import arange, no_grad
 
-from populora.populora import exists
+from einops import repeat
+
+from populora._utils import exists
 
 Entry = namedtuple('Entry', ['generation', 'weight_down', 'weight_up'])
 
@@ -104,7 +106,7 @@ class HallOfFame:
 
         slots = self.replay(self._replay, indices)
 
-        repeated = x.repeat(k, *([1] * (x.ndim - 1)))
+        repeated = repeat(x, '... -> k ...', k = k)
         outputs = self._replay(repeated, individuals = slots)
 
         return outputs.reshape(k, *x.shape[:-1], -1)

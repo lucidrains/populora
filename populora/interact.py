@@ -12,6 +12,7 @@ from env_ssl_wrapper import AutoBatchedWrapper, DoneTrackerWrapper, StandardizeW
 from env_ssl_wrapper.utils import parse_wrapper
 from torch_einops_utils import temp_eval
 
+from populora._utils import cast_tensor, default, exists
 from populora.distributed import (
     broadcast_object,
     distributed_device,
@@ -20,7 +21,7 @@ from populora.distributed import (
     preserve_rng,
 )
 from populora.memory import Memory, init_memory_tensor
-from populora.populora import Population, cast_tensor, default, exists
+from populora.population import Population
 
 # helpers
 
@@ -35,6 +36,22 @@ def _flatten_batch(t):
     if is_tensor(t):
         return t.reshape(-1)
     return np.asarray(t).reshape(-1)
+
+def _gather_slot_rewards(reward_arr, locs, device):
+    # per-slot rewards for a step, tensorized - `None` entries (some envs emit
+    # them on terminal transitions) count as zero reward
+
+    r = reward_arr[locs]
+
+    if is_tensor(r):
+        return r.to(device).float()
+
+    r = np.asarray(r)
+
+    if r.dtype == object:
+        r = np.array([0. if v is None else v for v in r], dtype = np.float32)
+
+    return torch.from_numpy(r.astype(np.float32)).to(device)
 
 # seeding - deterministic per (evaluation, slot, episode), so episodes are
 # reproducible across runs and distinct across slots / individuals
@@ -390,22 +407,28 @@ class EnvInteractor:
                 obs, reward, terminated, truncated, info = env.step(e_actions)
                 last_obs[e] = obs
 
-                reward = _flatten_batch(reward)
-                done = _flatten_batch(terminated) | _flatten_batch(truncated)
+                reward_arr = _flatten_batch(reward)
+                done_arr = _flatten_batch(terminated) | _flatten_batch(truncated)
 
                 # some envs return no reward on terminal / reset transitions
-                # (e.g. dm_control) - treat those steps as zero reward
+                # (e.g. dm_control) - treat those steps as zero reward. rewards
+                # accumulate in one tensor op per env; the per-slot state machine
+                # below only runs on episode endings
+
+                locs = [k - env_slot_offsets[e] for k in e_slots]
+                idxs = [tours[k][cursor[k]] for k in e_slots]
+
+                idxs_t = torch.tensor(idxs, device = device)
+                current_return.index_add_(0, idxs_t, _gather_slot_rewards(reward_arr, locs, device))
 
                 for k in e_slots:
-                    local = k - env_slot_offsets[e]
-                    idx = tours[k][cursor[k]]
-
-                    r = reward[local]
-                    current_return[idx] += float(r) if r is not None else 0.
                     steps_used[k] += 1
 
-                    if not bool(done[local]):
+                for k in e_slots:
+                    if not bool(done_arr[k - env_slot_offsets[e]]):
                         continue
+
+                    idx = tours[k][cursor[k]]
 
                     returns[idx] += current_return[idx]
                     current_return[idx] = 0.
@@ -672,7 +695,7 @@ class EnvInteractor:
         checkpoint_dir.mkdir(parents = True, exist_ok = True)
 
         pkg = dict(
-            population = population.state_dict_pkg(),
+            population = population.state_dict_pkg(save_base_model = False),
             generation = generation,
             best_fitness = best_fitness,
             best_index = best_index,

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from torch import atleast_1d, nn
 
-from populora.populora import cast_tensor, exists
+from populora._utils import cast_tensor, exists
 
 # helpers
 

@@ -6,15 +6,19 @@ import random
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from functools import wraps
+from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
 import numpy as np
 
 import torch
 import torch.distributed as dist
-from torch import Tensor, tensor
+from torch import Tensor, is_tensor, tensor
 
-from populora.populora import Population, cast_tensor, default, exists, is_tensor
+from populora._utils import cast_tensor, default, exists
+
+if TYPE_CHECKING:
+    from populora.population import Population
 
 # process group
 
