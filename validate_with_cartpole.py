@@ -20,6 +20,7 @@ import fire
 from x_mlps_pytorch import MLP
 
 from populora import interact_with_env
+from populora.populora import exists
 
 # one logit per action, mapped to the env's discrete action index
 
@@ -32,6 +33,7 @@ def run_cartpole_experiment(
     max_generations: int = 100,
     horizon: int = 1000,
     epsilon: float = 0.15,
+    dtype: str = 'float32',
     seed: int = 42,
     verbose: bool = False,
 ):
@@ -46,6 +48,7 @@ def run_cartpole_experiment(
         pop_size = pop_size,
         low_rank = low_rank,
         eval_seed = seed,
+        dtype = dtype,  # 'float32' | 'bfloat16' | 'float16' | 'float8_e4m3fn'
     )
 
     _, history = interactor.evolve(
@@ -79,8 +82,14 @@ def run_cartpole_experiment(
 
 def main(
     seeds: list[int] = [10, 20, 30, 40, 50],
+    seed: int | None = None,
     **kwargs
 ):
+    # a single explicit --seed overrides the multi-seed sweep
+
+    if exists(seed):
+        seeds = [seed]
+
     results = [run_cartpole_experiment(seed = s, **kwargs) for s in seeds]
 
     solved_count = sum(1 for r in results if r["solved"])
