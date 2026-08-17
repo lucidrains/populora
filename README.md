@@ -37,7 +37,7 @@ parents = pop.select_parents(
 pop.crossover_('average', parents, result.selected_out_indices)  # offspring overwrite the culled
 pop.mutate_('full_gaussian', individuals = result.selected_out_indices)
 
-model = pop.select_and_merge_best_(fitnesses)  # merge the best individual back in
+model = pop.merge_(fitnesses.argmax())  # merge the best individual back in
 ```
 
 `pop.evolve_(fitnesses)` runs selection, parent selection, crossover, and mutation in one step. Batch evaluation also supports `pop(x, individuals = [ids])` to route each sample to its own individual.
@@ -122,7 +122,7 @@ for gen in range(25):
 
     population.evolve_(fitnesses)
 
-policy = population.select_and_merge_best_(fitnesses)
+policy = population.merge_(fitnesses.argmax())
 ```
 
 Custom fitness functions may take `(population, individuals)` (batched), `(population, idx)` (per index), or `(population)` (all at once) — detected automatically.

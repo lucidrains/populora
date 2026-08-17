@@ -732,7 +732,11 @@ class EnvInteractor:
         policy = policy.to(device)
         memory_wrapped = isinstance(policy, Memory)
 
-        with temp_eval(policy):
+        # the episode seeding consumes the env rng, so evaluation is kept off
+        # the global rng - a side-effect-free policy eval never perturbs an
+        # ongoing evolution
+
+        with temp_eval(policy), preserve_rng():
             for j, env in enumerate(self.envs):
                 num_env_slots = env.num_envs
 

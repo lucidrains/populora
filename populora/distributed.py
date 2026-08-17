@@ -3,9 +3,7 @@ from __future__ import annotations
 import os
 import atexit
 import random
-from collections import namedtuple
 from contextlib import contextmanager, nullcontext
-from functools import wraps
 from typing import TYPE_CHECKING
 from weakref import WeakKeyDictionary
 
@@ -63,16 +61,6 @@ def distributed_world_size():
 def is_main_rank():
     return distributed_rank() == 0
 
-def main_rank_only(fn):
-    @wraps(fn)
-    def inner(*args, **kwargs):
-        if is_main_rank():
-            return fn(*args, **kwargs)
-
-    return inner
-
-DistributedInfo = namedtuple('DistributedInfo', ['rank', 'world_size', 'device', 'is_distributed', 'is_main_rank'])
-
 def distributed_device(device = None):
     if exists(device):
         return torch.device(device)
@@ -95,8 +83,8 @@ def default_backend(device = None):
 
 def _collective_device():
     # tensors must live on this device to take part in the process group's collectives.
-    # the current device is only set inside the `distributed()` context - use each
-    # rank's local device directly so collectives work under plain torchrun too
+    # the current device is only set under torchrun - use each rank's local device
+    # directly so collectives work under plain torchrun too
 
     return distributed_device() if dist.get_backend() == 'nccl' else torch.device('cpu')
 
@@ -139,27 +127,6 @@ def sync_seed(seed = 0, src = 0):
         torch.cuda.manual_seed_all(seed)
 
     return seed
-
-# context manager
-
-@contextmanager
-def distributed(
-    seed = 0,
-    backend: str | None = None,
-    device: torch.device | str | None = None,
-    init_method = 'env://'
-):
-    _ensure_process_group(backend, init_method)
-    sync_seed(seed)
-    device = distributed_device(device)
-
-    if is_distributed() and device.type == 'cuda':
-        torch.cuda.set_device(device)
-
-    yield DistributedInfo(distributed_rank(), distributed_world_size(), device, is_distributed(), is_main_rank())
-
-    if is_distributed():
-        dist.barrier()
 
 # rng preservation
 

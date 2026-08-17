@@ -757,7 +757,7 @@ def test_culled_excluded_from_parents():
     assert parent_res_set.isdisjoint(culled_set)
     assert parent_res_set.issubset(survivors_set)
 
-def test_select_and_merge_best():
+def test_merge_best():
     model = get_model()
     x = torch.randint(0, 1000, (1, 16))
 
@@ -773,7 +773,7 @@ def test_select_and_merge_best():
 
     out_best_before = pop(x, individual = best_idx)
 
-    merged_model = pop.select_and_merge_best(fitnesses)
+    merged_model = pop.merge_(fitnesses.argmax())
 
     # Returns the exact same model reference
     assert merged_model is model

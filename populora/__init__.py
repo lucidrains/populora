@@ -18,16 +18,13 @@ from populora.populora import (
     ISLAND_REINIT_REGISTRY,
 )
 from populora.distributed import (
-    DistributedInfo,
     broadcast_object,
-    distributed,
     distributed_device,
     distributed_rank,
     distributed_world_size,
     evaluate_population_distributed,
     is_distributed,
     is_main_rank,
-    main_rank_only,
     partition_indices,
     preserve_rng,
     sync_population,

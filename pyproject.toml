@@ -1,6 +1,6 @@
 [project]
 name = "populora"
-version = "0.1.26"
+version = "0.1.27"
 description = "Implementation of PopuLoRA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

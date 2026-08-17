@@ -626,13 +626,6 @@ class Population(_LoRAMixin):
     merge = merge_
 
     @torch.no_grad()
-    def select_and_merge_best_(self, fitnesses: Tensor):
-        best_idx = fitnesses.argmax()
-        return self.merge_(best_idx)
-
-    select_and_merge_best = select_and_merge_best_
-
-    @torch.no_grad()
     def select_and_merge_(
         self,
         fitnesses: Tensor | None = None,
