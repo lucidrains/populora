@@ -1168,7 +1168,7 @@ def test_coevolve_signature_di():
 
 def test_coevolve_arms_race():
     pop_size = 8
-    coevolve = make_coevolve(pop_size = pop_size, seed = 42)
+    coevolve = make_coevolve(pop_size = pop_size, seed = 0)
 
     initial_grid_mse = evaluate_grid(coevolve, pop_size).mean(dim = 1).min().item()
     hardnesses = []

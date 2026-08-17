@@ -58,16 +58,18 @@ def init_lora_weights(pop_size, dim, dim_inner, rank, device = None):
 # tensor helpers
 
 def _efficient_svd_of_lora(weight_down, weight_up):
+    # batched over any leading dims - one individual or many at once
+
     r = weight_down.shape[-1]
 
     Q_A, R_A = qr(weight_down)
     Q_B, R_B = qr(weight_up)
 
-    C = einsum(R_A, R_B, 'i j, k j -> i k')
+    C = einsum(R_A, R_B, '... i j, ... k j -> ... i k')
     U_C, S, V_C_T = svd(C, full_matrices = False)
 
-    U = einsum(Q_A, U_C, 'd i, i s -> d s')
-    V = einsum(Q_B, V_C_T, 'e j, s j -> e s')
+    U = einsum(Q_A, U_C, '... d i, ... i s -> ... d s')
+    V = einsum(Q_B, V_C_T, '... e j, ... s j -> ... e s')
 
     U = pad_right_at_dim_to(U, r, dim = -1)
     S = pad_right_at_dim_to(S, r, dim = -1)
@@ -76,7 +78,7 @@ def _efficient_svd_of_lora(weight_down, weight_up):
     return U, S, V
 
 def skew_symmetrize(t):
-    return (t - rearrange(t, 'i j -> j i')) / 2
+    return (t - rearrange(t, '... i j -> ... j i')) / 2
 
 def _concat_chunked_outputs(outputs, batch_size):
     first_output = outputs[0]
@@ -122,18 +124,26 @@ MUTATION_REGISTRY = dict()
 def register_mutation(name: str, fn: callable):
     MUTATION_REGISTRY[name] = fn
 
+def batchable(fn):
+    # a mutation that can mutate a cohort of individuals in one batched call -
+    # `mutate_` passes it a 1-d tensor of indices instead of looping per index
+
+    fn.batch = True
+    return fn
+
 # M1
+@batchable
 def mutation_svd_structured(
     population: Population,
-    idx: int,
+    idx: Tensor,
     epsilon: float = 0.1,
     **kwargs
 ):
     device = population.device
 
     for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
-        w_down = weight_down[idx]
-        w_up = weight_up[idx]
+        w_down = weight_down.data[idx]
+        w_up = weight_up.data[idx]
 
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
@@ -141,94 +151,108 @@ def mutation_svd_structured(
         z = torch.randn_like(S)
         S_new = S * torch.exp(epsilon * z)
 
-        M_U = torch.randn((r, r), device = device, dtype = U.dtype)
-        R_U = torch.eye(r, device = device, dtype = U.dtype).add_(skew_symmetrize(M_U), alpha = epsilon)
+        M_U = torch.randn((*S.shape[:-1], r, r), device = device, dtype = U.dtype)
+        R_U = torch.eye(r, device = device, dtype = U.dtype) + epsilon * skew_symmetrize(M_U)
 
-        M_V = torch.randn((r, r), device = device, dtype = V.dtype)
-        R_V = torch.eye(r, device = device, dtype = V.dtype).add_(skew_symmetrize(M_V), alpha = epsilon)
+        M_V = torch.randn((*S.shape[:-1], r, r), device = device, dtype = V.dtype)
+        R_V = torch.eye(r, device = device, dtype = V.dtype) + epsilon * skew_symmetrize(M_V)
 
-        U_new = einsum(U, R_U, 'd r, r s -> d s')
-        V_new = einsum(V, R_V, 'e r, r s -> e s')
+        U_new = einsum(U, R_U, '... d r, ... r s -> ... d s')
+        V_new = einsum(V, R_V, '... e r, ... r s -> ... e s')
 
         S_sqrt = torch.sqrt(S_new)
-        weight_down[idx].copy_(einsum(U_new, S_sqrt, 'd r, r -> d r'))
-        weight_up[idx].copy_(einsum(V_new, S_sqrt, 'e r, r -> e r'))
+        weight_down.data[idx] = einsum(U_new, S_sqrt, '... d r, ... r -> ... d r')
+        weight_up.data[idx] = einsum(V_new, S_sqrt, '... e r, ... r -> ... e r')
 
 # M2
+@batchable
 def mutation_layer_selective_gaussian(
     population: Population,
-    idx: int,
+    idx: Tensor,
     epsilon: float = 0.1,
     f: float = 0.33,
     **kwargs
 ):
     keys = list(population.weight_down.keys())
-    num_mutate = max(1, int(f * len(keys)))
+    num_layers = len(keys)
+    num_mutate = max(1, int(f * num_layers))
 
-    mutate_indices = torch.randperm(len(keys), device = population.device)[:num_mutate]
-    mutate_keys = [keys[i] for i in mutate_indices.tolist()]
+    # per-individual random subset of layers - `rand(...).argsort` draws the
+    # same permutation distribution as a per-row `randperm`; layer i is mutated
+    # when it lands within the first `num_mutate` positions
 
-    for key in mutate_keys:
-        weight_down = population.weight_down[key][idx]
-        weight_up = population.weight_up[key][idx]
+    layer_choice = torch.rand(len(idx), num_layers, device = population.device).argsort(dim = -1)[..., :num_mutate]
 
-        weight_down.add_(torch.randn_like(weight_down), alpha = epsilon * weight_down.std())
-        weight_up.add_(torch.randn_like(weight_up), alpha = epsilon * weight_up.std())
+    for i, key in enumerate(keys):
+        mutate_rows = (layer_choice == i).any(dim = -1)
+        rows = idx[mutate_rows]
+
+        if len(rows) == 0:
+            continue
+
+        w_down = population.weight_down[key].data[rows]
+        w_up = population.weight_up[key].data[rows]
+
+        population.weight_down[key].data[rows] = w_down + epsilon * w_down.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_down)
+        population.weight_up[key].data[rows] = w_up + epsilon * w_up.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_up)
 
 # M3
+@batchable
 def mutation_component_masking(
     population: Population,
-    idx: int,
+    idx: Tensor,
     rho: float = 0.3,
     **kwargs
 ):
     device = population.device
 
     for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
-        w_down = weight_down[idx]
-        w_up = weight_up[idx]
+        w_down = weight_down.data[idx]
+        w_up = weight_up.data[idx]
 
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
 
         num_drop = math.ceil(rho * r)
-        drop_indices = torch.randperm(r, device = device)[:num_drop]
+        drop_indices = torch.rand(len(idx), r, device = device).argsort(dim = -1)[..., :num_drop]
 
         S_new = S.clone()
-        S_new[drop_indices] = 0.0
+        S_new.scatter_(-1, drop_indices, 0.)
 
         S_sqrt = torch.sqrt(S_new)
-        weight_down[idx].copy_(einsum(U, S_sqrt, 'd r, r -> d r'))
-        weight_up[idx].copy_(einsum(V, S_sqrt, 'e r, r -> e r'))
+        weight_down.data[idx] = einsum(U, S_sqrt, '... d r, ... r -> ... d r')
+        weight_up.data[idx] = einsum(V, S_sqrt, '... e r, ... r -> ... e r')
 
 # M4
+@batchable
 def mutation_full_gaussian(
     population: Population,
-    idx: int,
+    idx: Tensor,
     epsilon: float = 0.15,
     **kwargs
 ):
-    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
-        w_down_i = w_down[idx]
-        w_up_i = w_up[idx]
+    for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down = weight_down.data[idx]
+        w_up = weight_up.data[idx]
 
-        w_down_i.add_(torch.randn_like(w_down_i), alpha = epsilon * w_down_i.std())
-        w_up_i.add_(torch.randn_like(w_up_i), alpha = epsilon * w_up_i.std())
+        weight_down.data[idx] = w_down + epsilon * w_down.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_down)
+        weight_up.data[idx] = w_up + epsilon * w_up.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_up)
 
 # M5
+@batchable
 def mutation_neftune_style(
     population: Population,
-    idx: int,
+    idx: Tensor,
     alpha: float = 10.0,
     **kwargs
 ):
     for weight_down in population.weight_down.values():
-        w_down = weight_down[idx]
+        w_down = weight_down.data[idx]
 
-        bound = alpha / math.sqrt(w_down.numel())
+        bound = alpha / math.sqrt(w_down.shape[-2] * w_down.shape[-1])
         noise = torch.empty_like(w_down).uniform_(-bound, bound)
 
-        w_down.add_(noise)
+        weight_down.data[idx] = w_down + noise
 
 register_mutation('svd_structured', mutation_svd_structured)
 register_mutation('layer_selective_gaussian', mutation_layer_selective_gaussian)
@@ -439,26 +463,34 @@ def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses 
     num_children, num_parents = parent_indices.shape
     assert num_parents == 2, 'svd subspace crossover requires exactly 2 parents'
 
+    device = population.device
+
     for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
         w_down_parents = w_down.data[parent_indices]
         w_up_parents = w_up.data[parent_indices]
 
         r = w_down_parents.shape[-1]
 
-        for i in range(num_children):
-            U1, S1, V1 = _efficient_svd_of_lora(w_down_parents[i, 0], w_up_parents[i, 0])
-            U2, S2, V2 = _efficient_svd_of_lora(w_down_parents[i, 1], w_up_parents[i, 1])
+        # batched svd over both parents of every child - `_efficient_svd_of_lora`
+        # takes any leading dims, so the per-child loop folds into one call
 
-            k = torch.randint(1, r, (1,)).item() if r > 1 else 1
+        U, S, V = _efficient_svd_of_lora(w_down_parents, w_up_parents)
 
-            U_child = cat((U1[:, :k], U2[:, k:]), dim = 1)
-            S_child = cat((S1[:k], S2[k:]), dim = 0).clamp(min = 0.)
-            V_child = cat((V1[:, :k], V2[:, k:]), dim = 1)
+        U1, U2 = U[:, 0], U[:, 1]
+        S1, S2 = S[:, 0], S[:, 1]
+        V1, V2 = V[:, 0], V[:, 1]
 
-            S_sqrt = torch.sqrt(S_child)
+        k = torch.randint(1, r, (num_children,), device = device) if r > 1 else torch.ones(num_children, dtype = torch.long, device = device)
+        split_mask = torch.arange(r, device = device)[None, :] < k[:, None]
 
-            w_down.data[child_indices[i]] = U_child * S_sqrt
-            w_up.data[child_indices[i]] = V_child * S_sqrt
+        U_child = torch.where(split_mask[:, None, :], U1, U2)
+        S_child = torch.where(split_mask, S1, S2).clamp(min = 0.)
+        V_child = torch.where(split_mask[:, None, :], V1, V2)
+
+        S_sqrt = torch.sqrt(S_child)
+
+        w_down.data[child_indices] = U_child * S_sqrt[:, None, :]
+        w_up.data[child_indices] = V_child * S_sqrt[:, None, :]
 
 # X4
 def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, fitnesses = None, **kwargs):
@@ -864,18 +896,28 @@ class Population(Module):
         mutation_fn = mutation_registry[mutation_type]
 
         if all_individuals:
-            indices = range(self.pop_size)
+            indices = torch.arange(self.pop_size, device = self.device)
         elif exists(individuals):
-            indices = individuals
+            indices = cast_tensor(individuals, device = self.device)
         else:
-            indices = (individual,)
+            indices = cast_tensor((individual,), device = self.device)
 
         if exists(ignore_individuals):
-            ignore_set = set(ignore_individuals.tolist() if isinstance(ignore_individuals, Tensor) else ignore_individuals)
-            indices = [i for i in indices if i not in ignore_set]
+            ignore = cast_tensor(ignore_individuals, device = self.device)
+            indices = indices[~torch.isin(indices, ignore)]
 
-        for idx in indices:
-            mutation_fn(self, idx, **kwargs)
+        if len(indices) == 0:
+            return self
+
+        # batched mutations get the whole cohort at once - one op per layer
+        # instead of one per individual; custom registry fns keep the scalar
+        # contract, since they may rely on `weight_down[key][idx]` being a view
+
+        if getattr(mutation_fn, 'batch', False):
+            mutation_fn(self, indices, **kwargs)
+        else:
+            for idx in indices.tolist():
+                mutation_fn(self, idx, **kwargs)
 
         return self
 
