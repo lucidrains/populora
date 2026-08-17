@@ -134,15 +134,18 @@ Wrap populations whose fitnesses derive from one another's outputs — e.g. a pr
 ```python
 import torch
 from torch import nn
-from populora import Population, Coevolve
+from populora import Population, Coevolve, HallOfFame
 
 pop_size = 8
+K = 4  # archived solver champions sampled per generation
 
 proposer = Population(nn.Sequential(nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1), nn.Tanh()), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
 solver = Population(nn.Sequential(nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1)), pop_size = pop_size, low_rank = 2, lora_targets = ['0', '2'])
 
+solver_hof = HallOfFame()
+
 def probe_proposer(coevolve):
-    return coevolve.proposer(torch.randn(1, 1), all_individuals = True)  # (P, 1) proposed inputs
+    return coevolve.proposer(torch.randn(proposer.pop_size, 1), all_individuals = True)  # (P, 1) proposed inputs, one per individual
 
 def probe_solver(coevolve, proposer_outputs):
     return coevolve.solver(proposer_outputs.repeat(solver.pop_size, 1), all_individuals = True)
@@ -152,16 +155,26 @@ def fitness_solver(solver_outputs, proposer_outputs):
     return -((solver_outputs - target) ** 2).reshape(solver.pop_size, -1).mean(dim = 1)
 
 def fitness_proposer(proposer_outputs, solver_outputs):
+    # a proposal earns credit for stumping both the current solver and the archived champions
+
     target = torch.sin(torch.pi * proposer_outputs.repeat(solver.pop_size, 1))
-    return ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1).mean(dim = 0)
+    err = ((solver_outputs - target) ** 2).reshape(solver.pop_size, -1).mean(dim = 0)
+
+    arch = solver_hof.probe(solver, proposer_outputs, K)  # (k, P, 1) through sampled champions
+
+    if arch is not None:
+        err = err + ((arch - torch.sin(torch.pi * proposer_outputs)) ** 2).mean(dim = (0, 2))
+
+    return err
 
 coevolve = Coevolve(populations = dict(
     proposer = dict(population = proposer, probe = probe_proposer, fitness = fitness_proposer),
     solver = dict(population = solver, probe = probe_solver, fitness = fitness_solver)
 ))
 
-for _ in range(100):
-    coevolve.step()
+for gen in range(100):
+    fitnesses = coevolve.step()
+    solver_hof.add_champion(solver, fitnesses['solver'], generation = gen)
 ```
 
 `coevolve.history` records the best / mean fitness per population; `coevolve.step(distributed = True)` splits the probes across ranks (round-robin, outputs broadcast raw). Probes must form a chain — a probe depending on its own outputs raises at construction; only fitnesses may close a circle, since every population is probed before any fitness is derived.

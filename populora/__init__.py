@@ -41,3 +41,4 @@ from populora.interact import (
 )
 from populora.memory import Memory
 from populora.generate import generate
+from populora.archive import HallOfFame
