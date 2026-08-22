@@ -10,12 +10,14 @@ from populora.populora import (
     register_crossover,
     register_migration,
     register_island_reinit,
+    register_tier_rule,
     MUTATION_REGISTRY,
     SELECTION_REGISTRY,
     PARENT_SELECTION_REGISTRY,
     CROSSOVER_REGISTRY,
     MIGRATION_REGISTRY,
     ISLAND_REINIT_REGISTRY,
+    TIER_RULE_REGISTRY,
 )
 from populora.distributed import (
     broadcast_object,

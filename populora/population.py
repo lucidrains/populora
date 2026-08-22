@@ -22,6 +22,8 @@ from populora.operators import (
     MUTATION_REGISTRY,
     PARENT_SELECTION_REGISTRY,
     SELECTION_REGISTRY,
+    TIER_RULE_REGISTRY,
+    TieredResult,
     SelectionResult,
     with_elites,
 )
@@ -92,6 +94,11 @@ def _chunked_forward(model, args, kwargs, ignore, chunk_size, batch_size):
         outputs.append(model(*chunk_args, **chunk_kwargs))
 
     return _concat_chunked_outputs(outputs, batch_size)
+
+# tiered evolve constants
+
+_TIERED_DEFAULT_TIERS = ((0.3, 'keep'), (0.4, 'mutate'), (0.3, 'replace'))  # clone-and-perturb spec
+_TIER_STRATA = ('fitness', 'novelty', 'group')
 
 # shared lora hook machinery
 
@@ -676,11 +683,14 @@ class Population(_LoRAMixin):
     select_and_merge = select_and_merge_
 
     @torch.no_grad()
-    def repopulate_(
+    def reinit_individuals_(
         self,
+        individuals: int | Sequence[int] | Tensor,
         std_down: float | None = None,
         std_up: float | None = None
     ):
+        individuals = cast_tensor(individuals, device = self.device)
+
         for path in self.lora_targets:
             linear = self.model.get_submodule(path)
             key = path.replace('.', '_')
@@ -690,13 +700,25 @@ class Population(_LoRAMixin):
             std_d = default(std_down, dim ** -0.5)
             std_u = default(std_up, low_rank ** -0.5)
 
-            w_down = torch.empty(self.pop_size, dim, low_rank, device = self.device)
-            w_up = torch.empty(self.pop_size, dim_inner, low_rank, device = self.device)
+            w_down = torch.empty(len(individuals), dim, low_rank, device = self.device)
+            w_up = torch.empty(len(individuals), dim_inner, low_rank, device = self.device)
             w_down.normal_(std = std_d)
             w_up.normal_(std = std_u)
 
-            self.weight_down[key].copy_(w_down.to(self._dtype))
-            self.weight_up[key].copy_(w_up.to(self._dtype))
+            self.weight_down[key].data[individuals] = w_down.to(self._dtype)
+            self.weight_up[key].data[individuals] = w_up.to(self._dtype)
+
+        return self
+
+    reinit_individuals = reinit_individuals_
+
+    @torch.no_grad()
+    def repopulate_(
+        self,
+        std_down: float | None = None,
+        std_up: float | None = None
+    ):
+        return self.reinit_individuals_(torch.arange(self.pop_size, device = self.device), std_down = std_down, std_up = std_up)
 
     repopulate = repopulate_
 
@@ -743,8 +765,34 @@ class Population(_LoRAMixin):
         epsilon = 0.1,
         weight_decay = 0.0,
         soft_threshold = 0.0,
+        tiered = False,
+        tiers = None,
+        strata = 'fitness',
+        novelty = None,
+        burn_in = 0,
+        gen = None,
         **kwargs
     ):
+        assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+
+        tiered = tiered or exists(tiers)
+
+        if tiered:
+            return self._evolve_tiered_(
+                fitnesses,
+                tiers = tiers,
+                strata = strata,
+                novelty = novelty,
+                parent_selection_type = parent_selection_type,
+                crossover_type = crossover_type,
+                mutation_type = mutation_type,
+                num_groups = num_groups,
+                epsilon = epsilon,
+                burn_in = burn_in,
+                gen = gen,
+                **kwargs
+            )
+
         result = self.select(
             selection_type,
             fitnesses,
@@ -770,6 +818,110 @@ class Population(_LoRAMixin):
         return result
 
     evolve = evolve_
+
+    @torch.no_grad()
+    def _tier_bins(self, axis, tiers, num_groups):
+        # quantile strata of the axis, per group, best first - the last tier
+        # absorbs the rounding remainder
+
+        group_size = self.pop_size // num_groups
+        axis_grouped = rearrange(axis, '(g p) -> g p', g = num_groups)
+
+        bins = [list() for _ in tiers]
+
+        for g in range(num_groups):
+            order = axis_grouped[g].argsort(descending = True)
+            offset = g * group_size
+            cum = 0
+
+            for i, (frac, _) in enumerate(tiers):
+                count = group_size - cum if i == len(tiers) - 1 else min(max(1, int(frac * group_size)), group_size - cum)
+                bins[i].append(order[:count] + offset)
+                order = order[count:]
+                cum += count
+
+        return [cat(b) for b in bins]
+
+    @torch.no_grad()
+    def _evolve_tiered_(
+        self,
+        fitnesses: Tensor,
+        *,
+        tiers = None,
+        strata = 'fitness',
+        novelty = None,
+        parent_selection_type = 'tournament',
+        crossover_type = 'average',
+        mutation_type = 'full_gaussian',
+        num_groups = 1,
+        epsilon = 0.1,
+        burn_in: int = 0,
+        gen: int | None = None,
+        **kwargs
+    ):
+        # tiered evolve - bin the population into quantile strata of an axis
+        # (fitness, novelty, or per-island fitness) and process each tier by its
+        # rule - keep / mutate / replace (top-tier clones + re-mutate) / crossover
+        # (children of higher tiers) / reinit / archive (hof replay). the default
+        # spec is the clone-and-perturb scheme of bench_tiered.py
+        #
+        # `burn_in` (an N_adapt-style pause) exempts individuals processed within
+        # the last `burn_in` generations from further processing, giving them time
+        # to adapt - requires `gen` (the caller's generation counter)
+
+        tiers = default(tiers, _TIERED_DEFAULT_TIERS)
+
+        assert all(frac >= 0. and exists(rule) for frac, rule in tiers)
+        assert sum(frac for frac, _ in tiers) <= 1. + 1e-6, 'tier fractions must sum to at most 1'
+        assert all(rule in TIER_RULE_REGISTRY for _, rule in tiers), f'unknown tier rule - choose from {tuple(TIER_RULE_REGISTRY)}'
+        assert strata in _TIER_STRATA, f'unknown strata {strata} - choose from {_TIER_STRATA}'
+        assert not (strata == 'novelty' and not exists(novelty)), 'strata = "novelty" requires a novelty tensor'
+        assert divisible_by(self.pop_size, num_groups)
+        assert not (burn_in > 0 and not exists(gen)), 'gen must be passed when burn_in > 0'
+
+        # stratum axis - 'group' is per-island fitness, which the binning does anyway
+
+        axis = novelty if strata == 'novelty' else fitnesses
+        tier_bins = self._tier_bins(axis, tiers, num_groups)
+        rules = [TIER_RULE_REGISTRY[rule] for _, rule in tiers]
+
+        if burn_in > 0:
+            # pause - individuals touched too recently to have adapted are exempt
+            # until gen + burn_in (the top tier is never touched)
+
+            last_mutated = getattr(self, '_tiered_last_mutated', None)
+
+            if not exists(last_mutated) or last_mutated.shape[0] != self.pop_size:
+                self._tiered_last_mutated = torch.full((self.pop_size,), -burn_in, dtype = torch.long, device = self.device)
+                last_mutated = self._tiered_last_mutated
+
+            eligible = (gen - last_mutated) >= burn_in
+
+            for i in range(1, len(tier_bins)):
+                tier_bins[i] = tier_bins[i][eligible[tier_bins[i]]]
+
+        top = tier_bins[0]
+        sources = torch.empty(0, dtype = torch.long, device = self.device)
+
+        rule_kwargs = dict(
+            mutation_type = mutation_type,
+            epsilon = epsilon,
+            parent_selection_type = parent_selection_type,
+            crossover_type = crossover_type,
+            num_groups = num_groups,
+            **kwargs
+        )
+
+        for i, (indices, rule) in enumerate(zip(tier_bins, rules)):
+            if i > 0:
+                sources = cat((sources, tier_bins[i - 1]))
+
+            rule(self, indices, sources = sources, top = top, fitnesses = fitnesses, **rule_kwargs)
+
+            if burn_in > 0 and i > 0:
+                self._tiered_last_mutated[indices] = gen
+
+        return TieredResult(tier_bins)
 
     def evaluate_distributed(
         self,

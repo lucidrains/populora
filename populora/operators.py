@@ -221,6 +221,26 @@ class SelectionResult(namedtuple('_SelectionResult', ['survivors', 'culled', 'el
     def elite_indices(self):
         return self.elites
 
+class TieredResult(namedtuple('_TieredResult', ['tiers'])):
+    # per-tier index tensors, best tier first - as processed, so burn_in-paused
+    # individuals are excluded from their tier
+
+    @property
+    def survivors(self):
+        return cat(self.tiers[:-1]) if len(self.tiers) > 1 else self.tiers[0]
+
+    @property
+    def culled(self):
+        return self.tiers[-1]
+
+    @property
+    def elites(self):
+        return self.tiers[0]
+
+    @property
+    def mid(self):
+        return self.tiers[1] if len(self.tiers) > 2 else self.tiers[0][:0]
+
 def register_selection(name: str, fn: callable):
     SELECTION_REGISTRY[name] = fn
 
@@ -453,6 +473,15 @@ register_crossover('layer_wise', crossover_layer_wise)
 register_crossover('svd_subspace', crossover_svd_subspace)
 register_crossover('extrapolative', crossover_extrapolative)
 
+# X6 - replacement: each child is an exact copy of its single parent, no mixing.
+# used with num_parents_per_child = 1 by the tiered evolve mode, which then
+# re-mutates the clone
+
+def crossover_clone(population, parent_indices, child_indices, fitnesses = None, **kwargs):
+    for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
+        w_down.data[child_indices] = w_down.data[parent_indices][:, 0].to(w_down.dtype)
+        w_up.data[child_indices] = w_up.data[parent_indices][:, 0].to(w_up.dtype)
+
 # X5
 def crossover_xes(population, parent_indices, child_indices, fitnesses = None, num_bad_parents = None, eta = 1.0, **kwargs):
     assert exists(fitnesses), 'XES crossover requires fitnesses'
@@ -493,6 +522,90 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
         w_up.data[child_indices] = (w_up_parents.mean(dim = 1) + eta * einsum(weights, w_up_parents, 'c p, c p ... -> c ...')).to(w_up.dtype)
 
 register_crossover('xes', crossover_xes)
+register_crossover('clone', crossover_clone)
+
+# tier rules - each receives (population, indices, sources, top, fitnesses) plus
+# the shared evolve params in kwargs; sources = higher tiers, top = best tier
+
+TIER_RULE_REGISTRY = dict()
+
+def register_tier_rule(name: str, fn: callable):
+    TIER_RULE_REGISTRY[name] = fn
+
+_UNIFORM_DRAW_TEMPERATURE = float('inf')  # roulette at this temperature is a uniform draw
+
+def _tier_reproduce(population, indices, sources, fitnesses, *, parent_selection_type = 'tournament', crossover_type = 'average', num_parents_per_child = 2, mutation_type = 'full_gaussian', epsilon = 0.1, num_groups = 1, temperature = None, **kwargs):
+    # children for `indices`, parents drawn from `sources` - select, crossover, mutate
+
+    if len(indices) == 0 or len(sources) == 0:
+        return
+
+    parent_kwargs = dict(kwargs, temperature = temperature) if exists(temperature) else kwargs
+
+    parents = population.select_parents(
+        parent_selection_type, fitnesses,
+        num_children = len(indices),
+        survivors = sources,
+        num_parents_per_child = num_parents_per_child,
+        num_groups = num_groups,
+        **parent_kwargs
+    )
+
+    population.crossover_(crossover_type, parents, indices, fitnesses = fitnesses, **kwargs)
+    population.mutate_(mutation_type, individuals = indices, epsilon = epsilon, **kwargs)
+
+def tier_rule_keep(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
+    pass
+
+def tier_rule_mutate(population, indices, sources = None, top = None, fitnesses = None, mutation_type = 'full_gaussian', epsilon = 0.1, **kwargs):
+    population.mutate_(mutation_type, individuals = indices, epsilon = epsilon, **kwargs)
+
+def tier_rule_replace(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
+    # exact copies of a uniformly random top-tier agent, then re-mutated
+
+    kwargs.pop('parent_selection_type', None)
+    kwargs.pop('crossover_type', None)
+    kwargs.pop('num_parents_per_child', None)
+
+    _tier_reproduce(
+        population, indices, top, fitnesses,
+        parent_selection_type = 'roulette',
+        crossover_type = 'clone',
+        num_parents_per_child = 1,
+        temperature = kwargs.pop('temperature', _UNIFORM_DRAW_TEMPERATURE),
+        **kwargs
+    )
+
+def tier_rule_crossover(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
+    # standard pipeline, parents drawn from the higher tiers
+
+    _tier_reproduce(population, indices, sources, fitnesses, **kwargs)
+
+def tier_rule_reinit(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
+    population.reinit_individuals_(indices)
+
+def tier_rule_archive(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
+    # replay archived individuals into the tier - requires hof = HallOfFame(...)
+
+    hof = kwargs.get('hof')
+    assert exists(hof), 'the "archive" tier rule requires hof = HallOfFame(...)'
+    assert len(hof) > 0, 'the "archive" tier rule requires a non-empty hof'
+
+    entry_indices = hof.sample(len(indices), mode = kwargs.get('archive_mode', 'uniform'))
+
+    for slot, entry_idx in zip(indices.tolist(), entry_indices.tolist()):
+        entry = hof.entries[entry_idx]
+        population.load_individual(
+            dict(weight_down = entry.weight_down, weight_up = entry.weight_up),
+            individual = slot
+        )
+
+register_tier_rule('keep', tier_rule_keep)
+register_tier_rule('mutate', tier_rule_mutate)
+register_tier_rule('replace', tier_rule_replace)
+register_tier_rule('crossover', tier_rule_crossover)
+register_tier_rule('reinit', tier_rule_reinit)
+register_tier_rule('archive', tier_rule_archive)
 
 # migration
 

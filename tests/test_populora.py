@@ -9,7 +9,7 @@ from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
 from einops import rearrange, repeat
-from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, evaluate_population_distributed, register_mutation
+from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, evaluate_population_distributed, register_mutation
 from populora.populora import exists
 
 # helper
@@ -399,6 +399,285 @@ def test_crossover_xes():
     with pytest.raises(AssertionError, match = 'XES crossover requires fitnesses'):
         pop.crossover_('xes', parent_indices, child_indices)
 
+# tiered evolution - clone crossover (replacement without mixing) and the
+# tiered 30/40/30 evolve mode
+
+def test_clone_crossover():
+    pop = Population(
+        get_model(),
+        pop_size = 6,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    parent_indices = torch.tensor([[1], [4]])
+    child_indices = torch.tensor([2, 5])
+
+    pop.crossover_('clone', parent_indices, child_indices)
+
+    for w_down, w_up in zip(pop.weight_down.values(), pop.weight_up.values()):
+        assert allclose(w_down[2], w_down[1])
+        assert allclose(w_down[5], w_down[4])
+        assert allclose(w_up[2], w_up[1])
+        assert allclose(w_up[5], w_up[4])
+
+def test_evolve_tiered():
+    pop = Population(
+        get_model(),
+        pop_size = 10,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    torch.manual_seed(7)
+    fitnesses = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+
+    before = {k: v.clone() for k, v in pop.weight_down.items()}
+
+    # identity mutation - isolates the tiered selection and replacement scheme
+
+    noop = lambda population, idx, **kwargs: None
+
+    res = pop.evolve_(fitnesses, tiered = True, mutation_type = noop)
+
+    # 30/40/30 split of pop_size 10
+
+    assert len(res.elites) == 3
+    assert len(res.mid) == 4
+    assert len(res.culled) == 3
+
+    # tiers partition the population
+
+    assert set(res.elites.tolist()) | set(res.mid.tolist()) | set(res.culled.tolist()) == set(range(10))
+
+    # top tier untouched
+
+    for k in pop.weight_down.keys():
+        assert allclose(pop.weight_down[k][res.elites], before[k][res.elites])
+
+    # with an identity mutation, mid keeps its weights
+
+    for k in pop.weight_down.keys():
+        assert allclose(pop.weight_down[k][res.mid], before[k][res.mid])
+
+    # culled replaced by exact copies of (distinct) top-tier agents
+
+    w = pop.weight_down['attn_layers_layers_0_1_to_q']
+
+    for c in res.culled.tolist():
+        assert any(allclose(w[c], w[e]) for e in res.elites.tolist())
+
+def test_evolve_tiered_burn_in():
+    pop = Population(
+        get_model(),
+        pop_size = 10,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    torch.manual_seed(3)
+    fitnesses = torch.linspace(1.0, 0.0, 10)
+
+    noop = lambda population, idx, **kwargs: None
+
+    # gen 0: everyone eligible, mid + bottom mutated
+
+    res0 = pop.evolve_(fitnesses, tiered = True, burn_in = 3, gen = 0, mutation_type = noop)
+    touched0 = set(res0.mid.tolist()) | set(res0.culled.tolist())
+
+    # gens 1-2: burn-in pauses everyone touched at gen 0, so no mid/bottom
+    # individual may be touched again until gen 3
+
+    for gen in (1, 2):
+        res = pop.evolve_(fitnesses, tiered = True, burn_in = 3, gen = gen, mutation_type = noop)
+        touched = set(res.mid.tolist()) | set(res.culled.tolist())
+        assert touched0.isdisjoint(touched)
+
+    # gen 3: paused individuals are eligible again
+
+    res3 = pop.evolve_(fitnesses, tiered = True, burn_in = 3, gen = 3, mutation_type = noop)
+    touched3 = set(res3.mid.tolist()) | set(res3.culled.tolist())
+    assert touched0 & touched3
+
+def test_evolve_tiered_groups():
+    pop = Population(
+        get_model(),
+        pop_size = 12,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    torch.manual_seed(11)
+    fitnesses = torch.randn(12)
+
+    noop = lambda population, idx, **kwargs: None
+
+    res = pop.evolve_(fitnesses, tiered = True, num_groups = 3, mutation_type = noop)
+
+    # each island of 4 is tiered independently - 30/40/30 with integer rounding
+    # gives 1 elite, 1 mid, 2 culled per island
+
+    assert len(res.elites) == 3
+    assert len(res.mid) == 3
+    assert len(res.culled) == 6
+
+    # culled clones come from elites of the same island
+
+    w = pop.weight_down['attn_layers_layers_0_1_to_q']
+    group_size = 4
+
+    for g in range(3):
+        island = range(g * group_size, (g + 1) * group_size)
+        island_elites = [e for e in res.elites.tolist() if e in island]
+
+        for c in res.culled.tolist():
+            if c in island:
+                assert any(allclose(w[c], w[e]) for e in island_elites)
+
+def test_evolve_tiered_spec():
+    # a custom tier spec - fractions and rules are both free
+
+    pop = Population(
+        get_model(),
+        pop_size = 10,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    torch.manual_seed(5)
+    fitnesses = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+    before = {k: v.clone() for k, v in pop.weight_down.items()}
+
+    noop = lambda population, idx, **kwargs: None
+
+    res = pop.evolve_(
+        fitnesses,
+        tiers = [(0.2, 'keep'), (0.2, 'mutate'), (0.6, 'replace')],
+        mutation_type = noop
+    )
+
+    assert len(res.tiers) == 3
+    assert len(res.elites) == 2
+    assert len(res.mid) == 2
+    assert len(res.culled) == 6
+
+    # tiers partition the population
+
+    assert set(res.elites.tolist()) | set(res.mid.tolist()) | set(res.culled.tolist()) == set(range(10))
+
+    # keep untouched
+
+    for k in pop.weight_down.keys():
+        assert allclose(pop.weight_down[k][res.elites], before[k][res.elites])
+
+    # replace copies the top tier exactly (noop mutation)
+
+    w = pop.weight_down['attn_layers_layers_0_1_to_q']
+
+    for c in res.culled.tolist():
+        assert any(allclose(w[c], w[e]) for e in res.elites.tolist())
+
+def test_evolve_tiered_strata_novelty():
+    pop = Population(
+        get_model(),
+        pop_size = 10,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+    novelty = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])  # inverted vs fitness
+
+    noop = lambda population, idx, **kwargs: None
+
+    res = pop.evolve_(
+        fitnesses,
+        tiers = [(0.3, 'keep'), (0.7, 'replace')],
+        strata = 'novelty',
+        novelty = novelty,
+        mutation_type = noop
+    )
+
+    # the keep tier follows novelty, not fitness
+
+    assert set(res.elites.tolist()) == {7, 8, 9}
+    assert set(res.culled.tolist()) == set(range(7))
+
+    # novelty strata require the novelty tensor
+
+    with pytest.raises(AssertionError, match = 'novelty'):
+        pop.evolve_(fitnesses, tiers = [(0.3, 'keep'), (0.7, 'replace')], strata = 'novelty', mutation_type = noop)
+
+def test_evolve_tiered_rules():
+    pop = Population(
+        get_model(),
+        pop_size = 10,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    torch.manual_seed(2)
+    fitnesses = torch.tensor([0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+    w = pop.weight_down['attn_layers_layers_0_1_to_q']
+
+    noop = lambda population, idx, **kwargs: None
+
+    # reinit - the whole bottom tier is freshly drawn
+
+    before = w.clone()
+    res = pop.evolve_(fitnesses, tiers = [(0.3, 'keep'), (0.7, 'reinit')], mutation_type = noop)
+
+    for c in res.culled.tolist():
+        assert not allclose(w[c], before[c])
+
+    # crossover - children are the average of two higher-tier parents (noop mutation)
+
+    res = pop.evolve_(fitnesses, tiers = [(0.3, 'keep'), (0.7, 'crossover')], mutation_type = noop)
+
+    for c in res.culled.tolist():
+        assert any(allclose(w[c], (w[a] + w[b]) / 2) for a in res.elites.tolist() for b in res.elites.tolist())
+
+    # archive - replays archived individuals into the tier
+
+    hof = HallOfFame()
+    archived = []
+
+    for i in range(4):
+        hof.add(pop, i)
+        _, (w_d, w_u) = pop.individual_weights(i)
+        archived.append(w_d['attn_layers_layers_0_1_to_q'].clone())
+
+    res = pop.evolve_(fitnesses, tiers = [(0.7, 'keep'), (0.3, 'archive')], mutation_type = noop, hof = hof)
+
+    assert len(res.culled) == 3
+
+    for c in res.culled.tolist():
+        assert any(allclose(w[c], entry) for entry in archived)
+
+    # archive without a hof raises
+
+    with pytest.raises(AssertionError, match = 'hof'):
+        pop.evolve_(fitnesses, tiers = [(0.7, 'keep'), (0.3, 'archive')], mutation_type = noop)
+
+def test_evolve_tiered_validation():
+    pop = Population(
+        get_model(),
+        pop_size = 10,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.randn(10)
+
+    with pytest.raises(AssertionError, match = 'tier rule'):
+        pop.evolve_(fitnesses, tiers = [(1.0, 'nonexistent')])
+
+    with pytest.raises(AssertionError, match = 'sum to at most 1'):
+        pop.evolve_(fitnesses, tiers = [(0.6, 'keep'), (0.6, 'mutate')])
+
+    with pytest.raises(AssertionError, match = 'strata'):
+        pop.evolve_(fitnesses, tiers = [(1.0, 'keep')], strata = 'bogus')
+
 @param('num_parents', [2, 3])
 def test_evolution_generation(num_parents):
     pop = Population(
@@ -409,8 +688,6 @@ def test_evolution_generation(num_parents):
     )
 
     fitnesses = torch.tensor([0.1, 0.9, 0.5, 0.2, 0.8, 0.6])
-
-    # 1. survivor selection
 
     survivor_indices, culled_indices, elite_indices = pop.select(
         'deterministic',

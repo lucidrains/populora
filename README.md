@@ -276,3 +276,15 @@ Samples can be routed to explicit individuals (`individual = 3` or `individuals 
     url     = {https://arxiv.org/abs/2604.20209},
 }
 ```
+
+```bibtex
+@misc{petrenko2023dexpbt,
+    title    = {DexPBT: Scaling up Dexterous Manipulation for Hand-Arm Systems with Population Based Training},
+    author   = {Aleksei Petrenko and Arthur Allshire and Gavriel State and Ankur Handa and Viktor Makoviychuk},
+    year     = {2023},
+    eprint   = {2305.12127},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url      = {https://arxiv.org/abs/2305.12127},
+}
+```
