@@ -5,6 +5,7 @@
 #   "fire",
 #   "gymnasium",
 #   "x-mlps-pytorch",
+#   "tqdm",
 #   "populora",
 # ]
 # [tool.uv.sources]
@@ -17,6 +18,7 @@ import gymnasium as gym
 import torch
 import numpy as np
 import fire
+from tqdm import tqdm
 from x_mlps_pytorch import MLP
 
 from populora import interact_with_env, make_categorical_action
@@ -91,7 +93,7 @@ def main(
     if exists(seed):
         seeds = [seed]
 
-    results = [run_cartpole_experiment(seed = s, **kwargs) for s in seeds]
+    results = [run_cartpole_experiment(seed = s, **kwargs) for s in tqdm(seeds, desc = 'validating cartpole')]
 
     solved_count = sum(1 for r in results if r["solved"])
     solve_gens = [r["gen_to_solve"] for r in results if r["solved"]]

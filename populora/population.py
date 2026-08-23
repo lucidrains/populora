@@ -72,6 +72,17 @@ def _concat_chunked_outputs(outputs, batch_size):
 def _slice_batch(t, start, end, batch_size):
     return t[start:end] if is_tensor(t) and t.ndim > 0 and t.shape[0] == batch_size else t
 
+def _expand_batch(t, p):
+    # broadcast a singleton batch to each individual, otherwise check it is a
+    # multiple - non-tensors (lengths, masks, ...) pass through untouched
+
+    if is_tensor(t) and t.ndim > 0:
+        if t.shape[0] == 1:
+            t = repeat(t, '1 ... -> p ...', p = p)
+        assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+
+    return t
+
 def _chunked_forward(model, args, kwargs, ignore, chunk_size, batch_size):
     # run the model over the batch in chunks, concatenating the outputs -
     # caps the activation blowup on large models
@@ -967,7 +978,16 @@ class Population(_LoRAMixin):
             yield
             return
 
-        with temp_eval(self), torch.no_grad():
+        # toggling train/eval walks the whole module tree with per-module
+        # setattrs - skipped when the model tree is already fully in eval
+        # mode, which is the rollout / decode steady state
+
+        if any(module.training for module in self.model.modules()):
+            with temp_eval(self), torch.no_grad():
+                yield
+            return
+
+        with torch.no_grad():
             yield
 
     def _create_hook(self, lora_key: str):
@@ -986,18 +1006,24 @@ class Population(_LoRAMixin):
 
             # per-sample routing when ids are vectorized (e.g. one individual per env)
 
-            routed_batch = individual is ... or (is_tensor(individual) and individual.ndim > 0)
-
-            if routed_batch:
+            if individual is ... or (is_tensor(individual) and individual.ndim > 0):
                 p = weight_down_i.shape[0]
 
                 assert divisible_by(x.shape[0], p), f'batch {x.shape[0]} must be a multiple of routed individuals {p}'
 
-                x = rearrange(x, '(p b) ... -> p b ...', p = p)
-                lora_out = einsum(x, weight_down_i.to(x.dtype), weight_up_i.to(x.dtype), 'p b ... d, p d r, p e r -> p b ... e')
-                lora_out = rearrange(lora_out, 'p b ... -> (p b) ...')
+                wd_i = weight_down_i.to(x.dtype)
+                wu_i = weight_up_i.to(x.dtype)
+
+                if x.shape[0] == p and x.ndim == 2:
+                    # one sample per individual - the delta is two chained
+                    # matmuls on a leading batch axis, no reshaping at all
+                    lora_out = (x.unsqueeze(1) @ wd_i @ wu_i.transpose(-1, -2)).squeeze(1)
+                else:
+                    x = rearrange(x, '(p b) ... -> p b ...', p = p)
+                    lora_out = einsum(x, wd_i, wu_i, 'p b ... d, p d r, p e r -> p b ... e')
+                    lora_out = rearrange(lora_out, 'p b ... -> (p b) ...')
             else:
-                lora_out = einsum(x, weight_down_i.to(x.dtype), weight_up_i.to(x.dtype), '... d, d r, e r -> ... e')
+                lora_out = x @ weight_down_i.to(x.dtype) @ weight_up_i.to(x.dtype).transpose(-1, -2)
 
             return output + lora_out.to(output.dtype)
 
@@ -1021,28 +1047,34 @@ class Population(_LoRAMixin):
             p = self.pop_size if all_individuals else len(individuals)
             batch_size = 0
 
-            def maybe_repeat_batch(t):
-                # broadcast a singleton batch to each individual, otherwise expect a multiple of the batch
+            if not ignore and not any(isinstance(t, (tuple, list, dict)) for t in (*args, *kwargs.values())):
+                # fast path - plain tensor args, no per-call structure walk
+                args = tuple(_expand_batch(a, p) for a in args)
+                kwargs = {k: _expand_batch(v, p) for k, v in kwargs.items()}
+                batch_size = next((t.shape[0] for t in (*args, *kwargs.values()) if is_tensor(t) and t.ndim > 0), 0)
+            else:
+                def maybe_repeat_batch(t):
+                    # broadcast a singleton batch to each individual, otherwise expect a multiple of the batch
 
-                nonlocal batch_size
+                    nonlocal batch_size
 
-                if t.shape[0] == 1:
-                    t = repeat(t, '1 ... -> p ...', p = p)
-                else:
-                    assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+                    if t.shape[0] == 1:
+                        t = repeat(t, '1 ... -> p ...', p = p)
+                    else:
+                        assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
 
-                batch_size = t.shape[0]
-                return t
+                    batch_size = t.shape[0]
+                    return t
 
-            args = tuple(
-                tree_map_tensor(maybe_repeat_batch, a) if i not in ignore else a
-                for i, a in enumerate(args)
-            )
+                args = tuple(
+                    tree_map_tensor(maybe_repeat_batch, a) if i not in ignore else a
+                    for i, a in enumerate(args)
+                )
 
-            kwargs = {
-                k: tree_map_tensor(maybe_repeat_batch, v) if k not in ignore else v
-                for k, v in kwargs.items()
-            }
+                kwargs = {
+                    k: tree_map_tensor(maybe_repeat_batch, v) if k not in ignore else v
+                    for k, v in kwargs.items()
+                }
 
             # with `micro_batch`, run the expanded batch through the model in
             # chunks, each a multiple of the population size so the per-sample
@@ -1111,7 +1143,7 @@ class LoRA(_LoRAMixin):
             weight_down = self.weight_down[lora_key]
             weight_up = self.weight_up[lora_key]
 
-            lora_out = einsum(x, weight_down.to(x.dtype), weight_up.to(x.dtype), '... d, d r, e r -> ... e')
+            lora_out = x @ weight_down.to(x.dtype) @ weight_up.to(x.dtype).transpose(-1, -2)
             return output + lora_out.to(output.dtype)
 
         return hook

@@ -18,6 +18,7 @@ from populora import (
     evolve_with_env,
     interact_with_env,
     linear_layer_paths,
+    rescale_from_range_to_range,
 )
 from populora.distributed import (
     distributed_world_size,
@@ -695,6 +696,64 @@ def test_distributed_interact():
     fitnesses = interactor.evaluate(pop, action = lambda logits: torch.tanh(logits), horizon = 40)
     assert fitnesses.shape == (1,)
 
+def test_rescale_from_range_to_range():
+    # affine map - endpoints and midpoint land exactly, no clamping
+
+    assert rescale_from_range_to_range(-1.) == 0.
+    assert rescale_from_range_to_range(0.) == 0.5
+    assert rescale_from_range_to_range(1.) == 1.
+
+    rescaled = rescale_from_range_to_range(torch.tensor([-1., 0., 1.]), to_range = (-2., 2.))
+    assert torch.allclose(rescaled, torch.tensor([-2., 0., 2.]))
+
+    # per-dimension ranges broadcast along the trailing dim
+
+    per_dim = rescale_from_range_to_range(
+        torch.tensor([[0., 0.]]),
+        from_range = ((-1., -1.), (1., 1.)),
+        to_range = ((0., 10.), (1., 20.))
+    )
+    assert torch.allclose(per_dim, torch.tensor([[0.5, 15.]]))
+
+def test_interact_to_range():
+    # to_range rescales the (-1, 1) policy output onto the env action range -
+    # a constant 0.5 action lands on 0.75 in (0, 1), scoring 0.75 per step
+
+    interactor = interact_with_env(ActionAimMockEnv(), seed = 0, to_range = (0., 1.))
+    pop = interactor.population(make_policy(zero_last = True), pop_size = 4, low_rank = 2)
+
+    fitnesses = interactor.evaluate(pop, action = lambda logits: 0.5, horizon = 60)
+    assert torch.allclose(fitnesses, torch.full((4,), 45.))
+
+    policy = pop.merge_(0)
+    assert interactor.evaluate_policy(policy, action = lambda logits: 0.5, num_episodes = 2) == 45.
+
+    # without to_range the action is passed through untouched
+
+    interactor = interact_with_env(ActionAimMockEnv(), seed = 0)
+    fitnesses = interactor.evaluate(pop, action = lambda logits: 0.5, horizon = 60)
+    assert torch.allclose(fitnesses, torch.full((4,), 60.))
+
+def test_evolve_with_env_to_range():
+    # the one-call wrapper forwards to_range to the interactor
+
+    if is_distributed():
+        return
+
+    policy = evolve_with_env(
+        ActionAimMockEnv(),
+        make_policy(zero_last = True),
+        pop_size = 8,
+        low_rank = 2,
+        num_generations = 2,
+        horizon = 60,
+        action = lambda logits: 0.5,
+        seed = 0,
+        to_range = (0., 1.),
+    )
+
+    assert isinstance(policy, nn.Module)
+
 if __name__ == '__main__':
     test_linear_layer_paths()
     test_interact_single_env()
@@ -727,6 +786,9 @@ if __name__ == '__main__':
     test_interact_vector_num_episodes_more_individuals()
     test_interact_dict_obs_vector_env()
     test_interact_scalar_action()
+    test_rescale_from_range_to_range()
+    test_interact_to_range()
+    test_evolve_with_env_to_range()
     test_interact_real_gymnasium_vector()
     test_distributed_interact()
     print('interact tests passed')

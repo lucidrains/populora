@@ -78,10 +78,13 @@ def make_squashed_gaussian_action(
 def make_beta_action(
     *,
     sample: bool = True,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    beta_rescale_neg_one_one: bool = True
 ):
     # 2 * action_dim logits - alpha then beta via softplus + 1, so the beta
-    # is always unimodal on (0, 1). temperature 0 is the mode
+    # is always unimodal on (0, 1), rescaled to (-1, 1) by default so it
+    # shares the squashed gaussian's range and can be multiplied by an
+    # action range directly. temperature 0 is the mode
 
     def action_fn(logits):
         alpha_pre, beta_pre = logits.chunk(2, dim = -1)
@@ -91,12 +94,17 @@ def make_beta_action(
         mode = (alpha - 1.0) / (alpha + beta - 2.0)
 
         if not sample or temperature == 0:
-            return mode
+            action = mode
+        else:
+            if temperature != 1.0:
+                alpha = 1.0 + (alpha - 1.0) / temperature
+                beta = 1.0 + (beta - 1.0) / temperature
 
-        if temperature != 1.0:
-            alpha = 1.0 + (alpha - 1.0) / temperature
-            beta = 1.0 + (beta - 1.0) / temperature
+            action = torch.distributions.Beta(alpha, beta).sample()
 
-        return torch.distributions.Beta(alpha, beta).sample()
+        if beta_rescale_neg_one_one:
+            action = 2.0 * action - 1.0
+
+        return action
 
     return action_fn

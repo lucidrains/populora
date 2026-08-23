@@ -39,23 +39,10 @@ def make_env(distribution: str, **env_kwargs):
     if distribution == 'categorical':
         return gym.make('LunarLander-v3', **env_kwargs)
 
-    env = gym.make('LunarLanderContinuous-v3', **env_kwargs)
-    if distribution == 'beta':
-        env = ActionTransformWrapper(env, transforms = [dict(rescale_from_to = ((0., 1.), (-1., 1.)))])
-
-    return env
+    return gym.make('LunarLanderContinuous-v3', **env_kwargs)
 
 def make_record_env(distribution: str, video_folder: str, name_prefix: str):
-    # record the raw env, with the action rescale (beta) wrapped on the
-    # outside - RecordVideo only accepts plain gymnasium envs
-
-    env = gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array')
-    env = gym.wrappers.RecordVideo(env, video_folder = video_folder, name_prefix = name_prefix, disable_logger = True)
-
-    if distribution == 'beta':
-        env = ActionTransformWrapper(env, transforms = [dict(rescale_from_to = ((0., 1.), (-1., 1.)))])
-
-    return env
+    # record the raw env - continuous action spaces already emit (-1, 1)
 
 def evaluate_individual(
     env: gym.Env,

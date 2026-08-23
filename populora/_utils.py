@@ -41,3 +41,22 @@ def resolve_dtype(dtype):
         return getattr(torch, dtype)
 
     raise TypeError(f'invalid dtype {dtype}')
+
+def rescale_from_range_to_range(value, from_range = (-1., 1.), to_range = (0., 1.)):
+    # affine map of a value (or tensor, or per-dimension range pair) from one
+    # range to another, e.g. policy outputs on (-1, 1) to an env action range.
+    # a pure rescale - no clamping
+
+    from_lo, from_hi = maybe_cast_tuple(from_range, 2)
+    to_lo, to_hi = maybe_cast_tuple(to_range, 2)
+
+    from_lo, from_hi = torch.as_tensor(from_lo), torch.as_tensor(from_hi)
+    to_lo, to_hi = torch.as_tensor(to_lo), torch.as_tensor(to_hi)
+
+    if is_tensor(value):
+        device = value.device
+        from_lo, from_hi = from_lo.to(device), from_hi.to(device)
+        to_lo, to_hi = to_lo.to(device), to_hi.to(device)
+
+    ratio = (to_hi - to_lo) / (from_hi - from_lo)
+    return to_lo + (value - from_lo) * ratio

@@ -5,6 +5,7 @@ from collections import namedtuple
 from functools import wraps
 from typing import TYPE_CHECKING, Sequence
 
+import numpy as np
 import torch
 from torch import Tensor, cat
 import torch.nn.functional as F
@@ -47,6 +48,34 @@ def _efficient_svd_of_lora(weight_down, weight_up):
 
 def skew_symmetrize(t):
     return (t - rearrange(t, '... i j -> ... j i')) / 2
+
+# noise helpers - numpy's ziggurat generator is ~2x faster than torch's
+# box-muller for the big elementwise draws. a numpy generator is seeded from
+# the torch generator's live state each call (advanced by one draw, so every
+# call gets a distinct stream): seeded runs stay reproducible, a fresh
+# torch.manual_seed restarts the noise exactly, and cuda keeps torch's own
+# generator, which is device-fast
+
+def _cpu_rng():
+    torch.rand(1)
+    state = torch.random.get_rng_state().view(torch.int64)
+    seed = int(state.sum().item()) & 0x7FFFFFFFFFFFFFFF  # numpy seeds are non-negative
+    return np.random.default_rng(seed)
+
+def _normal_noise(shape, device):
+    if device.type == 'cpu':
+        return torch.from_numpy(_cpu_rng().standard_normal(shape, dtype = np.float32))
+    return torch.randn(shape, device = device)
+
+def _uniform_noise(shape, device, low, high):
+    if device.type == 'cpu':
+        return torch.from_numpy(_cpu_rng().uniform(low, high, shape).astype(np.float32))
+    return torch.empty(shape, device = device).uniform_(low, high)
+
+def _noise_like(w, epsilon):
+    # epsilon-scaled per-individual-std gaussian noise, in w's precision
+
+    return epsilon * w.std(dim = (1, 2), keepdim = True) * _normal_noise(w.shape, w.device)
 
 # mutations
 
@@ -130,8 +159,11 @@ def mutation_layer_selective_gaussian(
         w_down_rows = w_down.data[rows].float()
         w_up_rows = w_up.data[rows].float()
 
-        w_down.data[rows] = (w_down_rows + epsilon * w_down_rows.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_down_rows)).to(w_down.dtype)
-        w_up.data[rows] = (w_up_rows + epsilon * w_up_rows.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_up_rows)).to(w_up.dtype)
+        w_down_rows.add_(_noise_like(w_down_rows, epsilon))
+        w_up_rows.add_(_noise_like(w_up_rows, epsilon))
+
+        w_down.data[rows] = w_down_rows.to(w_down.dtype)
+        w_up.data[rows] = w_up_rows.to(w_up.dtype)
 
 # M3
 @batchable
@@ -174,8 +206,11 @@ def mutation_full_gaussian(
         w_down = weight_down.data[idx].float()
         w_up = weight_up.data[idx].float()
 
-        weight_down.data[idx] = (w_down + epsilon * w_down.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_down)).to(dtype)
-        weight_up.data[idx] = (w_up + epsilon * w_up.std(dim = (1, 2), keepdim = True) * torch.randn_like(w_up)).to(dtype)
+        w_down.add_(_noise_like(w_down, epsilon))
+        w_up.add_(_noise_like(w_up, epsilon))
+
+        weight_down.data[idx] = w_down.to(dtype)
+        weight_up.data[idx] = w_up.to(dtype)
 
 # M5
 @batchable
@@ -190,9 +225,9 @@ def mutation_neftune_style(
         w_down = weight_down.data[idx].float()
 
         bound = alpha / math.sqrt(w_down.shape[-2] * w_down.shape[-1])
-        noise = torch.empty_like(w_down).uniform_(-bound, bound)
+        w_down.add_(_uniform_noise(w_down.shape, w_down.device, -bound, bound))
 
-        weight_down.data[idx] = (w_down + noise).to(dtype)
+        weight_down.data[idx] = w_down.to(dtype)
 
 register_mutation('svd_structured', mutation_svd_structured)
 register_mutation('layer_selective_gaussian', mutation_layer_selective_gaussian)
