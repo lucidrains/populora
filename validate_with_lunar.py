@@ -19,43 +19,58 @@ from __future__ import annotations
 import os
 import shutil
 from collections import deque
-import gymnasium as gym
-import torch
-import numpy as np
-from tqdm import tqdm
+
 import fire
+import gymnasium as gym
+import numpy as np
+import torch
+from env_ssl_wrapper import ActionTransformWrapper
+from tqdm import tqdm
 from x_mlps_pytorch import MLP
 
-from populora import Population
+from populora import Population, interact_with_env, make_action
 
 # helpers
 
-def exists(v):
-    return v is not None
-
 def divisible_by(num, den):
     return (num % den) == 0
+
+def make_env(distribution: str, **env_kwargs):
+    if distribution == 'categorical':
+        return gym.make('LunarLander-v3', **env_kwargs)
+
+    env = gym.make('LunarLanderContinuous-v3', **env_kwargs)
+    if distribution == 'beta':
+        env = ActionTransformWrapper(env, transforms = [dict(rescale_from_to = ((0., 1.), (-1., 1.)))])
+
+    return env
+
+def make_record_env(distribution: str, video_folder: str, name_prefix: str):
+    # record the raw env, with the action rescale (beta) wrapped on the
+    # outside - RecordVideo only accepts plain gymnasium envs
+
+    env = gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array')
+    env = gym.wrappers.RecordVideo(env, video_folder = video_folder, name_prefix = name_prefix, disable_logger = True)
+
+    if distribution == 'beta':
+        env = ActionTransformWrapper(env, transforms = [dict(rescale_from_to = ((0., 1.), (-1., 1.)))])
+
+    return env
 
 def evaluate_individual(
     env: gym.Env,
     pop: Population,
     individual_idx: int,
-    sample_actions: bool = True,
-    action_std: float = 0.10,
-    env_seed: int | None = None
+    action_fn,
 ) -> float:
-    state, _ = env.reset(seed = env_seed)
+    state, _ = env.reset()
     done = False
     total_reward = 0.0
 
     while not done:
         state_tensor = torch.tensor(state, dtype = torch.float32).unsqueeze(0)
         with torch.no_grad():
-            mean_action = pop(state_tensor, individual = individual_idx).squeeze(0).tanh()
-            if sample_actions and action_std > 0.:
-                action = torch.normal(mean_action, action_std).clamp(-1.0, 1.0).numpy()
-            else:
-                action = mean_action.numpy()
+            action = action_fn(pop(state_tensor, individual = individual_idx).squeeze(0)).numpy()
 
         state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -70,10 +85,14 @@ def validate_with_lunar(
     low_rank: int = 4,
     max_generations: int = 300,
     seed: int = 42,
+    distribution: str = 'squashed_gaussian',  # 'categorical' | 'squashed_gaussian' | 'beta'
     sample_actions: bool = True,
-    action_std: float = 0.10,
+    temperature: float = 1.0,
+    min_log_std: float = -5.0,
+    max_log_std: float = 0.5,
+    num_episodes: int = 2,
     es_every_generations: int = 25,
-    es_topk: int | float | None = None,
+    es_topk: float | None = None,
     es_temperature: float = 1.0,
     queen_bee_mating: bool = False,
     num_elites: int = 1,
@@ -87,36 +106,48 @@ def validate_with_lunar(
     os.makedirs('videos', exist_ok = True)
     print('\nlogging videos of the best individual per generation to ./videos/\n')
 
-    env = gym.make('LunarLanderContinuous-v3')
+    env = make_env(distribution)
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    continuous = isinstance(env.action_space, gym.spaces.Box)
+    action_dim = env.action_space.shape[0] if continuous else env.action_space.n
+
+    interactor = interact_with_env(env, seed = seed)
+
+    output_dim = 2 * action_dim if continuous else action_dim
 
     pop = Population(
-        MLP(state_dim, 64, 64, action_dim),
+        MLP(state_dim, 64, 64, output_dim),
         pop_size = pop_size,
         low_rank = low_rank,
         lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2'],
         eval_seed = seed
     )
 
-    print(f'[PopuLoRA Lunar] population size: {pop_size} | total generations: {max_generations}')
+    print(f'[PopuLoRA Lunar] population size: {pop_size} | total generations: {max_generations} | episodes per evaluation: {num_episodes}')
 
     recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
 
     parent_selection_type = 'queen_bee' if queen_bee_mating else 'tournament'
 
-    # evaluate the population under a shared per-generation seed
-
-    eval_env = lambda pop, idx: evaluate_individual(
-        env, pop, idx,
-        sample_actions = sample_actions,
-        action_std = action_std,
-        env_seed = pop.eval_seed
+    action_fn = make_action(
+        distribution,
+        sample = sample_actions,
+        temperature = temperature,
+        min_log_std = min_log_std,
+        max_log_std = max_log_std,
     )
 
     for gen in pbar:
-        fitnesses = pop.evaluate_distributed(eval_env)
+        # each individual scored on its mean return over `num_episodes` seeded episodes
+
+        fitnesses = interactor.evaluate(
+            pop,
+            action = action_fn,
+            horizon = 1000,
+            num_episodes = num_episodes,
+            seed = pop.eval_seed
+        )
 
         result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = 0.5, elite_frac = 0.25)
         best_reward = fitnesses.max().item()
@@ -127,13 +158,8 @@ def validate_with_lunar(
         pbar.write(f'gen {gen:03d} | best_reward: {best_reward:6.1f} | mean_reward: {mean_reward:6.1f} | avg_last_{avg_generations}_generations: {avg_recent:6.1f}')
 
         best_idx = fitnesses.argmax().item()
-        record_env = gym.make('LunarLanderContinuous-v3', render_mode = 'rgb_array')
-        record_env = gym.wrappers.RecordVideo(record_env, video_folder = 'videos', name_prefix = f'gen_{gen:03d}', disable_logger = True)
-        evaluate_individual(
-            record_env, pop, best_idx,
-            sample_actions = False, # deterministic video evaluation for best policy
-            action_std = action_std
-        )
+        record_env = make_record_env(distribution, video_folder = 'videos', name_prefix = f'gen_{gen:03d}')
+        evaluate_individual(record_env, pop, best_idx, action_fn = action_fn)
         record_env.close()
 
         if len(recent_rewards) >= avg_generations and avg_recent > target_avg_reward:

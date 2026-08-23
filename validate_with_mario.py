@@ -66,6 +66,7 @@ from populora import (
     distributed_world_size,
     is_distributed,
     is_main_rank,
+    make_categorical_action,
     partition_indices,
     preserve_rng,
     sync_seed,
@@ -130,15 +131,16 @@ def record_agent(
     obs, frames = rec_env.reset().copy(), []
     max_x, stagnant_steps = 0, 0
 
+    action_fn = make_categorical_action(
+        sample = sample_actions and policy_temperature > 0,
+        temperature = policy_temperature
+    )
+
     while True:
         frames.append(rec_env.render(mode = 'rgb_array').copy())
         with torch.no_grad():
             logits = pop(preprocess(obs, img_size, device = pop.device), individual = individual_idx)
-            if sample_actions and policy_temperature > 0:
-                probs = F.softmax(logits / policy_temperature, dim = -1)
-                action = torch.multinomial(probs, num_samples = 1).item()
-            else:
-                action = logits.argmax(dim = -1).item()
+            action = action_fn(logits).item()
 
         obs, reward, done, info = rec_env.step(action)
         obs = obs.copy()
@@ -234,15 +236,16 @@ def validate_with_mario(
 
         obs_list = [env.reset().copy() for env in envs]
 
+        action_fn = make_categorical_action(
+            sample = sample_actions and policy_temperature > 0,
+            temperature = policy_temperature
+        )
+
         while not done.all():
             with torch.no_grad():
                 obs_batch = preprocess(obs_list, img_size, device = device)
                 logits = pop(obs_batch, individuals = indices)
-                if sample_actions and policy_temperature > 0:
-                    probs = F.softmax(logits / policy_temperature, dim = -1)
-                    chosen_actions = torch.multinomial(probs.view(-1, num_actions), num_samples = 1).squeeze(-1).cpu().numpy()
-                else:
-                    chosen_actions = logits.argmax(dim = -1).cpu().numpy()
+                chosen_actions = action_fn(logits).cpu().numpy()
 
             for i in range(num_local):
                 if done[i]:

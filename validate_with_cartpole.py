@@ -19,12 +19,10 @@ import numpy as np
 import fire
 from x_mlps_pytorch import MLP
 
-from populora import interact_with_env
+from populora import interact_with_env, make_categorical_action
 from populora.populora import exists
 
-# one logit per action, mapped to the env's discrete action index
-
-action = lambda out: out.argmax(-1)
+# one logit per action, sampled from the temperature-scaled categorical
 
 def run_cartpole_experiment(
     target_avg_reward: float = 490.0,
@@ -33,6 +31,7 @@ def run_cartpole_experiment(
     max_generations: int = 100,
     horizon: int = 1000,
     epsilon: float = 0.15,
+    temperature: float = 1.0,
     dtype: str = 'float32',
     seed: int = 42,
     verbose: bool = False,
@@ -50,6 +49,8 @@ def run_cartpole_experiment(
         eval_seed = seed,
         dtype = dtype,  # 'float32' | 'bfloat16' | 'float16' | 'float8_e4m3fn'
     )
+
+    action = make_categorical_action(sample = True, temperature = temperature)
 
     _, history = interactor.evolve(
         pop,

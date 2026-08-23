@@ -41,3 +41,9 @@ from populora.interact import (
 from populora.memory import Memory
 from populora.generate import generate
 from populora.archive import HallOfFame
+from populora.policies import (
+    make_action,
+    make_beta_action,
+    make_categorical_action,
+    make_squashed_gaussian_action,
+)

@@ -4,13 +4,25 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
+from env_ssl_wrapper import DoneTrackerWrapper, compose_env
+from env_ssl_wrapper.mocks import (
+    AutoresetVectorMockEnv,
+    GymnasiumMockEnv,
+    IsaacMockEnv,
+    ManiSkillMockEnv,
+)
 from torch import allclose, nn
 
-from env_ssl_wrapper import DoneTrackerWrapper, compose_env
-from env_ssl_wrapper.mocks import AutoresetVectorMockEnv, GymnasiumMockEnv, IsaacMockEnv, ManiSkillMockEnv
-
-from populora import EnvInteractor, evolve_with_env, interact_with_env, linear_layer_paths
-from populora.distributed import distributed_rank, distributed_world_size, is_distributed
+from populora import (
+    EnvInteractor,
+    evolve_with_env,
+    interact_with_env,
+    linear_layer_paths,
+)
+from populora.distributed import (
+    distributed_world_size,
+    is_distributed,
+)
 
 # an environment whose reward discriminates policies - the optimal action is a
 # fixed constant, so evolution has to find it to maximize episode return
@@ -232,7 +244,8 @@ def test_interact_custom_fitness_modes():
     assert interactor.evaluate(pop, fitness = fitness_per_index).shape == (6,)
     assert interactor.evaluate(pop, fitness = fitness_all).shape == (6,)
 
-def test_interact_evolve_improves():
+@pytest.mark.parametrize('num_episodes', [1, 2])
+def test_interact_evolve_improves(num_episodes):
     # distributed evaluation reassigns which seeded episodes each individual
     # plays, so the improvement trajectory only holds in a single process
 
@@ -243,12 +256,12 @@ def test_interact_evolve_improves():
     pop = interactor.population(make_policy(zero_last = True), pop_size = 16, low_rank = 4, seed = 0)
 
     action = lambda logits: torch.tanh(logits)
-    initial = interactor.evaluate(pop, action = action, horizon = 60)
+    initial = interactor.evaluate(pop, action = action, horizon = 60, num_episodes = num_episodes)
 
     best_fitness = float('-inf')
 
     for _ in range(10):
-        fitnesses = interactor.evaluate(pop, action = action, horizon = 60)
+        fitnesses = interactor.evaluate(pop, action = action, horizon = 60, num_episodes = num_episodes)
         best_fitness = max(best_fitness, float(fitnesses.max()))
         pop.evolve_(
             fitnesses,
@@ -433,7 +446,7 @@ def test_interact_no_envs():
         interact_with_env([])
 
     with pytest.raises(AssertionError):
-        interact_with_env(lambda: [])
+        interact_with_env(list)
 
 def test_interact_dict_envs():
     interactor = interact_with_env(dict(a = GymnasiumMockEnv(), b = GymnasiumMockEnv()), seed = 0)

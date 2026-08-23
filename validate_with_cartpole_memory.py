@@ -18,18 +18,16 @@ import numpy as np
 import fire
 from torch import nn
 
-from populora import Memory, interact_with_env
+from populora import Memory, interact_with_env, make_categorical_action
 
-# one logit per action, mapped to the env's discrete action index - in memory
-# mode the action callable receives only the tuple's first slot (the action
-# distribution), so these lambdas work unchanged
+# one logit per action - in memory mode the action callable receives only the
+# tuple's first slot (the action distribution), so factories work unchanged
 
-action = lambda out: out.argmax(-1)
+action = make_categorical_action(sample = False)
 
 class GRUMemoryPolicy(nn.Module):
-    # batch-first GRU whose hidden state is the carried memory - the network
-    # emits (action_logits, hidden), and the wrapper feeds the hidden back in
-    # as the 1st arg on the next step
+    # batch-first GRU whose hidden state is the carried memory - emits
+    # (action_logits, hidden), fed back in as the 1st arg on the next step
 
     def __init__(self, obs_dim, act_dim, hidden = 32):
         super().__init__()
@@ -42,10 +40,9 @@ class GRUMemoryPolicy(nn.Module):
         return self.head(mem), mem
 
 class ActionDistAsMemoryPolicy(nn.Module):
-    # contrived - the memory is simply the previous step's action
-    # distribution, concatenated onto the observation and projected. the
-    # memory slot carries literally anything: hidden states, kv caches,
-    # previous outputs, whatever the researcher wants
+    # contrived - the memory is the previous step's action distribution
+    # concatenated onto the observation. the memory slot carries anything:
+    # hidden states, kv caches, previous outputs, whatever the researcher wants
 
     def __init__(self, obs_dim, act_dim, hidden = 32):
         super().__init__()
