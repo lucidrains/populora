@@ -101,7 +101,7 @@ policy, history = evolve_with_env(
 
 `lora_targets` auto-discovers every `Linear` layer when omitted. Pass `target_fitness` to stop early, `checkpoint_dir` to write `latest.pt` (every `checkpoint_every` generations) and `best.pt` (on new bests), and `resume = True` to pick up from the latest checkpoint.
 
-Continuous policies emit actions on `(-1, 1)` — pass `to_range = (-2., 2.)` (or any env action range) to `evolve_with_env` / `interact_with_env` and the actions are rescaled before stepping the env. The underlying `rescale_from_range_to_range` helper is exported too.
+Continuous policies emit actions on `(-1, 1)` — pass `to_range = (-2., 2.)` (or any env action range) to `evolve_with_env` / `interact_with_env` and the actions are rescaled before stepping the env. An action fn built with `make_action` carries its own range, e.g. a beta with `beta_rescale_neg_one_one = False` emits on `(0, 1)` instead — the interactor rescales from that automatically. `interact_with_env(from_range = ...)` is the fallback for custom action functions, and `rescale_from_range_to_range` is exported too.
 
 For a custom loop, `interact_with_env` exposes the underlying `EnvInteractor` — one routed forward over the active slots per timestep, distributed across ranks under `torchrun`:
 

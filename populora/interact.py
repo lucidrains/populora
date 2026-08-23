@@ -165,12 +165,18 @@ class EnvInteractor:
         *,
         device: torch.device | str | None = None,
         wrappers: Sequence | None = None,
+        # policy outputs live on from_range (-1, 1) by default - an action fn
+        # from make_action carries its own range, e.g. a beta with
+        # beta_rescale_neg_one_one = False emits on (0, 1) instead
+
         seed: int = 0,
-        to_range = None
+        to_range = None,
+        from_range = (-1., 1.)
     ):
         self.seed = seed
         self.device = torch.device(default(device, distributed_device()))
         self.to_range = to_range
+        self.from_range = from_range
 
         envs = self._normalize_envs(envs)
 
@@ -188,6 +194,17 @@ class EnvInteractor:
 
     def __repr__(self):
         return f'{self.__class__.__name__}(num_envs = {self.num_envs}, device = {self.device})'
+
+    def _rescale_actions(self, actions, action = None):
+        if not exists(self.to_range):
+            return actions
+
+        # an action fn from make_action carries its own output range, which
+        # beats the interactor-level default - e.g. a beta with
+        # beta_rescale_neg_one_one = False emits on (0, 1), not (-1, 1)
+
+        from_range = default(getattr(action, 'from_range', None), self.from_range)
+        return rescale_from_range_to_range(actions, from_range = from_range, to_range = self.to_range)
 
     # environment normalization - a single env, a list / dict of envs, a
     # vectorized env, or a factory returning any of the above
@@ -400,12 +417,7 @@ class EnvInteractor:
             actions = action(policy_out) if exists(action) else policy_out
             actions = actions if is_tensor(actions) else torch.as_tensor(actions)
             actions = atleast_1d(actions)
-
-            # policy outputs are the (-1, 1) convention - rescale to the env
-            # action range when one is given
-
-            if exists(self.to_range):
-                actions = rescale_from_range_to_range(actions, to_range = self.to_range)
+            actions = self._rescale_actions(actions, action)
 
             # step every environment with active slots; inactive sub-envs of a
             # vector env still have to step along, so they get zero actions
@@ -798,9 +810,7 @@ class EnvInteractor:
                         actions = action(policy_out) if exists(action) else policy_out
                         actions = actions if is_tensor(actions) else torch.as_tensor(actions)
                         actions = atleast_1d(actions)
-
-                        if exists(self.to_range):
-                            actions = rescale_from_range_to_range(actions, to_range = self.to_range)
+                        actions = self._rescale_actions(actions, action)
 
                         obs, reward, terminated, truncated, info = env.step(actions)
 
@@ -831,14 +841,16 @@ def interact_with_env(
     device: torch.device | str | None = None,
     wrappers: Sequence | None = None,
     seed: int = 0,
-    to_range = None
+    to_range = None,
+    from_range = (-1., 1.)
 ):
     return EnvInteractor(
         envs,
         device = device,
         wrappers = wrappers,
         seed = seed,
-        to_range = to_range
+        to_range = to_range,
+        from_range = from_range
     )
 
 # convenience - evolve a model against an environment (or environments) in one
@@ -865,14 +877,16 @@ def evolve_with_env(
     return_history: bool = False,
     evolve_kwargs: dict | None = None,
     evaluate_kwargs: dict | None = None,
-    to_range = None
+    to_range = None,
+    from_range = (-1., 1.)
 ):
     interactor = interact_with_env(
         envs,
         device = device,
         wrappers = wrappers,
         seed = seed,
-        to_range = to_range
+        to_range = to_range,
+        from_range = from_range
     )
 
     population = interactor.population(

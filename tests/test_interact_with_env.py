@@ -734,6 +734,16 @@ def test_interact_to_range():
     fitnesses = interactor.evaluate(pop, action = lambda logits: 0.5, horizon = 60)
     assert torch.allclose(fitnesses, torch.full((4,), 60.))
 
+    # a beta policy with beta_rescale_neg_one_one = False emits on (0, 1) -
+    # pass from_range = (0., 1.) so 0.5 stays 0.5, the env target, scoring 60
+
+    interactor = interact_with_env(ActionAimMockEnv(), seed = 0, to_range = (0., 1.), from_range = (0., 1.))
+    fitnesses = interactor.evaluate(pop, action = lambda logits: 0.5, horizon = 60)
+    assert torch.allclose(fitnesses, torch.full((4,), 60.))
+
+    policy = pop.merge_(0)
+    assert interactor.evaluate_policy(policy, action = lambda logits: 0.5, num_episodes = 2) == 60.
+
 def test_evolve_with_env_to_range():
     # the one-call wrapper forwards to_range to the interactor
 
