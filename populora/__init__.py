@@ -42,7 +42,12 @@ from populora.memory import Memory
 from populora.generate import generate
 from populora.archive import HallOfFame
 from populora.policies import (
+    ActionDist,
+    ActionFn,
+    AlphaBeta,
     Beta,
+    Categorical,
+    SquashedGaussian,
     make_action,
     make_beta_action,
     make_categorical_action,

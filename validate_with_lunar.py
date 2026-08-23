@@ -44,6 +44,8 @@ def make_env(distribution: str, **env_kwargs):
 def make_record_env(distribution: str, video_folder: str, name_prefix: str):
     # record the raw env - continuous action spaces already emit (-1, 1)
 
+    env = make_env(distribution)
+    return gym.wrappers.RecordVideo(env, video_folder = video_folder, name_prefix = name_prefix)
 def evaluate_individual(
     env: gym.Env,
     pop: Population,
@@ -72,7 +74,7 @@ def validate_with_lunar(
     low_rank: int = 4,
     max_generations: int = 300,
     seed: int = 42,
-    distribution: str = 'squashed_gaussian',  # 'categorical' | 'squashed_gaussian' | 'beta'
+    distribution: str = 'beta',  # 'categorical' | 'squashed_gaussian' | 'beta' (beta uses the mean-concentration reparam by default)
     sample_actions: bool = True,
     temperature: float = 1.0,
     min_log_std: float = -5.0,
