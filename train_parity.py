@@ -8,15 +8,22 @@
 # populora = { path = "." }
 # ///
 
-# sequential parity - predict the running xor of a random bit string, one bit at
-# a time. scoring high requires carrying state across steps, so the population
-# must learn to use its memory. two recurrent policies, both wrapped in Memory:
+# sequential parity with resets - the input is a stream of symbols 0, 1 and 2:
+# predict the running xor of the 1-bits since the last reset, one symbol at a
+# time, where a 2 clears the running parity and starts a new segment. scoring
+# high requires carrying state across steps, so the population must learn to
+# use its memory - and to clear it, since a register that can only be toggled
+# would carry stale parity into the next segment. two recurrent policies, both
+# wrapped in Memory:
 
 #   gru     - a GRU cell written out as Linear layers, so the recurrent weights
-#             themselves are LoRA targets and get evolved like everything else
+#             themselves are LoRA targets and get evolved like everything else.
+#             clearing the state on a 2 is the update gate's job
 #   explicit- a memory made of a binarized {-1, +1} register, with three small
-#             MLPs: write (proposes per-bit flips), forget (proposes per-bit
-#             clears), read (reads the register into the answer). the write and
+#             MLPs: write proposes per-bit flips and sees only the input symbol
+#             (a pure toggle, it cannot clear anything), forget proposes
+#             per-bit clears and is the only mechanism that can reset the
+#             register, read maps the register into the answer. the write and
 #             forget decisions are hard thresholds and the register is updated
 #             piecewise - no gradient could flow through this forward even if
 #             we asked for one. the population never needs one, so it trains
@@ -36,9 +43,15 @@ from populora import Memory, Population, evolve, rollout
 # task
 
 def make_sequences(batch, seq_len, device):
-    bits = torch.randint(0, 2, (batch, seq_len), device = device)
-    parity = bits.cumsum(dim = 1) % 2
-    return bits.float(), parity.float()
+    n = torch.randint(0, 4, (batch, seq_len), device = device)
+    syms = torch.where(n < 2, n, torch.ones_like(n) * 2)  # 0, 1 are bits; 2 and 3 both reset
+    parity = torch.zeros(batch, seq_len, device = device)
+    p = torch.zeros(batch, device = device)
+    for t in range(seq_len):
+        p = torch.where(syms[:, t] == 2, torch.zeros_like(p), p)
+        p = (p + (syms[:, t] == 1).float()) % 2
+        parity[:, t] = p
+    return syms.float(), parity
 
 # policies
 
@@ -61,7 +74,7 @@ class ExplicitMemoryPolicy(nn.Module):
     def __init__(self, obs_dim, hidden, act_dim):
         super().__init__()
         self.write = nn.Sequential(
-            nn.Linear(obs_dim + hidden, hidden), nn.ReLU(),
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden),
         )
         self.forget = nn.Sequential(
@@ -76,7 +89,7 @@ class ExplicitMemoryPolicy(nn.Module):
     def forward(self, mem, obs):
         x = torch.cat((obs, mem), dim = -1)
         mem = torch.where(self.forget(x) > 0, torch.ones_like(mem), mem)
-        mem = torch.where(self.write(x) > 0, -mem, mem)
+        mem = torch.where(self.write(obs) > 0, -mem, mem)
         return self.read(torch.cat((obs, mem), dim = -1)), mem
 
 # training - the fitness scores the whole population at once: fresh random
@@ -85,7 +98,7 @@ class ExplicitMemoryPolicy(nn.Module):
 
 def run(
     policy: str = 'gru',
-    pop_size: int = 64,
+    pop_size: int = 128,
     low_rank: int = 4,
     hidden: int = 16,
     seq_len: int = 32,
@@ -133,7 +146,7 @@ def run(
 
     # generalization - the merged policy re-rolled on longer sequences it never
     # saw. for the explicit policy this only passes if the evolved state
-    # machine really does toggle on every 1 bit
+    # machine really does toggle on every 1 bit and clear on every 2
 
     bits, parity = make_sequences(pop_size * 4, seq_len * 4, model.device)
     logits = rollout(model, bits)
