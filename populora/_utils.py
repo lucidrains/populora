@@ -38,7 +38,9 @@ def resolve_dtype(dtype):
         return dtype
 
     if isinstance(dtype, str):
-        return getattr(torch, dtype)
+        resolved = getattr(torch, dtype, None)
+        assert isinstance(resolved, torch.dtype), f'invalid dtype {dtype}'
+        return resolved
 
     raise TypeError(f'invalid dtype {dtype}')
 

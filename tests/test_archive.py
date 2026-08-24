@@ -88,3 +88,65 @@ def test_probe_routes_through_archived_champions():
 
     for i in range(k):
         assert torch.allclose(out[i], manual[i])
+
+def test_entries_stored_on_cpu_and_replayed_to_device():
+    # archived champions live on cpu, so long runs do not accumulate adapter
+    # memory on the accelerator - replay moves them back through load_individual
+
+    pop = make_pop(4)
+    fitnesses = torch.arange(4, dtype = torch.float32)
+
+    hof = HallOfFame()
+
+    for gen in range(3):
+        hof.add_champion(pop, fitnesses, generation = gen)
+
+    for entry in hof.entries:
+        assert all(w.device.type == 'cpu' for w in entry.weight_down.values())
+        assert all(w.device.type == 'cpu' for w in entry.weight_up.values())
+
+    replay_pop = make_pop(2)
+    slots = hof.replay(replay_pop, [0, 2])
+
+    for slot, entry_idx in zip(slots.tolist(), [0, 2]):
+        entry = hof.entries[entry_idx]
+        _, (wd, wu) = replay_pop.individual_weights(slot)
+
+        for key in wd:
+            assert wd[key].device.type == replay_pop.device.type
+            assert torch.equal(wd[key], entry.weight_down[key].to(wd[key].device))
+
+def test_probe_replaces_undersized_replay_without_hook_leak():
+    # probing with a growing k replaces the internal replay population - the
+    # replaced one must remove its hooks from the shared base model, or they
+    # pile up forever
+
+    pop = make_pop(4)
+    fitnesses = torch.arange(4, dtype = torch.float32)
+
+    hof = HallOfFame()
+
+    for gen in range(4):
+        hof.add_champion(pop, fitnesses, generation = gen)
+
+    x = torch.randn(2, 4)
+    base = pop.model
+
+    def total_forward_hooks(module):
+        return sum(len(m._forward_hooks) for m in base.modules())
+
+    hooks_before = total_forward_hooks(base)
+
+    for k in (1, 2, 3):
+        assert hof.probe(pop, x, k).shape == (k, 2, 2)
+
+    assert len(hof._replay._hooks) > 0
+    assert total_forward_hooks(base) == hooks_before + len(hof._replay.lora_targets)
+
+    # a different base population gets its own replay population - the old
+    # one is detached again
+
+    other = make_pop(4)
+    assert hof.probe(other, x, 2).shape == (2, 2, 2)
+
+    assert total_forward_hooks(base) == hooks_before

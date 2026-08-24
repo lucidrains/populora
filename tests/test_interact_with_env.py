@@ -728,9 +728,11 @@ def test_interact_to_range():
     policy = pop.merge_(0)
     assert interactor.evaluate_policy(policy, action = lambda logits: 0.5, num_episodes = 2) == 45.
 
-    # without to_range the action is passed through untouched
+    # without to_range the action is passed through untouched - a fresh
+    # population, since the one above was merged into its base model
 
     interactor = interact_with_env(ActionAimMockEnv(), seed = 0)
+    pop = interactor.population(make_policy(zero_last = True), pop_size = 4, low_rank = 2)
     fitnesses = interactor.evaluate(pop, action = lambda logits: 0.5, horizon = 60)
     assert torch.allclose(fitnesses, torch.full((4,), 60.))
 
@@ -772,7 +774,6 @@ if __name__ == '__main__':
     test_interact_already_composed()
     test_interact_env_factory()
     test_interact_custom_fitness_modes()
-    test_interact_evolve_improves()
     test_interact_evolve_high_level()
     test_evolve_with_env()
     test_evolve_with_env_policy_only()
@@ -799,6 +800,10 @@ if __name__ == '__main__':
     test_rescale_from_range_to_range()
     test_interact_to_range()
     test_evolve_with_env_to_range()
+
+    for num_episodes in (1, 2):
+        test_interact_evolve_improves(num_episodes)
+
     test_interact_real_gymnasium_vector()
     test_distributed_interact()
     print('interact tests passed')

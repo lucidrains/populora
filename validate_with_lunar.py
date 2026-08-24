@@ -35,16 +35,16 @@ from populora import Population, interact_with_env, make_action
 def divisible_by(num, den):
     return (num % den) == 0
 
-def make_env(distribution: str, **env_kwargs):
+def make_env(distribution: str, render_mode = None, **env_kwargs):
     if distribution == 'categorical':
-        return gym.make('LunarLander-v3', **env_kwargs)
+        return gym.make('LunarLander-v3', render_mode = render_mode, **env_kwargs)
 
-    return gym.make('LunarLanderContinuous-v3', **env_kwargs)
+    return gym.make('LunarLanderContinuous-v3', render_mode = render_mode, **env_kwargs)
 
 def make_record_env(distribution: str, video_folder: str, name_prefix: str):
     # record the raw env - continuous action spaces already emit (-1, 1)
 
-    env = make_env(distribution)
+    env = make_env(distribution, render_mode = 'rgb_array')
     return gym.wrappers.RecordVideo(env, video_folder = video_folder, name_prefix = name_prefix)
 def evaluate_individual(
     env: gym.Env,

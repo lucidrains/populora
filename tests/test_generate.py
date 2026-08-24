@@ -3,6 +3,7 @@ param = pytest.mark.parametrize
 
 import torch
 from torch import nn
+from einops import repeat
 
 from x_transformers import TransformerWrapper, Decoder
 
@@ -220,7 +221,8 @@ def test_slice_cache():
 
 def test_forward_micro_batch():
     # the routed forward, chunked or not, gives identical outputs - including
-    # a batch that is not a multiple of the chunk size
+    # a batch that is not a multiple of the chunk size. routes are sliced in
+    # lockstep with each chunk, so any positive micro_batch is valid
 
     pop = get_pop(pop_size = 4)
 
@@ -234,7 +236,51 @@ def test_forward_micro_batch():
     assert torch.equal(full, chunked)
     assert torch.equal(full, chunked_uneven)
 
-    # micro_batch must be a multiple of the population size
+def test_forward_micro_batch_multi_tile_routing():
+    # a batch holding several samples per individual must stay correctly
+    # routed through every chunk - the hooks used to regroup each chunk as if
+    # it held one sample per individual
 
-    with pytest.raises(AssertionError):
-        pop(x, all_individuals = True, micro_batch = 6)
+    pop = get_pop(pop_size = 4)
+
+    # individual-major tiling - three consecutive rows per individual
+
+    x_single = torch.randint(0, 32, (4, 16))
+    x_tiled = repeat(x_single, 'p d -> (p b) d', b = 3)
+
+    full = pop(x_tiled, all_individuals = True)
+
+    for micro_batch in (4, 5, 6, 7, 12):
+        chunked = pop(x_tiled, all_individuals = True, micro_batch = micro_batch)
+        assert chunked.shape == (12, 16, 32)
+        assert torch.allclose(full, chunked, atol = 1e-4), f'micro_batch {micro_batch}'
+
+    # each individual's three tiled rows match its single-row output
+
+    for i in range(4):
+        single = pop(x_single[i:i + 1], individual = i)
+        assert torch.allclose(single[0], full[i * 3], atol = 1e-4)
+        assert torch.allclose(single[0], full[i * 3 + 2], atol = 1e-4)
+
+def test_generate_micro_batch_forwards_kwargs():
+    # scalar model kwargs still reach the model when the prefill is chunked
+
+    seen = dict()
+
+    class Spy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(8, 16)
+
+        def forward(self, x, scale = 1.):
+            seen['scale'] = scale
+            return self.linear(x)
+
+    model = Spy()
+    pop = Population(model, pop_size = 4, low_rank = 2, lora_targets = ['linear'])
+
+    ids = torch.randn(8, 8)
+
+    generate(pop, ids, all_individuals = True, max_len = 8, micro_batch = 4, forward_kwargs = dict(scale = 2.))
+
+    assert seen.get('scale') == 2.

@@ -42,6 +42,7 @@ from populora.memory import Memory
 from populora.generate import generate
 from populora.archive import HallOfFame
 from populora.policies import (
+    ACTION_DIST_REGISTRY,
     ActionDist,
     ActionFn,
     AlphaBeta,
@@ -52,5 +53,6 @@ from populora.policies import (
     make_beta_action,
     make_categorical_action,
     make_squashed_gaussian_action,
+    register_action_dist,
 )
 from populora._utils import rescale_from_range_to_range

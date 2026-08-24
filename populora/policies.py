@@ -18,7 +18,9 @@ from populora._utils import default, exists
 # scalar per item, so RL losses just consume it), and a `from_range` telling
 # the interactor what range its samples live in. every action factory returns
 # an ActionFn wrapping that container - callable (logits -> env actions) and
-# exposing the container through distribution / mean / log_prob
+# exposing the container through distribution / mean / log_prob. researchers
+# can subclass ActionDist and pass their own instance / factory / registered
+# name straight into make_action
 
 class ActionDist(Module):
     from_range = None
@@ -364,26 +366,79 @@ def make_alpha_beta_action(
         to_env_space_inv = to_env_space_inv
     )
 
+# custom distributions - researchers register their own factories by name,
+# mirroring the mutation / selection / crossover registries. a registered name
+# resolves in make_action alongside the builtins
+
+ACTION_DIST_REGISTRY = dict()
+
+def register_action_dist(name: str, factory: callable):
+    ACTION_DIST_REGISTRY[name] = factory
+
+_BUILTIN_ACTION_DISTS = None  # populated lazily, after the builtin factories are defined
+
+def _action_dist_factories():
+    global _BUILTIN_ACTION_DISTS
+
+    if _BUILTIN_ACTION_DISTS is None:
+        _BUILTIN_ACTION_DISTS = dict(
+            categorical = make_categorical_action,
+            squashed_gaussian = make_squashed_gaussian_action,
+            beta = make_beta_action,
+        )
+
+    return {**_BUILTIN_ACTION_DISTS, **ACTION_DIST_REGISTRY}
+
 def make_action(
-    distribution: str,
+    distribution: str | ActionDist | ActionFn | callable,
     *,
     sample: bool = True,
     temperature: float = 1.0,
     **kwargs
 ):
     # one entry point - 'categorical' for discrete, 'squashed_gaussian' /
-    # 'beta' for continuous. distribution-specific kwargs are dropped when
-    # not accepted
+    # 'beta' for continuous, or any name registered through
+    # register_action_dist. a researcher can also bring their own:
+    #
+    #   - an ActionFn passes through as-is
+    #   - an ActionDist instance (or subclass) is wrapped in an ActionFn
+    #   - any other callable is invoked as a factory, receiving `sample` and
+    #     `temperature` when accepted, plus the kwargs it accepts
+    #
+    # unknown keyword args on the string / factory paths are dropped rather
+    # than erroring, so one config works across distributions
 
-    factory = dict(
-        categorical = make_categorical_action,
-        squashed_gaussian = make_squashed_gaussian_action,
-        beta = make_beta_action,
-    ).get(distribution)
+    if isinstance(distribution, ActionFn):
+        return distribution
+
+    if isinstance(distribution, ActionDist):
+        return ActionFn(distribution, sample = sample, temperature = temperature)
+
+    if isinstance(distribution, type) and issubclass(distribution, ActionDist):
+        return ActionFn(distribution(), sample = sample, temperature = temperature)
+
+    if callable(distribution):
+        factory = distribution
+    elif isinstance(distribution, str):
+        factory = _action_dist_factories().get(distribution)
+    else:
+        factory = None
 
     if not exists(factory):
-        raise ValueError(f'unknown action distribution {distribution!r} - must be one of "categorical", "squashed_gaussian", "beta"')
+        known = tuple(_action_dist_factories())
+        raise ValueError(f'unknown action distribution {distribution!r} - must be one of {known}, an ActionDist (sub)class or instance, an ActionFn, or a factory callable')
 
-    accepted = inspect.signature(factory).parameters
-    kwargs = {name: value for name, value in kwargs.items() if name in accepted}
-    return factory(sample = sample, temperature = temperature, **kwargs)
+    try:
+        accepted = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return factory()
+
+    call_kwargs = {name: value for name, value in kwargs.items() if name in accepted}
+
+    if 'sample' in accepted:
+        call_kwargs['sample'] = sample
+
+    if 'temperature' in accepted:
+        call_kwargs['temperature'] = temperature
+
+    return factory(**call_kwargs)

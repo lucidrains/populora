@@ -62,7 +62,7 @@ def _concat_chunked_outputs(outputs, batch_size):
     first_output = outputs[0]
 
     if is_tensor(first_output):
-        return cat(outputs, dim = 0) if first_output.ndim > 0 and first_output.shape[0] == batch_size else first_output
+        return cat(outputs, dim = 0) if len(outputs) > 1 else first_output
 
     if isinstance(first_output, (tuple, list)):
         return type(first_output)((_concat_chunked_outputs([output[i] for output in outputs], batch_size) for i in range(len(first_output))))
@@ -83,29 +83,6 @@ def _expand_batch(t, p):
 
     return t
 
-def _chunked_forward(model, args, kwargs, ignore, chunk_size, batch_size):
-    # run the model over the batch in chunks, concatenating the outputs -
-    # caps the activation blowup on large models
-
-    outputs = []
-
-    for start in range(0, batch_size, chunk_size):
-        end = min(start + chunk_size, batch_size)
-
-        chunk_args = tuple(
-            _slice_batch(a, start, end, batch_size) if i not in ignore else a
-            for i, a in enumerate(args)
-        )
-
-        chunk_kwargs = {
-            key: _slice_batch(value, start, end, batch_size) if key not in ignore else value
-            for key, value in kwargs.items()
-        }
-
-        outputs.append(model(*chunk_args, **chunk_kwargs))
-
-    return _concat_chunked_outputs(outputs, batch_size)
-
 # tiered evolve constants
 
 _TIERED_DEFAULT_TIERS = ((0.3, 'keep'), (0.4, 'mutate'), (0.3, 'replace'))  # clone-and-perturb spec
@@ -118,6 +95,7 @@ class _LoRAMixin(Module):
         super().__init__()
         self._hooks = []
         self._hooks_registered = False
+        self._merged = False
 
     @property
     def device(self):
@@ -126,6 +104,12 @@ class _LoRAMixin(Module):
     def register_hooks(self):
         if self._hooks_registered:
             return
+
+        # after a merge the delta lives in the base weights - routing through
+        # the population again would apply the adapter a second time. any
+        # re-anchor (repopulate_ / reinit_individuals_ / load) lifts the guard
+
+        assert not self._merged, 'population was merged into its base model - the lora deltas are baked into the weights, and routing forwards through the population would apply them a second time. re-anchor first (repopulate_ / reinit_individuals_)'
 
         for path in self.lora_targets:
             linear = self.model.get_submodule(path)
@@ -249,6 +233,11 @@ class Population(_LoRAMixin):
 
         self.weight_down.load_state_dict(pkg['weight_down'], strict = strict)
         self.weight_up.load_state_dict(pkg['weight_up'], strict = strict)
+
+        # a fresh set of adapters re-anchors the population - a prior merge no
+        # longer taints routed forwards
+
+        self._merged = False
         return self
 
     @classmethod
@@ -316,6 +305,7 @@ class Population(_LoRAMixin):
         # so the delta is applied exactly once
 
         self.remove_hooks()
+        self._merged = True
 
         _, (weight_down, weight_up) = self.individual_weights(individual)
 
@@ -383,8 +373,11 @@ class Population(_LoRAMixin):
         self,
         selection_type: str | callable,
         fitnesses: Tensor,
-        survive_frac: float = 0.8,
-        elite_frac: float = 0.25,
+        # defaults kept identical to evolve_, so the same truncation pressure
+        # applies whichever entry point is used
+
+        survive_frac: float = 0.5,
+        elite_frac: float = 0.10,
         num_groups: int = 1,
         **kwargs
     ):
@@ -563,8 +556,11 @@ class Population(_LoRAMixin):
         new_arrangement = migration_fn(fitnesses, num_islands, **kwargs)
 
         for w_down, w_up in zip(self.weight_down.values(), self.weight_up.values()):
-            w_down.data.copy_(w_down.data[new_arrangement].clone())
-            w_up.data.copy_(w_up.data[new_arrangement].clone())
+            # advanced indexing already materializes a fresh tensor, so copy_
+            # never aliases its source
+
+            w_down.data.copy_(w_down.data[new_arrangement])
+            w_up.data.copy_(w_up.data[new_arrangement])
 
         return self
 
@@ -639,6 +635,7 @@ class Population(_LoRAMixin):
             linear.weight.add_(delta.to(linear.weight.dtype))
 
         self.remove_hooks()
+        self._merged = True
         return self.model
 
     merge = merge_
@@ -688,6 +685,7 @@ class Population(_LoRAMixin):
 
         if remove_hooks:
             self.remove_hooks()
+            self._merged = True
 
         return self.model
 
@@ -701,6 +699,7 @@ class Population(_LoRAMixin):
         std_up: float | None = None
     ):
         individuals = cast_tensor(individuals, device = self.device)
+        self._merged = False
 
         for path in self.lora_targets:
             linear = self.model.get_submodule(path)
@@ -1009,6 +1008,11 @@ class Population(_LoRAMixin):
             if individual is ... or (is_tensor(individual) and individual.ndim > 0):
                 p = weight_down_i.shape[0]
 
+                # a 1-d activation is one unbatched feature vector, which cannot be
+                # split across routed individuals - anything else is a guess
+
+                assert x.ndim >= 2, f'routed forwards need batched inputs - got a {x.ndim}-d tensor of shape {tuple(x.shape)}. pass observations with their batch / feature axes'
+
                 assert divisible_by(x.shape[0], p), f'batch {x.shape[0]} must be a multiple of routed individuals {p}'
 
                 wd_i = weight_down_i.to(x.dtype)
@@ -1077,14 +1081,39 @@ class Population(_LoRAMixin):
                 }
 
             # with `micro_batch`, run the expanded batch through the model in
-            # chunks, each a multiple of the population size so the per-sample
-            # routing stays intact
+            # chunks. the routes are sliced in lockstep with each chunk - a
+            # chunk's rows are routed by their explicit individual ids, so
+            # any chunk boundary is safe, not only tile-aligned ones
 
             if exists(micro_batch) and all_individuals and batch_size > 0:
-                assert divisible_by(micro_batch, self.pop_size), f'micro_batch {micro_batch} must be a multiple of the population size {self.pop_size}'
+                per_indiv = batch_size // self.pop_size
 
-                with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
-                    return _chunked_forward(self.model, args, kwargs, ignore, micro_batch, batch_size)
+                route_rows = repeat(
+                    torch.arange(self.pop_size, device = self.device),
+                    'p -> (p b)',
+                    b = per_indiv
+                )
+
+                outputs = []
+
+                with self._eval_and_no_grad(eval_and_no_grad):
+                    for start in range(0, batch_size, micro_batch):
+                        end = min(start + micro_batch, batch_size)
+
+                        chunk_args = tuple(
+                            _slice_batch(a, start, end, batch_size) if i not in ignore else a
+                            for i, a in enumerate(args)
+                        )
+
+                        chunk_kwargs = {
+                            key: _slice_batch(value, start, end, batch_size) if key not in ignore else value
+                            for key, value in kwargs.items()
+                        }
+
+                        with self._route(None, route_rows[start:end], False):
+                            outputs.append(self.model(*chunk_args, **chunk_kwargs))
+
+                return _concat_chunked_outputs(outputs, batch_size)
 
         with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
             return self.model(*args, **kwargs)
@@ -1116,7 +1145,13 @@ class LoRA(_LoRAMixin):
             key = path.replace('.', '_')
             dim, dim_inner = linear.in_features, linear.out_features
 
-            if exists(weight_down) and key in weight_down:
+            # a supplied checkpoint must cover every target - silently random
+            # initializing the missing ones would yield a quietly wrong adapter
+
+            if exists(weight_down) or exists(weight_up):
+                assert exists(weight_down) and exists(weight_up), 'weight_down and weight_up must be provided together'
+                assert key in weight_down and key in weight_up, f'missing lora weights for target {path} in the provided checkpoint'
+
                 w_down = cast_tensor(weight_down[key], device)
                 w_up = cast_tensor(weight_up[key], device)
 
@@ -1212,7 +1247,8 @@ class Populations(Module):
         model: Module | None = None,
         models: dict[str, Module] | None = None,
         requires_grad: bool = False,
-        device: torch.device | str | None = None
+        device: torch.device | str | None = None,
+        seed: int | None = None
     ):
         super().__init__()
 
@@ -1230,7 +1266,8 @@ class Populations(Module):
                 low_rank = extract_dict(low_ranks, pop_name),
                 lora_targets = extract_dict(lora_targets, pop_name),
                 requires_grad = requires_grad,
-                device = device
+                device = device,
+                seed = seed
             )
 
     # save and load
@@ -1266,7 +1303,8 @@ class PopuLoRA(Module):
         model: Module | None = None,
         teacher_model: Module | None = None,
         student_model: Module | None = None,
-        requires_grad: bool = False
+        requires_grad: bool = False,
+        seed: int | None = None
     ):
         super().__init__()
 
@@ -1279,7 +1317,8 @@ class PopuLoRA(Module):
             lora_targets = lora_targets,
             model = model,
             models = models,
-            requires_grad = requires_grad
+            requires_grad = requires_grad,
+            seed = seed
         )
 
     # save and load

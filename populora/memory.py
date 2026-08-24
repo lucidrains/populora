@@ -11,17 +11,18 @@ from populora._utils import cast_tensor, exists
 
 def init_memory_tensor(init_memory, num, device = None):
     # normalize the initial memory into a batch of `num` - a scalar broadcasts to
-    # every slot, a (1, ...) tensor is expanded, a tensor matching `num` is used as-is
+    # every slot, a (1, ...) tensor is expanded, a tensor matching `num` is used as-is.
+    # always returns a fresh tensor, never an alias of the caller's
 
     init = cast_tensor(init_memory, device).to(device)
     init = atleast_1d(init)
 
     if init.shape[0] == 1:
-        init = init.expand(num, *init.shape[1:]).clone()
+        return init.expand(num, *init.shape[1:]).clone()
 
     assert init.shape[0] == num, f'initial memory must be a scalar or a tensor whose first dim is 1 or {num}, got {tuple(init.shape)}'
 
-    return init
+    return init.clone()
 
 # main class
 

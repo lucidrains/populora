@@ -26,14 +26,16 @@ class HallOfFame:
 
     @no_grad()
     def add(self, population, individual, generation = None):
-        # archive a copy of the individual's weights
+        # archive a copy of the individual's weights - kept on cpu, so long
+        # runs do not accumulate champions on the accelerator; `replay` moves
+        # them back through load_individual
 
         _, (weight_down, weight_up) = population.individual_weights(individual)
 
         self.entries.append(Entry(
             generation = generation,
-            weight_down = {key: w.clone() for key, w in weight_down.items()},
-            weight_up = {key: w.clone() for key, w in weight_up.items()}
+            weight_down = {key: w.clone().cpu() for key, w in weight_down.items()},
+            weight_up = {key: w.clone().cpu() for key, w in weight_up.items()}
         ))
 
         if exists(self.capacity) and len(self.entries) > self.capacity:
@@ -95,6 +97,13 @@ class HallOfFame:
         k = len(indices)
 
         if not exists(self._replay) or self._replay_population is not population or self._replay.pop_size < k:
+            # the replay population registers hooks on the shared base model -
+            # a replaced one must remove its hooks, or they pile up on the
+            # base (leaked adapter memory + passthrough overhead per forward)
+
+            if exists(self._replay):
+                self._replay.remove_hooks()
+
             self._replay = population.__class__(
                 population.model,
                 pop_size = k,

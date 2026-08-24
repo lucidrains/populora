@@ -35,7 +35,11 @@ def _ensure_process_group(backend = None, init_method = 'env://'):
     dist.init_process_group(backend = default(backend, default_backend()), init_method = init_method)
     _initialized_by_us = True
 
-    sync_seed(0)
+    # identical rng streams across ranks are what keep the spmd evolution
+    # flows in lockstep - share rank 0's current seed rather than forcing a
+    # fixed value, so any seeding done before this point survives
+
+    sync_seed()
     atexit.register(_finalize_process_group)
 
 def _finalize_process_group():
@@ -111,8 +115,17 @@ def _broadcast_tensor(tensor, src = 0):
 
 # seeds
 
-def sync_seed(seed = 0, src = 0):
+def sync_seed(seed = None, src = 0):
+    # seed every rng identically across ranks, broadcasting from `src`. with
+    # no explicit seed, rank `src`'s current torch seed is the one shared, so
+    # a researcher's earlier seeding propagates instead of being clobbered
+
     _ensure_process_group()
+
+    if not exists(seed):
+        # the current torch seed - masked into the range every rng accepts
+
+        seed = int(torch.initial_seed()) & 0xFFFFFFFF
 
     if is_distributed():
         seed_tensor = tensor(seed, dtype = torch.long)
@@ -135,6 +148,7 @@ def preserve_rng():
     cpu_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     np_state = np.random.get_state()
+    random_state = random.getstate()
 
     try:
         yield
@@ -143,6 +157,7 @@ def preserve_rng():
         if exists(cuda_states):
             torch.cuda.set_rng_state_all(cuda_states)
         np.random.set_state(np_state)
+        random.setstate(random_state)
 
 # broadcast helpers
 
@@ -261,12 +276,12 @@ def evaluate_population_distributed(
         if batch_eval:
             if len(assigned_indices) > 0:
                 res = eval_fn(population, assigned_indices)
-                res = cast_tensor(res, device = device).to(dtype = torch.float32)
+                res = cast_tensor(res, device = device).to(device = device, dtype = torch.float32)
                 assert res.shape[0] == len(assigned_indices), 'batch eval fn must return one fitness per assigned index'
                 fitnesses[assigned_indices] = res
         else:
             for idx in assigned_indices:
-                fitnesses[idx] = cast_tensor(eval_fn(population, idx), device = device).to(dtype = torch.float32)
+                fitnesses[idx] = cast_tensor(eval_fn(population, idx), device = device).to(device = device, dtype = torch.float32)
 
     if is_distributed():
         _tensor_collective(fitnesses, lambda t: dist.all_reduce(t, op = dist.ReduceOp.SUM))

@@ -109,13 +109,13 @@ def mutation_svd_structured(
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
 
-        z = torch.randn_like(S)
+        z = _normal_noise(S.shape, device)
         S_new = S * torch.exp(epsilon * z)
 
-        M_U = torch.randn((*S.shape[:-1], r, r), device = device)
+        M_U = _normal_noise((*S.shape[:-1], r, r), device)
         R_U = torch.eye(r, device = device) + epsilon * skew_symmetrize(M_U)
 
-        M_V = torch.randn((*S.shape[:-1], r, r), device = device)
+        M_V = _normal_noise((*S.shape[:-1], r, r), device)
         R_V = torch.eye(r, device = device) + epsilon * skew_symmetrize(M_V)
 
         U_new = einsum(U, R_U, '... d r, ... r s -> ... d s')
@@ -389,9 +389,21 @@ def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps =
     return expanded_sort_indices.gather(-1, selected)
 
 def parent_select_roulette(fitnesses, num_children, num_parents_per_child = 2, temperature = 1., **kwargs):
-    probs = F.softmax(fitnesses / temperature, dim = -1)
     num_samples = num_children * num_parents_per_child
-    selected = torch.multinomial(probs, num_samples, replacement = True)
+    batch_shape = fitnesses.shape[:-1]
+
+    if math.isinf(temperature):
+        # a uniform draw - softmax over +-inf fitnesses at infinite temperature
+        # would come out all-nan
+
+        if fitnesses.shape[-1] <= 1:
+            selected = torch.zeros((*batch_shape, num_samples), dtype = torch.long, device = fitnesses.device)
+        else:
+            selected = torch.randint(0, fitnesses.shape[-1], (*batch_shape, num_samples), device = fitnesses.device)
+    else:
+        probs = F.softmax(fitnesses / temperature, dim = -1)
+        selected = torch.multinomial(probs, num_samples, replacement = True)
+
     return rearrange(selected, '... (c p) -> ... c p', c = num_children)
 
 def parent_select_queen_bee(fitnesses, num_children, num_parents_per_child = 2, tournament_size = 3, num_elites = 1, **kwargs):
@@ -475,7 +487,13 @@ def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses 
         S1, S2 = S[:, 0], S[:, 1]
         V1, V2 = V[:, 0], V[:, 1]
 
-        k = torch.randint(1, r, (num_children,), device = device) if r > 1 else torch.ones(num_children, dtype = torch.long, device = device)
+        if r > 1:
+            k = torch.randint(1, r, (num_children,), device = device)
+        else:
+            # rank 1 admits no split point - each child clones one parent wholesale
+
+            k = torch.randint(0, 2, (num_children,), device = device)
+
         split_mask = torch.arange(r, device = device)[None, :] < k[:, None]
 
         U_child = torch.where(split_mask[:, None, :], U1, U2)

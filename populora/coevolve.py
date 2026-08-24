@@ -51,6 +51,14 @@ class Coevolve(Module):
         if isinstance(populations, (Populations, PopuLoRA)):
             populations = populations.populations
 
+        # a population named like a reserved injection would silently shadow it
+        # in every probe / fitness signature
+
+        reserved = self._reserved_names()
+
+        for name in populations:
+            assert name not in reserved, f'population name "{name}" collides with a reserved injection - rename the population (reserved: {", ".join(reserved)})'
+
         self.probes = dict()
         self.fitness_fns = dict()
         self.populations = ModuleDict()
@@ -290,7 +298,18 @@ class Coevolve(Module):
         fitnesses: dict[str, Tensor],
         evolve_kwargs: dict[str, dict] | None = None
     ):
-        evolve_kwargs = default(evolve_kwargs, self.evolve_kwargs)
+        # per-call kwargs override the constructor's per population, merging
+        # name-by-name - a call that tunes one population must not silently
+        # drop the constructor settings of the others
+
+        ctor_kwargs = self.evolve_kwargs
+        call_kwargs = default(evolve_kwargs, dict())
+
+        merged = dict(ctor_kwargs)
+
+        for name, kwargs in call_kwargs.items():
+            base = merged.get(name)
+            merged[name] = {**base, **kwargs} if isinstance(base, dict) and isinstance(kwargs, dict) else kwargs
 
         for name, pop in self.populations.items():
             assert name in fitnesses, f'fitnesses missing for population {name}'
@@ -298,7 +317,7 @@ class Coevolve(Module):
             f = fitnesses[name]
             assert f.ndim == 1 and f.shape[0] == pop.pop_size, f'fitnesses for {name} must be of shape ({pop.pop_size},)'
 
-            pop.evolve_(f.to(pop.device), **evolve_kwargs.get(name, dict()))
+            pop.evolve_(f.to(pop.device), **merged.get(name, dict()))
 
         self.generation += 1
         return self

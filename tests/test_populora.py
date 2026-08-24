@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
-from einops import rearrange, repeat
+from einops import einsum, rearrange, repeat
 from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, evaluate_population_distributed, register_mutation
 from populora.populora import exists
 
@@ -1060,7 +1060,18 @@ def test_merge_best():
     assert allclose(out_best_before, out_after, atol = 1e-5)
     assert len(pop._hooks) == 0
 
-    # Invoking population forward afterwards auto-registers hooks
+    # Invoking population forward after a merge is guarded - the delta lives
+    # in the base weights now, and a second application would go unnoticed
+
+    with pytest.raises(AssertionError):
+        pop(x, individual = best_idx)
+
+    assert len(pop._hooks) == 0
+
+    # any re-anchor lifts the guard - fresh adapters around the merged base
+
+    pop.repopulate_()
+
     out_pop_again = pop(x, individual = best_idx)
     assert len(pop._hooks) > 0
     assert out_pop_again.shape == (1, 16, 1000)
@@ -1695,3 +1706,245 @@ def test_coevolve_chain_three_populations():
 
     assert fitnesses['proposer'].shape == (pop_size,)
     assert coevolve.generation == 2
+
+# regression tests
+
+def test_chunked_forward_concatenates_all_chunks():
+    # a batch larger than the chunk size must return every row - the concat
+    # used to compare a chunk's batch dim against the full batch and silently
+    # return only the first chunk
+
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    x = torch.randint(0, 1000, (12, 16))
+
+    full = pop(x, all_individuals = True)
+    chunked = pop(x, all_individuals = True, micro_batch = 4)
+
+    # the trailing chunk is smaller than micro_batch - still every row.
+    # per-chunk gemms round differently than one full-batch gemm, so compare
+    # with a tolerance instead of bitwise
+
+    chunked_uneven = pop(x, all_individuals = True, micro_batch = 8)
+
+    assert full.shape == (12, 16, 1000)
+    assert allclose(full, chunked, atol = 1e-4)
+    assert allclose(full, chunked_uneven, atol = 1e-4)
+
+def test_roulette_inf_temperature_with_neg_inf_fitness():
+    # the tiered replace rule draws parents at infinite temperature for a
+    # uniform draw - softmax over a -inf fitness would come out all-nan
+
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([float('-inf'), 1., 2., 3.])
+    parents = pop.select_parents('roulette', fitnesses, num_children = 8, num_parents_per_child = 2, temperature = float('inf'))
+
+    assert parents.shape == (8, 2)
+    assert parents.min() >= 0 and parents.max() < 4
+
+    # and it is a genuine uniform draw - the -inf individual is as likely as any
+
+    assert (parents == 0).any()
+
+def test_crossover_svd_subspace_rank_one_uses_both_parents():
+    # low_rank 1 admits no split point - each child clones one parent
+    # wholesale, never a blend. child slots stay disjoint from the parents,
+    # so repeated crossovers cannot collapse onto whichever parent got copied
+
+    torch.manual_seed(0)
+
+    pop = Population(
+        get_model(),
+        pop_size = 3,
+        low_rank = 1,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    key = next(iter(pop.weight_down))
+
+    parent_deltas = [
+        einsum(pop.weight_up[key][i].float(), pop.weight_down[key][i].float(), 'e r, d r -> e d')
+        for i in range(2)
+    ]
+
+    parent_indices = torch.tensor([[0, 1]])
+    child_index = torch.tensor([2])
+
+    seen_first_parent = False
+    seen_second_parent = False
+
+    for _ in range(64):
+        pop.crossover_('svd_subspace', parent_indices, child_index)
+
+        child_delta = einsum(
+            pop.weight_up[key][2].float(),
+            pop.weight_down[key][2].float(),
+            'e r, d r -> e d'
+        )
+
+        if allclose(child_delta, parent_deltas[0], atol = 1e-4):
+            seen_first_parent = True
+        else:
+            assert allclose(child_delta, parent_deltas[1], atol = 1e-4)
+            seen_second_parent = True
+
+    assert seen_first_parent and seen_second_parent
+
+def test_preserve_rng_restores_python_random():
+    # torch / numpy / python random all get restored - python's module was
+    # missed, so random-based noise diverged across the context boundary
+
+    import random
+    from populora.distributed import preserve_rng
+
+    random.seed(1234)
+
+    with preserve_rng():
+        expected = random.random()
+        random.seed(9999)
+        assert random.random() != expected
+
+    # the state at context entry is live again - same draw comes back
+
+    assert random.random() == expected
+
+def test_sync_seed_no_explicit_seed_is_noop_single_process():
+    # without an explicit seed in a single process, the current torch seed is
+    # kept - no silent reset to a fixed value
+
+    from populora.distributed import sync_seed
+
+    torch.manual_seed(42)
+    returned = sync_seed()
+
+    assert int(torch.initial_seed()) == 42
+    assert returned == 42
+
+def test_vectorized_routing_rejects_unbatched_input():
+    # a 1-d activation is one unbatched feature vector and cannot be split
+    # across individuals - fail with a clear message, not an einsum error
+
+    pop = Population(
+        nn.Sequential(nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 4)),
+        pop_size = 2,
+        low_rank = 4,
+        lora_targets = ['0', '2']
+    )
+
+    x = torch.randn(16)
+
+    with pytest.raises(AssertionError) as err:
+        pop(x, all_individuals = True)
+
+    assert 'batched' in str(err.value)
+
+def test_vectorized_routing_batched_input_still_works():
+    # the guard must not disturb ordinary batched routing
+
+    torch.manual_seed(0)
+
+    pop = Population(
+        nn.Sequential(nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 4)),
+        pop_size = 2,
+        low_rank = 4,
+        lora_targets = ['0', '2']
+    )
+
+    x = torch.randn(2, 16)
+
+    out_routed = pop(x, individuals = [0, 1])
+    out_single_0 = pop(x[0], individual = 0)   # unbatched, one individual - fine
+    out_single_1 = pop(x[1], individual = 1)
+
+    assert out_routed.shape == (2, 4)
+    assert torch.allclose(out_routed[0], out_single_0, atol = 1e-5)
+    assert torch.allclose(out_routed[1], out_single_1, atol = 1e-5)
+
+def test_coevolve_rejects_reserved_population_names():
+    from populora import Coevolve
+
+    def probe(pop):
+        return torch.randn(2, 4)
+
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 4))
+
+    for reserved_name in ('pop', 'gen', 'generation', 'coevolve'):
+        populations = {
+            'solver': Population(model, pop_size = 2, low_rank = 2, lora_targets = ['0', '2']),
+            reserved_name: dict(
+                population = Population(model, pop_size = 2, low_rank = 2, lora_targets = ['0', '2']),
+                probe = probe,
+                fitness = lambda **kwargs: None
+            )
+        }
+
+        with pytest.raises(AssertionError) as err:
+            Coevolve(populations = populations)
+
+        assert 'reserved' in str(err.value)
+
+def test_coevolve_evolve_kwargs_merge_per_population():
+    # per-call kwargs override per population without dropping the constructor's
+    # settings for the others
+
+    calls = []
+
+    class RecordingPop(Population):
+        def evolve_(self, fitnesses, **kwargs):
+            calls.append(kwargs)
+            return self
+
+    model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 4))
+
+    proposer = RecordingPop(model, pop_size = 2, low_rank = 2, lora_targets = ['0', '2'])
+    solver = RecordingPop(model, pop_size = 2, low_rank = 2, lora_targets = ['0', '2'])
+
+    coevolve = Coevolve(
+        populations = dict(proposer = proposer, solver = solver),
+        evolve_kwargs = dict(solver = dict(epsilon = 0.3))
+    )
+
+    coevolve.evolve_(
+        dict(proposer = torch.zeros(2), solver = torch.zeros(2)),
+        evolve_kwargs = dict(proposer = dict(epsilon = 0.1))
+    )
+
+    assert calls[0] == dict(epsilon = 0.1)          # call-level for proposer
+    assert calls[1] == dict(epsilon = 0.3)          # ctor setting for solver survives
+
+    # and an explicit override still wins over the constructor
+
+    coevolve.evolve_(
+        dict(proposer = torch.zeros(2), solver = torch.zeros(2)),
+        evolve_kwargs = dict(solver = dict(epsilon = 0.9))
+    )
+
+    assert calls[3] == dict(epsilon = 0.9)
+
+def test_roulette_inf_temperature_single_individual():
+    # a single-individual population at infinite temperature - a uniform draw
+    # from one candidate, not a randint(0, 1) crash
+
+    pop = Population(
+        get_model(),
+        pop_size = 1,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([float('-inf')])
+    parents = pop.select_parents('roulette', fitnesses, num_children = 4, num_parents_per_child = 2, temperature = float('inf'))
+
+    assert parents.shape == (4, 2)
+    assert (parents == 0).all()

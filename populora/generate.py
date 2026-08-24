@@ -130,10 +130,10 @@ def generate(
     length = prompt_len
     step = 0
 
-    def decode(x, **kwargs):
+    def decode(x, routed_individuals = None, **kwargs):
         out = population(
             x,
-            individuals = individuals,
+            individuals = default(routed_individuals, individuals),
             ignore_args_kwargs = ignore_args_kwargs,
             eval_and_no_grad = True,
             **kwargs
@@ -154,11 +154,12 @@ def generate(
         return mask
 
     # prefill - chunked over the batch when micro_batch is set (only valid
-    # without a cache, asserted above)
+    # without a cache, asserted above). each chunk carries its slice of the
+    # routes, so per-sample routing stays intact within the chunk
 
     if exists(micro_batch):
         logits = cat([
-            decode(ids[start:start + micro_batch], **forward_kwargs)[0]
+            decode(ids[start:start + micro_batch], individuals[start:start + micro_batch], **forward_kwargs)[0]
             for start in range(0, batch_size, micro_batch)
         ], dim = 0)
     else:

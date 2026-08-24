@@ -285,3 +285,13 @@ def test_interact_memory_real_gymnasium_vector():
         seed = 0
     )
     assert np.isfinite(score)
+
+def test_init_memory_tensor_never_aliases_caller():
+    from populora.memory import init_memory_tensor
+
+    init = torch.zeros(4, 2)
+    batch = init_memory_tensor(init, 4)
+
+    batch[0, 0] = 7.
+
+    assert init[0, 0].item() == 0.
