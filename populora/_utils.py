@@ -31,6 +31,17 @@ maybe_cast_tuple = maybe(cast_tuple)
 def cast_tensor(val, device = None):
     return val if is_tensor(val) else tensor(val, device = device)
 
+def maybe_progress(iterable, enabled = False, desc = ''):
+    if not enabled:
+        return iterable
+
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return iterable
+
+    return tqdm(iterable, desc = desc)
+
 def resolve_dtype(dtype):
     # accept a torch.dtype or a string name like 'float16' / 'bfloat16'
 

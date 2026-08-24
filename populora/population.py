@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 from contextlib import contextmanager
 
 import torch
@@ -13,7 +13,7 @@ from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from einops import einsum, rearrange, repeat
 from torch_einops_utils import batched_index_select, temp_eval, tree_map_tensor, z_score
 
-from populora._utils import cast_tensor, default, divisible_by, exists, extract_dict, first, has_, maybe_cast_tuple, resolve_dtype
+from populora._utils import cast_tensor, default, divisible_by, exists, extract_dict, first, has_, maybe_cast_tuple, maybe_progress, resolve_dtype
 from populora.distributed import distributed_device, evaluate_population_distributed, is_distributed
 from populora.operators import (
     CROSSOVER_REGISTRY,
@@ -29,6 +29,13 @@ from populora.operators import (
 )
 
 # helpers
+
+def linear_layer_paths(model: Module) -> list[str]:
+    """module paths of every Linear layer, used as `lora_targets` for the population"""
+    return [
+        path for path, module in model.named_modules()
+        if isinstance(module, Linear)
+    ]
 
 def init_lora_weights(pop_size, dim, dim_inner, rank, device = None, dtype = None):
     # weights are drawn in float32 and cast down - quantization happens once at
@@ -141,7 +148,7 @@ class Population(_LoRAMixin):
         *,
         pop_size: int,
         low_rank: int,
-        lora_targets: Sequence[str],
+        lora_targets: Sequence[str] | None = None,
         requires_grad: bool = False,
         eval_seed: int | None = 0,
         device: torch.device | str | None = None,
@@ -168,6 +175,9 @@ class Population(_LoRAMixin):
 
         self.weight_down = ParameterDict()
         self.weight_up = ParameterDict()
+
+        lora_targets = default(lora_targets, linear_layer_paths(model))
+        assert len(lora_targets) > 0, 'model has no Linear layers to target - pass explicit lora_targets'
 
         self.lora_targets = tuple(lora_targets)
 
@@ -1331,3 +1341,67 @@ class PopuLoRA(Module):
 
     def forward(self, *args, **kwargs):
         return self.populations(*args, **kwargs)
+
+# module-level evolve - the generation loop for any task that scores the
+# population with a fitness function, the non-env sibling of `evolve_with_env`
+
+def evolve(
+    population: Population,
+    fitness_fn: Callable,
+    *,
+    num_generations: int,
+    target_fitness: float | None = None,
+    patience: int = 1,
+    progress: bool = False,
+    return_history: bool = False,
+    **evolve_kwargs
+):
+    """evolve a population against any fitness function, in one call.
+
+    `fitness_fn` receives the population and returns one fitness per individual
+    (a tensor, or anything tensor-able). each generation it is evaluated, best /
+    mean are recorded, and `population.evolve_` is run with `evolve_kwargs`.
+    evolution stops once `target_fitness` has been reached for `patience`
+    consecutive generations, and the best individual is merged back into the
+    base model. returns the merged policy, plus the history (per-generation
+    best / mean) with `return_history = True`."""
+
+    assert callable(fitness_fn), 'fitness_fn must be a callable taking the population and returning one fitness per individual'
+    assert num_generations >= 1, 'num_generations must be at least 1'
+    assert patience >= 1, 'patience must be at least 1'
+
+    best_fitness = float('-inf')
+    best_index = 0
+    streak = 0
+    history = []
+
+    for _ in maybe_progress(range(num_generations), progress, 'evolving'):
+        fitnesses = cast_tensor(fitness_fn(population)).to(population.device).float()
+        assert fitnesses.shape == (population.pop_size,), f'fitness_fn must return one fitness per individual, got {tuple(fitnesses.shape)}'
+
+        gen_best_fitness = float(fitnesses.max())
+        is_best = gen_best_fitness > best_fitness
+
+        if is_best:
+            best_fitness = gen_best_fitness
+            best_index = int(fitnesses.argmax())
+
+        history.append(dict(
+            best_fitness = gen_best_fitness,
+            mean_fitness = float(fitnesses.mean()),
+        ))
+
+        if exists(target_fitness):
+            streak = streak + 1 if gen_best_fitness >= target_fitness else 0
+
+            if streak >= patience:
+                break
+
+        population.evolve_(fitnesses, **evolve_kwargs)
+
+    policy = population.merge_(best_index)
+
+    if return_history:
+        return policy, history
+
+    return policy

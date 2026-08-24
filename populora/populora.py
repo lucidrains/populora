@@ -17,6 +17,7 @@ from populora.population import (
     Population,
     Populations,
     PopuLoRA,
+    evolve,
     init_lora_weights,
 )
 from populora.coevolve import Coevolve

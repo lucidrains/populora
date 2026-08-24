@@ -221,3 +221,4 @@ __marimo__/
 
 # Antigravity agent config (contains API keys)
 .antigravity/
+AGENTS.md

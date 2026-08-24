@@ -128,6 +128,9 @@ def main(
     seeds: list[int] = [10, 20, 30, 40, 50],
     **kwargs
 ):
+    seed = kwargs.pop('seed', None)
+    seeds = [seed] if seed is not None else seeds
+
     results = [
         run_cartpole_memory_experiment(policy_type = policy_type, seed = s, **kwargs)
         for s in seeds

@@ -9,7 +9,7 @@ from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
 from einops import einsum, rearrange, repeat
-from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, evaluate_population_distributed, register_mutation
+from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, evolve, evaluate_population_distributed, register_mutation
 from populora.populora import exists
 
 # helper
@@ -1948,3 +1948,69 @@ def test_roulette_inf_temperature_single_individual():
 
     assert parents.shape == (4, 2)
     assert (parents == 0).all()
+
+# module-level evolve - the generation loop for fitness-function tasks
+
+def test_evolve_merges_best_and_stops_on_target():
+    # a constant fitness - evolve terminates as soon as the target is reached
+    # (patience = 1), and the merged weights carry exactly the best
+    # individual's lora delta
+
+    model = nn.Sequential(nn.Linear(1, 4), nn.ReLU(), nn.Linear(4, 1))
+    pop = Population(model, pop_size = 4, low_rank = 2)
+
+    base_weight = model[0].weight.clone()
+
+    fitnesses = torch.tensor([1., 2., 3., 4.])
+    merged, history = evolve(
+        pop,
+        lambda pop: fitnesses,
+        num_generations = 10,
+        target_fitness = 4.,
+        patience = 1,
+        return_history = True,
+    )
+
+    assert len(history) == 1
+    assert history[0]['best_fitness'] == 4.
+    assert history[0]['mean_fitness'] == 2.5
+
+    # the best individual (index 3) is merged into the base model
+
+    best_delta = einsum(pop.weight_up['0'][3].float(), pop.weight_down['0'][3].float(), 'e r, d r -> e d')
+    assert allclose(model[0].weight, base_weight + best_delta)
+    assert merged is model
+
+def test_evolve_patience():
+    # the target must be held for `patience` consecutive generations - with a
+    # constant fitness above the target, a patience of 3 stops at gen 3
+
+    pop = Population(nn.Sequential(nn.Linear(1, 4), nn.ReLU(), nn.Linear(4, 1)), pop_size = 4, low_rank = 2)
+
+    _, history = evolve(
+        pop,
+        lambda pop: torch.ones(pop.pop_size),
+        num_generations = 10,
+        target_fitness = 0.5,
+        patience = 3,
+        return_history = True,
+    )
+
+    assert len(history) == 3
+
+def test_evolve_runs_full_loop():
+    # without a target, evolve runs all generations and tracks history - a
+    # static fitness so the population cannot actually improve
+
+    pop = Population(nn.Sequential(nn.Linear(1, 4), nn.ReLU(), nn.Linear(4, 1)), pop_size = 4, low_rank = 2)
+
+    merged, history = evolve(
+        pop,
+        lambda pop: torch.full((pop.pop_size,), 0.5),
+        num_generations = 5,
+        return_history = True,
+    )
+
+    assert len(history) == 5
+    assert all(h['best_fitness'] == 0.5 for h in history)
+    assert merged is pop.model

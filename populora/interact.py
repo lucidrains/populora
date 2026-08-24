@@ -12,7 +12,7 @@ from env_ssl_wrapper import AutoBatchedWrapper, DoneTrackerWrapper, StandardizeW
 from env_ssl_wrapper.utils import parse_wrapper
 from torch_einops_utils import temp_eval
 
-from populora._utils import cast_tensor, default, exists, rescale_from_range_to_range
+from populora._utils import cast_tensor, default, exists, maybe_progress, rescale_from_range_to_range
 from populora.distributed import (
     broadcast_object,
     distributed_device,
@@ -21,16 +21,9 @@ from populora.distributed import (
     preserve_rng,
 )
 from populora.memory import Memory, init_memory_tensor
-from populora.population import Population
+from populora.population import Population, linear_layer_paths
 
 # helpers
-
-def linear_layer_paths(model: nn.Module) -> list[str]:
-    """module paths of every Linear layer, used as `lora_targets` for the population"""
-    return [
-        path for path, module in model.named_modules()
-        if isinstance(module, nn.Linear)
-    ]
 
 def _flatten_batch(t):
     if is_tensor(t):
@@ -145,19 +138,6 @@ def _fitness_mode(fn):
 
     return 'all'
 
-def _maybe_progress(iterable, enabled = False, desc = ''):
-    if not enabled:
-        return iterable
-
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        return iterable
-
-    return tqdm(iterable, desc = desc)
-
-# main class
-
 class EnvInteractor:
     def __init__(
         self,
@@ -262,10 +242,6 @@ class EnvInteractor:
         eval_seed: int | None = 0,
         **kwargs
     ):
-        lora_targets = default(lora_targets, linear_layer_paths(model))
-
-        assert len(lora_targets) > 0, 'model has no Linear layers to target - pass explicit lora_targets'
-
         return Population(
             model,
             pop_size = pop_size,
@@ -655,7 +631,7 @@ class EnvInteractor:
             if exists(resumed):
                 start_generation, best_fitness, best_index, history = resumed
 
-        for generation in _maybe_progress(range(start_generation, num_generations), progress, desc = 'evolving'):
+        for generation in maybe_progress(range(start_generation, num_generations), progress, desc = 'evolving'):
             fitnesses = self.evaluate(
                 population,
                 action = action,

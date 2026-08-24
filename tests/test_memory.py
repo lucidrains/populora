@@ -295,3 +295,48 @@ def test_init_memory_tensor_never_aliases_caller():
     batch[0, 0] = 7.
 
     assert init[0, 0].item() == 0.
+
+# batched sequential rollout - the routed per-timestep loop, memory threaded
+
+class CountStepPolicy(nn.Module):
+    # emits the carried memory value and increments it - outputs must be
+    # [init, init + 1, ...] over the roll if the memory threads correctly
+
+    def __init__(self, obs_dim = 1):
+        super().__init__()
+        self.proj = nn.Linear(obs_dim, 1)
+
+    def forward(self, mem, obs):
+        return mem.float().unsqueeze(-1), mem + 1
+
+def test_rollout_plain_net_threads_memory():
+    from populora import rollout
+
+    net = Memory(CountStepPolicy(), init_memory = 10)
+    outputs = rollout(net, torch.zeros(2, 4))
+
+    # every sequence resets to the init memory and counts up from there - a
+    # single-feature net collapses to (batch, seq_len)
+
+    assert outputs.shape == (2, 4)
+    assert torch.equal(outputs, torch.tensor([[10., 11., 12., 13.], [10., 11., 12., 13.]]))
+
+def test_rollout_population_routes_and_resets_per_individual():
+    from populora import Population, rollout
+
+    net = Memory(CountStepPolicy(), init_memory = 10)
+    pop = Population(net, pop_size = 2, low_rank = 1)
+
+    # two sequences per individual, each reset to the init memory - with
+    # all_individuals the rows tile individuals in order
+
+    outputs = rollout(pop, torch.zeros(4, 4), all_individuals = True)
+
+    assert outputs.shape == (4, 4)
+    assert torch.equal(outputs, torch.full((4, 4), 10.) + torch.arange(4).float())
+
+def test_rollout_requires_memory_wrapped():
+    from populora import rollout
+
+    with pytest.raises(AssertionError):
+        rollout(nn.Linear(2, 2), torch.zeros(2, 4))

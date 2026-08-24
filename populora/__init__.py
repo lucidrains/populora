@@ -4,6 +4,7 @@ from populora.populora import (
     PopuLoRA,
     LoRA,
     Coevolve,
+    evolve,
     register_mutation,
     register_selection,
     register_parent_selection,
@@ -38,7 +39,7 @@ from populora.interact import (
     interact_with_env,
     linear_layer_paths,
 )
-from populora.memory import Memory
+from populora.memory import Memory, rollout
 from populora.generate import generate
 from populora.archive import HallOfFame
 from populora.policies import (
