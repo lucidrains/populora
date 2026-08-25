@@ -14,6 +14,7 @@ from populora._utils import (
 )
 from populora.population import (
     LoRA,
+    PerTarget,
     Population,
     Populations,
     PopuLoRA,

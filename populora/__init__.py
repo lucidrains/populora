@@ -5,6 +5,7 @@ from populora.populora import (
     LoRA,
     Coevolve,
     evolve,
+    PerTarget,
     register_mutation,
     register_selection,
     register_parent_selection,

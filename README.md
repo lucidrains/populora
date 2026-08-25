@@ -42,6 +42,32 @@ model = pop.merge_(fitnesses.argmax())  # merge the best individual back in
 
 `pop.evolve_(fitnesses)` runs selection, parent selection, crossover, and mutation in one step. Batch evaluation also supports `pop(x, individuals = [ids])` to route each sample to its own individual.
 
+### Per-weight-matrix operators
+
+`mutation_type`, `epsilon`, and `crossover_type` each accept a dict keyed by LoRA target instead of a scalar — set the mutation rate (or the operator itself) per weight matrix. Keys match a layer's dotted module path or its storage key exactly, else by glob pattern (first match wins); a `'default'` entry catches everything left, coverage must be total, and unmatched patterns raise.
+
+```python
+pop.evolve_(
+    fitnesses,
+    mutation_type = {
+        'encoder.*': 'svd_structured',   # glob over the dotted module path
+        'default': 'full_gaussian'
+    },
+    epsilon = {
+        'encoder.proj_in': 0.05,         # exact dotted path
+        'encoder_proj_out': 0.2,         # exact storage key
+        'head': 0.,                      # freeze this matrix entirely
+        'default': 0.1
+    },
+    crossover_type = {
+        '*to_q*': 'svd_subspace',
+        'default': 'average'
+    }
+)
+```
+
+Any other operator kwarg can vary per target too via the explicit `PerTarget` wrapper: `alpha = PerTarget({'*.proj_in': 5., 'default': 10.})`. Targets sharing the same resolved parameters are dispatched together in one call, so per-target specs cost nothing when they collapse to a single group.
+
 ## Distributed evolution
 
 Each rank evaluates its share of the population and the fitnesses are gathered, so every rank evolves in lockstep. The population is moved to the local device on construction.

@@ -9,7 +9,8 @@ from torch import allclose
 
 from x_transformers import TransformerWrapper, Decoder
 from einops import einsum, rearrange, repeat
-from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, evolve, evaluate_population_distributed, register_mutation
+import populora.operators
+from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, PerTarget, evolve, evaluate_population_distributed, register_mutation
 from populora.populora import exists
 
 # helper
@@ -2014,3 +2015,155 @@ def test_evolve_runs_full_loop():
     assert len(history) == 5
     assert all(h['best_fitness'] == 0.5 for h in history)
     assert merged is pop.model
+
+# per-target operator params - mutation rate, mutation type, and crossover type
+# may be set per weight matrix via dicts keyed by target path or glob pattern
+
+@pytest.fixture
+def two_layer_pop():
+    # three lora targets across nested modules - keys are 'encoder_proj_in',
+    # 'encoder_proj_out', and 'head', dotted paths 'encoder.proj_in', ...
+
+    class Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj_in = nn.Linear(8, 16)
+            self.act = nn.ReLU()
+            self.proj_out = nn.Linear(16, 4)
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = Inner()
+            self.head = nn.Linear(4, 1)
+
+    torch.manual_seed(0)
+    return Population(Net(), pop_size = 4, low_rank = 2)
+
+def snapshot(pop):
+    return {key: (pop.weight_down[key].clone(), pop.weight_up[key].clone()) for key in pop.weight_down.keys()}
+
+def test_per_target_epsilon(two_layer_pop):
+    # epsilon = 0. must leave its target untouched while the default mutates
+
+    pop = two_layer_pop
+    before = snapshot(pop)
+
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = {'encoder_proj_in': 0., 'default': 0.3})
+
+    assert allclose(before['encoder_proj_in'][0], pop.weight_down['encoder_proj_in'])
+    assert allclose(before['encoder_proj_in'][1], pop.weight_up['encoder_proj_in'])
+
+    assert not allclose(before['encoder_proj_out'][0], pop.weight_down['encoder_proj_out'])
+    assert not allclose(before['head'][0], pop.weight_down['head'])
+
+def test_per_target_epsilon_matches_storage_key_and_dotted_path(two_layer_pop):
+    pop = two_layer_pop
+
+    # exact dotted module path
+
+    before = snapshot(pop)
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = {'encoder.proj_in': 0., 'default': 0.3})
+    assert allclose(before['encoder_proj_in'][0], pop.weight_down['encoder_proj_in'])
+    assert not allclose(before['head'][0], pop.weight_down['head'])
+
+    # glob over the dotted path
+
+    before = snapshot(pop)
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = {'*.proj_out': 0., 'default': 0.3})
+    assert allclose(before['encoder_proj_out'][0], pop.weight_down['encoder_proj_out'])
+    assert not allclose(before['encoder_proj_in'][0], pop.weight_down['encoder_proj_in'])
+    assert not allclose(before['head'][0], pop.weight_down['head'])
+
+def test_per_target_mutation_type(two_layer_pop):
+    # neftune_style perturbs only weight_down - mixing it per target with
+    # full_gaussian elsewhere shows each group ran its own operator
+
+    pop = two_layer_pop
+    before = snapshot(pop)
+
+    pop.mutate_(
+        {'*proj_out': 'neftune_style', 'default': 'full_gaussian'},
+        all_individuals = True,
+        epsilon = 0.3,
+        alpha = PerTarget({'*proj_out': 10., 'default': 10.})
+    )
+
+    assert not allclose(before['encoder_proj_out'][0], pop.weight_down['encoder_proj_out'])
+    assert allclose(before['encoder_proj_out'][1], pop.weight_up['encoder_proj_out'])  # neftune leaves weight_up alone
+
+    assert not allclose(before['encoder_proj_in'][0], pop.weight_down['encoder_proj_in'])
+    assert not allclose(before['encoder_proj_in'][1], pop.weight_up['encoder_proj_in'])  # full gaussian touches both
+
+def test_per_target_crossover_type(two_layer_pop):
+    # clone copies parent 0 exactly, average blends both parents - per-target
+    # dispatch yields clone semantics on one layer only
+
+    pop = two_layer_pop
+    fitnesses = torch.rand(4)
+
+    parents = pop.select_parents('tournament', fitnesses, num_children = 2, culled = [0, 1])
+    pop.crossover_({'encoder.proj_in': 'clone', 'default': 'average'}, parents, torch.tensor([0, 1]))
+
+    for key in ('encoder_proj_in', 'encoder_proj_out'):
+        child = pop.weight_down[key][:2]
+        parent_a = pop.weight_down[key][parents[:, 0]]
+        parent_b = pop.weight_down[key][parents[:, 1]]
+
+        if key == 'encoder_proj_in':
+            assert allclose(child, parent_a)  # exact copy of parent 0
+        else:
+            assert not allclose(child, parent_a) and not allclose(child, parent_b)
+
+def test_per_target_via_evolve(two_layer_pop):
+    # mixed specs flow through evolve_ unchanged (they ride **kwargs)
+
+    pop = two_layer_pop
+    fitnesses = torch.rand(4)
+
+    pop.evolve_(
+        fitnesses,
+        mutation_type = {'*.proj_in': 'svd_structured', 'default': 'full_gaussian'},
+        epsilon = {'*': 0.2},
+        crossover_type = {'head': 'extrapolative', 'default': 'average'},
+    )
+
+def test_per_target_unknown_pattern_raises(two_layer_pop):
+    pop = two_layer_pop
+
+    with pytest.raises(AssertionError, match = 'match none of'):
+        pop.mutate_('full_gaussian', all_individuals = True, epsilon = {'nope_*': 0.5, 'default': 0.1})
+
+def test_per_target_incomplete_coverage_raises(two_layer_pop):
+    # no default entry - every target must be covered explicitly
+
+    pop = two_layer_pop
+
+    with pytest.raises(AssertionError, match = 'uncovered'):
+        pop.mutate_('full_gaussian', all_individuals = True, epsilon = {'head': 0.5})
+
+def test_per_target_custom_kwarg(two_layer_pop):
+    # any operator kwarg can vary per target via the explicit PerTarget wrapper -
+    # verified with a probe mutation that records what it received
+
+    seen = []
+
+    def mutation_probe(population, idx, alpha = None, **kwargs):
+        assert exists(alpha), 'probe requires alpha'
+        seen.append((tuple(population.weight_down.keys()), alpha))
+
+    register_mutation('probe', mutation_probe)
+
+    try:
+        two_layer_pop.mutate_(
+            {'default': 'probe'},
+            all_individuals = True,
+            alpha = PerTarget({'*.proj_out': 5., 'default': 1.})
+        )
+    finally:
+        del populora.operators.MUTATION_REGISTRY['probe']
+
+    received = dict(seen)
+    assert set(received) <= {('encoder_proj_in', 'head'), ('encoder_proj_out',)}  # grouped by shared alpha
+    assert received[('encoder_proj_out',)] == 5.
+    assert received[('encoder_proj_in', 'head')] == 1.

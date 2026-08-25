@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Sequence
 from contextlib import contextmanager
@@ -89,6 +90,76 @@ def _expand_batch(t, p):
         assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
 
     return t
+
+# per-target operator params - mutation_type, epsilon, and crossover_type (and,
+# via PerTarget, any operator kwarg) may be given as a dict keyed by lora
+# target instead of a scalar. keys match a target's dotted module path or its
+# storage key exactly, else by glob pattern ('*' wildcards, first match wins in
+# insertion order); a 'default' or '*' entry catches everything left. every
+# explicit key must match at least one target, and coverage must be total
+
+_DEFAULT_SPEC_KEYS = ('default', '*')
+
+class PerTarget(dict):
+    # explicit wrapper letting any operator kwarg vary per lora target -
+    # e.g. alpha = PerTarget({'*to_q': 5., 'default': 10.}). mutation_type /
+    # epsilon / crossover_type also accept bare dicts
+
+    pass
+
+def _target_spec_assignments(spec, dotted_paths, name):
+    # resolve one spec {pattern: value} into one value per target -
+    # dotted_paths maps each storage key to its dotted module path
+
+    assert isinstance(spec, dict), f'{name} must be a scalar or a dict keyed by lora target'
+    assert len(spec) > 0, f'{name} spec cannot be empty'
+
+    explicit = [(key, value) for key, value in spec.items() if key not in _DEFAULT_SPEC_KEYS]
+    fallback = next((value for key, value in spec.items() if key in _DEFAULT_SPEC_KEYS), None)
+
+    def match_one(key):
+        dotted = dotted_paths[key]
+
+        for pattern, value in explicit:
+            if pattern == key or pattern == dotted:
+                return pattern, value
+
+        for pattern, value in explicit:
+            if fnmatch(key, pattern) or fnmatch(dotted, pattern):
+                return pattern, value
+
+        return None, fallback
+
+    matched = set()
+    assignments = dict()
+
+    for key in dotted_paths:
+        pattern, value = match_one(key)
+
+        assert exists(value), f'{name} spec leaves target {key!r} uncovered - add a "default" entry'
+
+        if exists(pattern):
+            matched.add(pattern)
+
+        assignments[key] = value
+
+    unmatched = [pattern for pattern, _ in explicit if pattern not in matched]
+    assert len(unmatched) == 0, f'{name} spec keys {unmatched} match none of {list(dotted_paths)}'
+
+    return assignments
+
+class _TargetView:
+    # stand-in population exposing a subset of lora targets - operators written
+    # against population.weight_{down,up}.values() transparently run over just
+    # their group; every other attribute delegates to the real population
+
+    def __init__(self, population, keys):
+        self._population = population
+        self.weight_down = {key: population.weight_down[key] for key in keys}
+        self.weight_up = {key: population.weight_up[key] for key in keys}
+
+    def __getattr__(self, name):
+        return getattr(self._population, name)
 
 # tiered evolve constants
 
@@ -337,20 +408,62 @@ class Population(_LoRAMixin):
         # shared eval seed, auto-synced across ranks - None disables
         return self._eval_seed
 
+    def _target_groups(self, knobs, kwargs):
+        # group lora targets by resolved per-target params - among `knobs`
+        # (the canonical params accepting bare dicts, layered over kwargs) and
+        # kwargs itself, any bare dict or PerTarget-wrapped value makes that
+        # param vary per lora target. returns None when nothing varies (scalar
+        # fast path), else [(target keys, resolved kwargs)] per group
+
+        eligible = dict(kwargs)
+        eligible.update(knobs)
+
+        specs = [
+            (name, value) for name, value in eligible.items()
+            if isinstance(value, (dict, PerTarget)) and (name in knobs or isinstance(value, PerTarget))
+        ]
+
+        if len(specs) == 0:
+            return None
+
+        dotted = {path.replace('.', '_'): path for path in self.lora_targets}
+        assignments = [_target_spec_assignments(spec, dotted, name) for name, spec in specs]
+        spec_names = [name for name, _ in specs]
+
+        static = {name: value for name, value in kwargs.items() if name not in spec_names}
+
+        signatures = dict()
+
+        for key in self.weight_down.keys():
+            signature = tuple(assignment[key] for assignment in assignments)
+            signatures.setdefault(signature, []).append(key)
+
+        groups = []
+
+        for signature, keys in signatures.items():
+            params = dict(static)
+            params.update(zip(spec_names, signature))
+            groups.append((keys, params))
+
+        return groups
+
     @torch.no_grad()
     def mutate_(
         self,
-        mutation_type: str | callable,
+        mutation_type: str | callable | dict,
         individual: int | None = None,
         individuals: Sequence[int] | Tensor | None = None,
         all_individuals: bool = False,
         ignore_individuals: Sequence[int] | Tensor | None = None,
         **kwargs
     ):
+        # mutation_type and epsilon may be per-target dicts (see PerTarget) -
+        # targets sharing the same resolved params are dispatched together
+        # through a filtered view of this population
+
         assert sum((exists(individual), exists(individuals), all_individuals)) == 1
 
         mutation_registry = default(self.mutation_registry, MUTATION_REGISTRY)
-        mutation_fn = _resolve_fn(mutation_type, mutation_registry, 'mutation')
 
         if all_individuals:
             indices = torch.arange(self.pop_size, device = self.device)
@@ -370,11 +483,22 @@ class Population(_LoRAMixin):
         # instead of one per individual; custom registry fns keep the scalar
         # contract, since they may rely on `weight_down[key][idx]` being a view
 
-        if getattr(mutation_fn, 'batch', False):
-            mutation_fn(self, indices, **kwargs)
-        else:
-            for idx in indices.tolist():
-                mutation_fn(self, idx, **kwargs)
+        def run(population, fn, params):
+            if getattr(fn, 'batch', False):
+                fn(population, indices, **params)
+            else:
+                for idx in indices.tolist():
+                    fn(population, idx, **params)
+
+        groups = self._target_groups(dict(mutation_type = mutation_type, epsilon = kwargs.get('epsilon')), kwargs)
+
+        if groups is None:
+            run(self, _resolve_fn(mutation_type, mutation_registry, 'mutation'), kwargs)
+            return self
+
+        for keys, params in groups:
+            fn = _resolve_fn(params.pop('mutation_type', mutation_type), mutation_registry, 'mutation')
+            run(_TargetView(self, keys), fn, params)
 
         return self
 
@@ -530,19 +654,32 @@ class Population(_LoRAMixin):
     @torch.no_grad()
     def crossover_(
         self,
-        crossover_type: str | callable,
+        crossover_type: str | callable | dict,
         parent_indices: Tensor,
         child_indices: Tensor,
         fitnesses: Tensor | None = None,
         **kwargs
     ):
+        # crossover_type may be a per-target dict (see PerTarget) - targets
+        # sharing the same resolved params are dispatched together through a
+        # filtered view of this population
+
         crossover_registry = default(self.crossover_registry, CROSSOVER_REGISTRY)
-        crossover_fn = _resolve_fn(crossover_type, crossover_registry, 'crossover')
 
         if exists(fitnesses):
             kwargs = dict(kwargs, fitnesses = fitnesses)
 
-        crossover_fn(self, parent_indices, child_indices, **kwargs)
+        groups = self._target_groups(dict(crossover_type = crossover_type), kwargs)
+
+        if groups is None:
+            crossover_fn = _resolve_fn(crossover_type, crossover_registry, 'crossover')
+            crossover_fn(self, parent_indices, child_indices, **kwargs)
+            return self
+
+        for keys, params in groups:
+            crossover_fn = _resolve_fn(params.pop('crossover_type', crossover_type), crossover_registry, 'crossover')
+            crossover_fn(_TargetView(self, keys), parent_indices, child_indices, **params)
+
         return self
 
     @torch.no_grad()
