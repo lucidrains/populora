@@ -181,6 +181,9 @@ def validate_with_mario(
     es_temperature = 1.0,
     sample_actions = True,
     policy_temperature = 1.0,
+    survive_frac = 0.5,
+    elite_frac = 0.10,
+    tournament_size = 5,
     render_video = True,
     video_dir = "./videos-mario",
     checkpoint_dir = "./checkpoints-mario",
@@ -320,8 +323,8 @@ def validate_with_mario(
         else:
             pop.evolve_(
                 fitnesses,
-                survive_frac = 0.5,
-                elite_frac = 0.10,
+                survive_frac = survive_frac,
+                elite_frac = elite_frac,
                 selection_type = survivor_selection_type,
                 parent_selection_type = parent_selection_type,
                 crossover_type = crossover_type,
@@ -329,7 +332,7 @@ def validate_with_mario(
                 epsilon = epsilon,
                 weight_decay = weight_decay,
                 soft_threshold = soft_threshold,
-                tournament_size = 5
+                tournament_size = tournament_size
             )
 
     for env in envs:

@@ -2167,3 +2167,238 @@ def test_per_target_custom_kwarg(two_layer_pop):
     assert set(received) <= {('encoder_proj_in', 'head'), ('encoder_proj_out',)}  # grouped by shared alpha
     assert received[('encoder_proj_out',)] == 5.
     assert received[('encoder_proj_in', 'head')] == 1.
+
+# per-individual mutation step size - log-normal self-adaptation
+# (adaptive_epsilon): each individual carries its own sigma in log space,
+# recombined from parents at birth and perturbed before mutating, so selection
+# tunes the mutation rate instead of a hand-set schedule. `sigma_granularity`
+# picks the finest structure tracked - shared across the genome ('pop'), one per
+# LoRA adapter ('lora'), one per singular-value direction ('rank'), or one per
+# parameter ('weight')
+
+def _sigma_tensors(pop):
+    return list(dict.fromkeys((*pop._log_sigma_down.values(), *pop._log_sigma_up.values())))
+
+def test_adaptive_epsilon_diversifies():
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 16,
+        low_rank = 2,
+        adaptive_epsilon = True,
+        epsilon_init = 0.1,
+    )
+
+    assert pop.epsilon_tau > 0
+    assert len(_sigma_tensors(pop)) == 1, "'pop' granularity shares one sigma across the genome"
+    for log_sigma in _sigma_tensors(pop):
+        assert allclose(log_sigma, torch.full_like(log_sigma, math.log(0.1)))
+
+    grid = torch.linspace(-1, 1, 9).reshape(1, -1)
+    grid_rep = repeat(grid, '1 n -> (s n) 1', s = 16)
+
+    for _ in range(10):
+        preds = pop(grid_rep, all_individuals = True).reshape(16, 9)
+        fitnesses = -((preds - torch.sin(torch.pi * grid)) ** 2).mean(dim = 1)
+        pop.evolve_(fitnesses)
+
+    assert any((log_sigma != math.log(0.1)).any() for log_sigma in _sigma_tensors(pop)), 'sigma must adapt away from init'
+
+def test_adaptive_epsilon_recombines_from_parents():
+    # children inherit the geometric mean of their parents' sigma (in log
+    # space), so a step size is not reset at birth - one parent passes it whole
+
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+    )
+
+    fitnesses = torch.rand(8)
+    result = pop.select('deterministic', fitnesses, survive_frac = 0.5, elite_frac = 0.1)
+
+    parents = pop.select_parents('tournament', fitnesses, num_children = len(result.culled), culled = result.culled)
+
+    for log_sigma in _sigma_tensors(pop):
+        log_sigma.data[0] = math.log(0.5)
+        log_sigma.data[1] = math.log(0.5)
+
+    pop._sigma_recombine_(result.culled, parents)
+
+    culled = result.culled.tolist()
+    for log_sigma in _sigma_tensors(pop):
+        for child in culled:
+            parent_sigmas = [log_sigma[p].item() for p in parents[culled.index(child)].tolist()]
+            assert log_sigma[child].item() < 0.3, 'children should inherit a log sigma near the parents'
+
+def test_adaptive_epsilon_tiered_and_roundtrip():
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+    )
+
+    fitnesses = torch.rand(8)
+    pop.evolve_(fitnesses, tiered = True)
+
+    saved = pop.state_dict_pkg(save_base_model = False)
+    assert 'sigma' in saved
+
+    pop2 = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+    )
+    pop2.load(saved)
+
+    for key in pop.weight_down.keys():
+        assert allclose(pop2._log_sigma_down[key], pop._log_sigma_down[key])
+        assert allclose(pop2._log_sigma_up[key], pop._log_sigma_up[key])
+
+def test_adaptive_epsilon_resets_on_reinit():
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+        epsilon_init = 0.05,
+    )
+
+    pop.evolve_(torch.rand(8), tiered = True)
+    assert any((log_sigma != math.log(0.05)).any() for log_sigma in _sigma_tensors(pop))
+
+    pop.repopulate_()
+    for log_sigma in _sigma_tensors(pop):
+        assert allclose(log_sigma, torch.full_like(log_sigma, math.log(0.05)))
+
+def test_adaptive_epsilon_granularity_shapes():
+    model = nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1))
+
+    pop = Population(model, pop_size = 4, low_rank = 3, adaptive_epsilon = True, sigma_granularity = 'lora')
+    for key in pop.weight_down.keys():
+        assert pop._log_sigma_down[key].shape == (4, 1, 1)
+        assert pop._log_sigma_up[key] is pop._log_sigma_down[key], "down/up share one step size per adapter"
+
+    pop = Population(model, pop_size = 4, low_rank = 3, adaptive_epsilon = True, sigma_granularity = 'rank')
+    for key in pop.weight_down.keys():
+        assert pop._log_sigma_down[key].shape == (4, 1, 3)
+        assert pop._log_sigma_up[key] is pop._log_sigma_down[key], "down/up share the per-direction step sizes"
+
+    pop = Population(model, pop_size = 4, low_rank = 3, adaptive_epsilon = True, sigma_granularity = 'weight')
+    for key in pop.weight_down.keys():
+        assert pop._log_sigma_down[key].shape == pop.weight_down[key].shape
+        assert pop._log_sigma_up[key].shape == pop.weight_up[key].shape
+        assert pop._log_sigma_down[key] is not pop._log_sigma_up[key]
+
+    with pytest.raises(ValueError):
+        Population(model, pop_size = 4, low_rank = 3, adaptive_epsilon = True, sigma_granularity = 'bogus')
+
+def test_adaptive_epsilon_per_lora_independent():
+    # 'lora' granularity: each adapter adapts its own step size - setting one
+    # leaves the others untouched, and recombined step sizes drift apart
+
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+        sigma_granularity = 'lora',
+    )
+
+    keys = list(pop.weight_down.keys())
+    assert len(keys) == 2
+
+    pop._log_sigma_down[keys[0]].data[0] = math.log(0.7)
+    assert math.isclose(pop._log_sigma_down[keys[1]].data[0, 0, 0].item(), math.log(0.1), abs_tol = 1e-6), 'adapters adapt independently'
+
+    fitnesses = torch.rand(8)
+    result = pop.select('deterministic', fitnesses, survive_frac = 0.5, elite_frac = 0.1)
+    parents = pop.select_parents('tournament', fitnesses, num_children = len(result.culled), culled = result.culled)
+
+    pop._sigma_recombine_(result.culled, parents)
+
+    assert not allclose(pop._log_sigma_down[keys[0]], pop._log_sigma_down[keys[1]]), 'per-adapter step sizes diverge'
+
+def test_adaptive_epsilon_per_weight_evolve():
+    # per-parameter step sizes: full-shape sigma buffers adapted by selection,
+    # with a checkpoint roundtrip of the per-weight state
+
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+        epsilon_init = 0.1,
+        sigma_granularity = 'weight',
+    )
+
+    for key in pop.weight_down.keys():
+        assert pop._log_sigma_down[key].shape == pop.weight_down[key].shape
+
+    grid = torch.linspace(-1, 1, 9).reshape(1, -1)
+    grid_rep = repeat(grid, '1 n -> (s n) 1', s = 8)
+
+    for _ in range(10):
+        preds = pop(grid_rep, all_individuals = True).reshape(8, 9)
+        fitnesses = -((preds - torch.sin(torch.pi * grid)) ** 2).mean(dim = 1)
+        pop.evolve_(fitnesses)
+
+    assert any((log_sigma != math.log(0.1)).any() for log_sigma in _sigma_tensors(pop)), 'per-weight sigma must adapt'
+
+    saved = pop.state_dict_pkg(save_base_model = False)
+
+    pop2 = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+        sigma_granularity = 'weight',
+    )
+    pop2.load(saved)
+
+    for key in pop.weight_down.keys():
+        assert allclose(pop2._log_sigma_down[key], pop._log_sigma_down[key])
+        assert allclose(pop2._log_sigma_up[key], pop._log_sigma_up[key])
+
+def test_adaptive_epsilon_legacy_sigma_checkpoint():
+    # pre-granularity checkpoints stored one shared scalar tensor - it must
+    # broadcast into the per-target buffers of any granularity
+
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+        adaptive_epsilon = True,
+        sigma_granularity = 'lora',
+    )
+
+    legacy = pop.state_dict_pkg(save_base_model = False)
+    legacy['sigma'] = torch.full((8, 1, 1), math.log(0.42))
+
+    pop.load(legacy)
+
+    for log_sigma in _sigma_tensors(pop):
+        assert allclose(log_sigma, torch.full_like(log_sigma, math.log(0.42)))
+
+def test_mutate_per_target_epsilon_map():
+    # a dict keyed by lora target with (down, up) step-size pairs is an epsilon
+    # map, not a per-target spec - every target mutates with its own pair
+
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+
+    epsilons = {
+        key: (torch.full((8, 1, 1), 0.5), torch.full((8, 1, 1), 0.5))
+        for key in pop.weight_down.keys()
+    }
+
+    before = {key: pop.weight_down[key].clone() for key in pop.weight_down.keys()}
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = epsilons)
+
+    for key in pop.weight_down.keys():
+        assert not allclose(before[key], pop.weight_down[key]), 'per-target epsilon should mutate every target'

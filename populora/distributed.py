@@ -201,6 +201,11 @@ def sync_population(population: Population, src = 0, sync_base_model = False):
     # identical on every rank by construction. opt in to sync it too
 
     lora_params = [*population.weight_down.values(), *population.weight_up.values()]
+
+    if population.adaptive_epsilon:
+        # step sizes are part of the genome - keep every rank in lockstep
+        lora_params = [*lora_params, *population._log_sigma_down.values(), *population._log_sigma_up.values()]
+
     params = [*lora_params, *population.model.state_dict().values()] if sync_base_model else lora_params
 
     for param in params:

@@ -24,7 +24,6 @@ import fire
 import gymnasium as gym
 import numpy as np
 import torch
-from env_ssl_wrapper import ActionTransformWrapper
 from tqdm import tqdm
 from x_mlps_pytorch import MLP
 
@@ -86,7 +85,17 @@ def validate_with_lunar(
     queen_bee_mating: bool = False,
     num_elites: int = 1,
     weight_decay: float = 1e-3,
-    soft_threshold: float = 0.0
+    soft_threshold: float = 0.0,
+    adaptive_epsilon: bool = True,
+    epsilon_init: float = 0.15,
+    epsilon_tau: float | None = None,
+    sigma_granularity: str = 'weight',
+    epsilon: float = 0.15,
+    survive_frac: float = 0.5,
+    elite_frac: float = 0.25,
+    crossover_type: str = 'extrapolative',
+    mutation_type: str = 'full_gaussian',
+    horizon: int = 1000,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -109,10 +118,19 @@ def validate_with_lunar(
         pop_size = pop_size,
         low_rank = low_rank,
         lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2'],
-        eval_seed = seed
+        eval_seed = seed,
+        adaptive_epsilon = adaptive_epsilon,
+        epsilon_init = epsilon_init,
+        epsilon_tau = epsilon_tau,
+        sigma_granularity = sigma_granularity,
     )
 
-    print(f'[PopuLoRA Lunar] population size: {pop_size} | total generations: {max_generations} | episodes per evaluation: {num_episodes}')
+    tau = pop.epsilon_tau if adaptive_epsilon else 'n/a'
+    mut_eps = f'per-individual ({sigma_granularity})' if adaptive_epsilon else f'fixed {epsilon}'
+
+    print(f'[PopuLoRA Lunar] pop_size: {pop_size} | low_rank: {low_rank} | generations: {max_generations} | episodes: {num_episodes} | distribution: {distribution} | horizon: {horizon}')
+    print(f'  mutation: {mut_eps} | adaptive_epsilon: {adaptive_epsilon} | sigma_granularity: {sigma_granularity} | epsilon_init: {epsilon_init} | epsilon_tau: {tau}')
+    print(f'  crossover: {crossover_type} | mutation_type: {mutation_type} | survive_frac: {survive_frac} | elite_frac: {elite_frac} | sample_actions: {sample_actions} | temperature: {temperature}')
 
     recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
@@ -133,12 +151,12 @@ def validate_with_lunar(
         fitnesses = interactor.evaluate(
             pop,
             action = action_fn,
-            horizon = 1000,
+            horizon = horizon,
             num_episodes = num_episodes,
             seed = pop.eval_seed
         )
 
-        result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = 0.5, elite_frac = 0.25)
+        result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = survive_frac, elite_frac = elite_frac)
         best_reward = fitnesses.max().item()
         mean_reward = fitnesses.mean().item()
         recent_rewards.append(mean_reward)
@@ -162,7 +180,17 @@ def validate_with_lunar(
             pop.repopulate()
         else:
             parents = pop.select_parents(parent_selection_type, fitnesses = fitnesses, num_children = len(result.culled), num_elites = num_elites, culled = result.culled)
-            pop.crossover_('extrapolative', parents, result.culled, fitnesses = fitnesses).mutate_('full_gaussian', individuals = result.culled, epsilon = 0.15).regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
+
+            if pop.adaptive_epsilon:
+                # per-individual mutation rate (log-normal self-adaptation) -
+                # recombined from the parents (geometric mean) and used to
+                # mutate each child with its own step size, at the granularity
+                # picked by `sigma_granularity` ('weight' = one per individual
+                # per parameter, every element of every LoRA matrix)
+                pop._sigma_recombine_(result.culled, parents)
+                epsilon = pop._sigma_epsilon_(result.culled)
+
+            pop.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses).mutate_(mutation_type, individuals = result.culled, epsilon = epsilon).regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
 
     env.close()
     assert False, f'LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})'

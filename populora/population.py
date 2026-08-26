@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from fnmatch import fnmatch
 from pathlib import Path
@@ -66,6 +67,12 @@ def _resolve_fn(type_or_fn, registry, kind):
 def _lora_delta(w_down, w_up):
     return einsum(w_up.float(), w_down.float(), 'e r, d r -> e d')
 
+def _sigma_param(tensor):
+    # wrap a step-size buffer as a parameter once - shared buffers ('pop' /
+    # 'lora' / 'rank') must keep their identity across the targets they back
+
+    return tensor if isinstance(tensor, Parameter) else Parameter(tensor, requires_grad = False)
+
 def _concat_chunked_outputs(outputs, batch_size):
     first_output = outputs[0]
 
@@ -99,6 +106,16 @@ def _expand_batch(t, p):
 # explicit key must match at least one target, and coverage must be total
 
 _DEFAULT_SPEC_KEYS = ('default', '*')
+
+def _is_sigma_map(value):
+    # a per-target epsilon map (the adaptive-epsilon output - tensors keyed by
+    # lora target) vs a per-target spec dict (scalar operator params): only the
+    # latter groups targets together, tensor maps pass through to the operator
+
+    return isinstance(value, dict) and len(value) > 0 and all(
+        is_tensor(v) or (isinstance(v, (tuple, list)) and all(is_tensor(x) for x in v))
+        for v in value.values()
+    )
 
 class PerTarget(dict):
     # explicit wrapper letting any operator kwarg vary per lora target -
@@ -230,7 +247,13 @@ class Population(_LoRAMixin):
         crossover_registry: dict | None = None,
         mutation_registry: dict | None = None,
         migration_registry: dict | None = None,
-        island_reinit_registry: dict | None = None
+        island_reinit_registry: dict | None = None,
+        adaptive_epsilon: bool = False,
+        epsilon_init: float = 0.1,
+        epsilon_tau: float | None = None,
+        epsilon_floor: float = 1e-4,
+        epsilon_cap: float = 1.0,
+        sigma_granularity: str = 'pop'
     ):
         super().__init__()
         self.model = model
@@ -277,6 +300,63 @@ class Population(_LoRAMixin):
         self._individual = None
         self._eval_seed = eval_seed
 
+        # per-individual mutation step size (log-normal self-adaptation,
+        # Schwefel 1981 / Beyer 2001): each individual carries its own mutation
+        # strength in log space, inherited from its parents (geometric mean,
+        # `_sigma_recombine_`) or perturbed in place (`_sigma_perturb_`), and the
+        # perturbed value is what mutates its offspring's weights - so selection
+        # tunes the mutation rate itself, no hand-set schedule. the log-sigma
+        # lives in one buffer per lora target (down and up factor), each shaped
+        # so it broadcasts against that target's weights; `sigma_granularity`
+        # picks the finest structure the step size is tracked at:
+        #
+        #   'pop'    one per individual, shared across the whole genome
+        #   'lora'   one per individual per LoRA adapter (down/up pair share it)
+        #   'rank'   one per individual per singular-value direction
+        #   'weight' one per individual per parameter (every element of every
+        #            LoRA matrix) - roughly doubles the population's storage
+        #
+        # default tau is the textbook 1 / sqrt(2 * sqrt(n_params)), clamped to
+        # stay responsive on small networks
+
+        self.adaptive_epsilon = adaptive_epsilon
+        self.sigma_granularity = sigma_granularity
+        self.epsilon_init = epsilon_init
+        self.epsilon_floor = math.log(epsilon_floor)
+        self.epsilon_cap = math.log(epsilon_cap)
+
+        if exists(epsilon_tau):
+            self.epsilon_tau = epsilon_tau
+        else:
+            n_params = sum(w.numel() for w in (*self.weight_down.values(), *self.weight_up.values())) // pop_size
+            self.epsilon_tau = min(0.3, max(0.05, 1. / (2 * n_params) ** 0.25))
+
+        # 'pop' / 'lora' / 'rank' keep a single tensor per adapter shared between
+        # the down and up factor (and, for 'pop', one tensor for every adapter),
+        # so one perturb / recombine / reset covers the whole genome
+
+        self._log_sigma_down = ParameterDict()
+        self._log_sigma_up = ParameterDict()
+
+        shared_sigma = None
+
+        for key, w_down, w_up in zip(self.weight_down.keys(), self.weight_down.values(), self.weight_up.values()):
+            if sigma_granularity == 'pop':
+                shared_sigma = default(shared_sigma, _sigma_param(torch.full((self.pop_size, 1, 1), math.log(epsilon_init), device = self.device)))
+                sigma_down = sigma_up = shared_sigma
+            elif sigma_granularity == 'lora':
+                sigma_down = sigma_up = _sigma_param(torch.full((self.pop_size, 1, 1), math.log(epsilon_init), device = self.device))
+            elif sigma_granularity == 'rank':
+                sigma_down = sigma_up = _sigma_param(torch.full((self.pop_size, 1, w_down.shape[-1]), math.log(epsilon_init), device = self.device))
+            elif sigma_granularity == 'weight':
+                sigma_down = _sigma_param(torch.full(w_down.shape, math.log(epsilon_init), device = self.device))
+                sigma_up = _sigma_param(torch.full(w_up.shape, math.log(epsilon_init), device = self.device))
+            else:
+                raise ValueError(f'unknown sigma_granularity {sigma_granularity!r} - choose from "pop", "lora", "rank", "weight"')
+
+            self._log_sigma_down[key] = sigma_down
+            self._log_sigma_up[key] = sigma_up
+
         if exists(device):
             self.to(device)
 
@@ -292,6 +372,12 @@ class Population(_LoRAMixin):
             lora_targets = list(self.lora_targets),
             dtype = self._dtype
         )
+
+        if self.adaptive_epsilon:
+            pkg['sigma'] = dict(
+                down = {key: log_sigma.clone() for key, log_sigma in self._log_sigma_down.items()},
+                up = {key: log_sigma.clone() for key, log_sigma in self._log_sigma_up.items()},
+            )
 
         if save_base_model:
             pkg['model'] = self.model.state_dict()
@@ -314,6 +400,21 @@ class Population(_LoRAMixin):
 
         self.weight_down.load_state_dict(pkg['weight_down'], strict = strict)
         self.weight_up.load_state_dict(pkg['weight_up'], strict = strict)
+
+        if self.adaptive_epsilon and 'sigma' in pkg:
+            sigma = pkg['sigma']
+
+            # a plain tensor (or flat per-key dict) is a legacy checkpoint of
+            # the shared scalar step size - broadcast it into every buffer
+
+            if isinstance(sigma, dict):
+                down, up = (sigma['down'], sigma['up']) if 'down' in sigma else (sigma, sigma)
+            else:
+                down = up = {key: sigma for key in self._log_sigma_down.keys()}
+
+            for key in self._log_sigma_down.keys():
+                self._log_sigma_down[key].data.copy_(down[key].to(self.device).broadcast_to(self._log_sigma_down[key].shape))
+                self._log_sigma_up[key].data.copy_(up[key].to(self.device).broadcast_to(self._log_sigma_up[key].shape))
 
         # a fresh set of adapters re-anchors the population - a prior merge no
         # longer taints routed forwards
@@ -420,7 +521,7 @@ class Population(_LoRAMixin):
 
         specs = [
             (name, value) for name, value in eligible.items()
-            if isinstance(value, (dict, PerTarget)) and (name in knobs or isinstance(value, PerTarget))
+            if isinstance(value, (dict, PerTarget)) and (name in knobs or isinstance(value, PerTarget)) and not _is_sigma_map(value)
         ]
 
         if len(specs) == 0:
@@ -709,6 +810,10 @@ class Population(_LoRAMixin):
             w_down.data.copy_(w_down.data[new_arrangement])
             w_up.data.copy_(w_up.data[new_arrangement])
 
+        if self.adaptive_epsilon:
+            for log_sigma in self._sigma_tensors():
+                log_sigma.data.copy_(log_sigma.data[new_arrangement])
+
         return self
 
     @torch.no_grad()
@@ -735,6 +840,8 @@ class Population(_LoRAMixin):
         elif isinstance(islands, Tensor):
             islands = islands.tolist()
 
+        island_size = self.pop_size // num_islands
+
         for island_idx in islands:
             reinit_fn(
                 population = self,
@@ -743,6 +850,10 @@ class Population(_LoRAMixin):
                 fitnesses = fitnesses,
                 **kwargs
             )
+
+            if self.adaptive_epsilon:
+                island_indices = torch.arange(island_size, device = self.device) + island_idx * island_size
+                self._sigma_reset_(island_indices)
 
         return self
 
@@ -865,6 +976,8 @@ class Population(_LoRAMixin):
             self.weight_down[key].data[individuals] = w_down.to(self._dtype)
             self.weight_up[key].data[individuals] = w_up.to(self._dtype)
 
+        self._sigma_reset_(individuals)
+
         return self
 
     reinit_individuals = reinit_individuals_
@@ -906,6 +1019,62 @@ class Population(_LoRAMixin):
         return self
 
     regularize = regularize_
+
+    # per-individual mutation step size (log-normal self-adaptation) - `epsilon`
+    # for the mutation operators becomes a per-individual tensor, or a per-target
+    # map of (down, up) pairs at `sigma_granularity` finer than 'pop', drawn from
+    # a log-sigma that lives inside the genome: perturbed when an individual
+    # mutates in place, recombined from its parents (geometric mean) when it is
+    # (re)born through crossover, selected along with the weights it shaped
+
+    def _sigma_tensors(self):
+        # the unique step-size buffers - 'pop' / 'lora' / 'rank' share a single
+        # tensor between the down and up factor (and, for 'pop', across every
+        # adapter), so a perturb / recombine / reset touches each logical sigma
+        # exactly once instead of double-drawing its noise
+
+        seen = set()
+
+        for tensors in (self._log_sigma_down, self._log_sigma_up):
+            for log_sigma in tensors.values():
+                if id(log_sigma) not in seen:
+                    seen.add(id(log_sigma))
+                    yield log_sigma
+
+    def _sigma_perturb_(self, indices: Tensor):
+        if not self.adaptive_epsilon:
+            return self
+
+        for log_sigma in self._sigma_tensors():
+            log_sigma.data[indices] = (log_sigma[indices] + self.epsilon_tau * torch.randn_like(log_sigma[indices])).clamp(self.epsilon_floor, self.epsilon_cap)
+        return self
+
+    def _sigma_recombine_(self, children: Tensor, parents: Tensor):
+        if not self.adaptive_epsilon:
+            return self
+
+        # geometric mean of the parents' step sizes, perturbed log-normally -
+        # `parents` is (C, P); a single parent (clone crossover) passes its
+        # step size straight through. every granularity broadcasts the same way
+
+        for log_sigma in self._sigma_tensors():
+            parent_log_sigma = log_sigma[parents].mean(dim = 1)     # (C, ...)
+            log_sigma.data[children] = (parent_log_sigma + self.epsilon_tau * torch.randn_like(parent_log_sigma)).clamp(self.epsilon_floor, self.epsilon_cap)
+        return self
+
+    def _sigma_epsilon_(self, indices: Tensor) -> dict:
+        # per-target (down, up) step-size pair, ready for the mutation operators
+
+        return {
+            key: (torch.exp(self._log_sigma_down[key][indices]), torch.exp(self._log_sigma_up[key][indices]))
+            for key in self.weight_down.keys()
+        }
+
+    def _sigma_reset_(self, indices: Tensor):
+        if self.adaptive_epsilon:
+            for log_sigma in self._sigma_tensors():
+                log_sigma.data[indices] = math.log(self.epsilon_init)
+        return self
 
     @torch.no_grad()
     def evolve_(
@@ -967,6 +1136,10 @@ class Population(_LoRAMixin):
             num_groups = num_groups,
             **kwargs
         )
+
+        if self.adaptive_epsilon:
+            self._sigma_recombine_(result.culled, parents)
+            epsilon = self._sigma_epsilon_(result.culled)
 
         self.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses, **kwargs) \
             .mutate_(mutation_type, individuals = result.culled, epsilon = epsilon, **kwargs) \

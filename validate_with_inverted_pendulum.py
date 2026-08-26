@@ -56,6 +56,9 @@ def run_inverted_pendulum_experiment(
     dtype: str = 'float32',
     seed: int = 42,
     verbose: bool = False,
+    survive_frac: float = 0.5,
+    elite_frac: float = 0.25,
+    crossover_type: str = 'extrapolative',
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -103,9 +106,9 @@ def run_inverted_pendulum_experiment(
         progress = verbose,
         return_history = True,
         evolve_kwargs = dict(
-            survive_frac = 0.5,
-            elite_frac = 0.25,
-            crossover_type = 'extrapolative',
+            survive_frac = survive_frac,
+            elite_frac = elite_frac,
+            crossover_type = crossover_type,
             epsilon = epsilon,
         ),
     )

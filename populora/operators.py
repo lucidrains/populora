@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import torch
-from torch import Tensor, cat
+from torch import Tensor, cat, is_tensor
 import torch.nn.functional as F
 from torch.linalg import qr, svd
 
@@ -77,6 +77,16 @@ def _noise_like(w, epsilon):
 
     return epsilon * w.std(dim = (1, 2), keepdim = True) * _normal_noise(w.shape, w.device)
 
+def _resolve_epsilon(epsilon, key):
+    # epsilon may be a scalar or per-individual tensor (applied to every
+    # target), or a dict keyed by lora target with the (down, up) step-size pair
+    # per target - the adaptive-epsilon (self-adaptation) output. returns the
+    # (down, up) pair, down and up sharing a value when they share a sigma
+
+    if isinstance(epsilon, dict):
+        return epsilon[key]
+    return epsilon, epsilon
+
 # mutations
 
 MUTATION_REGISTRY = dict()
@@ -101,22 +111,37 @@ def mutation_svd_structured(
 ):
     device = population.device
 
-    for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
+    for key, weight_down in population.weight_down.items():
+        weight_up = population.weight_up[key]
         dtype = weight_down.dtype
         w_down = weight_down.data[idx].float()
         w_up = weight_up.data[idx].float()
+
+        eps_down, eps_up = _resolve_epsilon(epsilon, key)
+
+        # step sizes finer than the rank collapse onto the singular-value axis
+        # the mutation works in (mean over the free dim); rotations take the
+        # mean step size, like the SVD self-adaptation of bench_adaptive_mutation
+
+        sig = 0.5 * (eps_down.float() + eps_up.float()) if is_tensor(eps_down) else eps_down
+
+        if is_tensor(sig):
+            sig = sig.mean(dim = 1, keepdim = True)
+            rot_eps = sig.mean(dim = -1, keepdim = True)
+        else:
+            rot_eps = sig
 
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
 
         z = _normal_noise(S.shape, device)
-        S_new = S * torch.exp(epsilon * z)
+        S_new = S * torch.exp(sig * z)
 
         M_U = _normal_noise((*S.shape[:-1], r, r), device)
-        R_U = torch.eye(r, device = device) + epsilon * skew_symmetrize(M_U)
+        R_U = torch.eye(r, device = device) + rot_eps * skew_symmetrize(M_U)
 
         M_V = _normal_noise((*S.shape[:-1], r, r), device)
-        R_V = torch.eye(r, device = device) + epsilon * skew_symmetrize(M_V)
+        R_V = torch.eye(r, device = device) + rot_eps * skew_symmetrize(M_V)
 
         U_new = einsum(U, R_U, '... d r, ... r s -> ... d s')
         V_new = einsum(V, R_V, '... e r, ... r s -> ... e s')
@@ -153,14 +178,16 @@ def mutation_layer_selective_gaussian(
         if len(rows) == 0:
             continue
 
+        eps_down, eps_up = _resolve_epsilon(epsilon, key)
+
         w_down = population.weight_down[key]
         w_up = population.weight_up[key]
 
         w_down_rows = w_down.data[rows].float()
         w_up_rows = w_up.data[rows].float()
 
-        w_down_rows.add_(_noise_like(w_down_rows, epsilon))
-        w_up_rows.add_(_noise_like(w_up_rows, epsilon))
+        w_down_rows.add_(_noise_like(w_down_rows, eps_down))
+        w_up_rows.add_(_noise_like(w_up_rows, eps_up))
 
         w_down.data[rows] = w_down_rows.to(w_down.dtype)
         w_up.data[rows] = w_up_rows.to(w_up.dtype)
@@ -201,13 +228,16 @@ def mutation_full_gaussian(
     epsilon: float = 0.15,
     **kwargs
 ):
-    for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
+    for key, weight_down in population.weight_down.items():
+        weight_up = population.weight_up[key]
         dtype = weight_down.dtype
         w_down = weight_down.data[idx].float()
         w_up = weight_up.data[idx].float()
 
-        w_down.add_(_noise_like(w_down, epsilon))
-        w_up.add_(_noise_like(w_up, epsilon))
+        eps_down, eps_up = _resolve_epsilon(epsilon, key)
+
+        w_down.add_(_noise_like(w_down, eps_down))
+        w_up.add_(_noise_like(w_up, eps_up))
 
         weight_down.data[idx] = w_down.to(dtype)
         weight_up.data[idx] = w_up.to(dtype)
@@ -604,6 +634,10 @@ def _tier_reproduce(population, indices, sources, fitnesses, *, parent_selection
         **parent_kwargs
     )
 
+    if population.adaptive_epsilon:
+        population._sigma_recombine_(indices, parents)
+        epsilon = population._sigma_epsilon_(indices)
+
     population.crossover_(crossover_type, parents, indices, fitnesses = fitnesses, **kwargs)
     population.mutate_(mutation_type, individuals = indices, epsilon = epsilon, **kwargs)
 
@@ -611,6 +645,13 @@ def tier_rule_keep(population, indices, sources = None, top = None, fitnesses = 
     pass
 
 def tier_rule_mutate(population, indices, sources = None, top = None, fitnesses = None, mutation_type = 'full_gaussian', epsilon = 0.1, **kwargs):
+    # in-place mutation of the tier - with adaptive epsilon, each individual
+    # perturbs its own step size log-normally before its weights are mutated
+
+    if population.adaptive_epsilon:
+        population._sigma_perturb_(indices)
+        epsilon = population._sigma_epsilon_(indices)
+
     population.mutate_(mutation_type, individuals = indices, epsilon = epsilon, **kwargs)
 
 def tier_rule_replace(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
@@ -636,6 +677,7 @@ def tier_rule_crossover(population, indices, sources = None, top = None, fitness
 
 def tier_rule_reinit(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
     population.reinit_individuals_(indices)
+    population._sigma_reset_(indices)
 
 def tier_rule_archive(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
     # replay archived individuals into the tier - requires hof = HallOfFame(...)
@@ -652,6 +694,8 @@ def tier_rule_archive(population, indices, sources = None, top = None, fitnesses
             dict(weight_down = entry.weight_down, weight_up = entry.weight_up),
             individual = slot
         )
+
+    population._sigma_reset_(indices)
 
 register_tier_rule('keep', tier_rule_keep)
 register_tier_rule('mutate', tier_rule_mutate)
