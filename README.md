@@ -38,6 +38,8 @@ pop.crossover_('average', parents, result.selected_out_indices)  # offspring ove
 pop.mutate_('full_gaussian', individuals = result.selected_out_indices)
 
 model = pop.merge_(fitnesses.argmax())  # merge the best individual back in
+
+pop.save_individual('best.pt', fitnesses.argmax())  # or save just the best individual's weights
 ```
 
 `pop.evolve_(fitnesses)` runs selection, parent selection, crossover, and mutation in one step. Batch evaluation also supports `pop(x, individuals = [ids])` to route each sample to its own individual.
@@ -203,7 +205,14 @@ coevolve = Coevolve(populations = dict(
 for gen in range(100):
     fitnesses = coevolve.step()
     solver_hof.add_champion(solver, fitnesses['solver'], generation = gen)
+
+# when it is over, pluck each population's champion
+
+for name in fitnesses:
+    coevolve[name].save_individual(f'winners/{name}.pt', fitnesses[name].argmax())
 ```
+
+Any individual can be saved by index (`save_individual(path, 3)`), loaded back into a population slot (`load_individual`), and the whole population rebuilt with `Population.from_checkpoint`. `demo_coevolve_three.py` runs the same loop with a third population - a `judge` that learns to predict the solver's errors - and shows the winners of all three falling out the same way.
 
 `coevolve.history` records the best / mean fitness per population; `coevolve.step(distributed = True)` splits the probes across ranks (round-robin, outputs broadcast raw). Probes must form a chain — a probe depending on its own outputs raises at construction; only fitnesses may close a circle, since every population is probed before any fitness is derived.
 
