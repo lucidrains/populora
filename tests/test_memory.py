@@ -8,11 +8,9 @@ from torch import nn
 from populora import Memory, interact_with_env
 from populora.memory import init_memory_tensor
 
-# the counting policy emits the carried memory value as its action, and
-# increments the memory every step - so an episode's return is the triangular
-# number of its length, and any failure to thread / reset the memory changes
-# the returns in a predictable way. the dummy projection exists only so the
-# population has a Linear layer to attach lora to
+# the counting policy emits the carried memory value as its action and
+# increments the memory every step - an episode's return is the triangular
+# number of its length, so any threading / reset failure changes returns
 
 class CountingPolicy(nn.Module):
     def __init__(self, obs_dim = 4):

@@ -7,22 +7,13 @@ import torch
 from torch import Tensor, is_tensor
 from torch.nn import Module, ModuleDict
 
-from populora._utils import default, exists
+from populora._utils import default, exists, torch_save
 from populora.distributed import broadcast_object, distributed_rank, distributed_world_size, is_distributed, preserve_rng
 from populora.population import Population, Populations, PopuLoRA
 
-# coevolution - multiple populations whose fitnesses derive from one another's outputs.
-#
-# each population supplies a `probe` (produces its outputs for a step) and a `fitness`
-# function (scores it). parameters are injected from the function signatures:
-#
-#   - a parameter named after a population receives that population's outputs,
-#     computed once per step, in dependency order (a solver probed on the proposer's
-#     outputs runs after the proposer)
-#   - `coevolve`, `generation` / `gen`, and `pop` are injected as well
-#   - parameters with defaults are left alone
-#
-# probes are evaluated in dependency order - circular probe dependencies raise an error
+# coevolution - populations whose fitnesses derive from one another's outputs.
+# each has a probe (outputs) and a fitness fn; parameters are injected from the
+# signature: population names, coevolve, generation / gen, and pop
 
 def _param_deps(fn):
     # the non-default parameter names of a probe / fitness fn
@@ -272,11 +263,9 @@ class Coevolve(Module):
 
     @torch.no_grad()
     def _compute_outputs_distributed(self, order):
-        # each rank evaluates its share of the populations (round-robin, in
-        # dependency order) and the outputs are broadcast, so every rank ends
-        # with all of them. probe noise is drawn under a preserved rng so the
-        # evolution stays in sync. tensor outputs are broadcast raw - much
-        # cheaper than pickling - with a pickled fallback for anything else
+        # distributed probes - round-robin ownership in dependency order, outputs
+        # broadcast (tensors raw, else pickled) under a preserved rng, so every
+        # rank ends with all of them and the evolution stays in sync
 
         world_size = distributed_world_size()
         outputs = dict()
@@ -407,9 +396,7 @@ class Coevolve(Module):
 
     @torch.no_grad()
     def save(self, path: str | Path, save_base_model: bool = True):
-        path = Path(path)
-        path.parent.mkdir(parents = True, exist_ok = True)
-        torch.save(self.state_dict_pkg(save_base_model = save_base_model), path)
+        torch_save(self.state_dict_pkg(save_base_model = save_base_model), path)
         return self
 
     @torch.no_grad()

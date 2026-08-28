@@ -20,6 +20,7 @@ from populora.population import (
     PopuLoRA,
     evolve,
     init_lora_weights,
+    linear_layer_paths,
 )
 from populora.coevolve import Coevolve
 from populora.operators import (

@@ -12,10 +12,11 @@ from torch import Tensor, atleast_1d, cat, is_tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 
+from einx import get_at, set_at
 from einops import einsum, rearrange, repeat
 from torch_einops_utils import batched_index_select, temp_eval, tree_map_tensor, z_score
 
-from populora._utils import cast_tensor, default, divisible_by, exists, extract_dict, first, has_, maybe_cast_tuple, maybe_progress, resolve_dtype
+from populora._utils import cast_tensor, default, divisible_by, exists, extract_dict, first, has_, maybe_cast_tuple, maybe_progress, resolve_dtype, torch_save
 from populora.distributed import distributed_device, evaluate_population_distributed, is_distributed
 from populora.operators import (
     CROSSOVER_REGISTRY,
@@ -27,6 +28,7 @@ from populora.operators import (
     TIER_RULE_REGISTRY,
     TieredResult,
     SelectionResult,
+    reinit_es,
     with_elites,
 )
 
@@ -39,15 +41,18 @@ def linear_layer_paths(model: Module) -> list[str]:
         if isinstance(module, Linear)
     ]
 
-def init_lora_weights(pop_size, dim, dim_inner, rank, device = None, dtype = None):
+def init_lora_weights(pop_size, dim, dim_inner, rank, device = None, dtype = None, std_down = None, std_up = None):
     # weights are drawn in float32 and cast down - quantization happens once at
     # the storage boundary instead of corrupting the init noise itself
+
+    std_d = default(std_down, dim ** -0.5)
+    std_u = default(std_up, rank ** -0.5)
 
     w_down = torch.empty(pop_size, dim, rank, device = device)
     w_up = torch.empty(pop_size, dim_inner, rank, device = device)
 
-    init.normal_(w_down, std = dim ** -0.5)
-    init.normal_(w_up, std = rank ** -0.5)
+    init.normal_(w_down, std = std_d)
+    init.normal_(w_up, std = std_u)
 
     if exists(dtype):
         w_down = w_down.to(dtype)
@@ -66,6 +71,30 @@ def _resolve_fn(type_or_fn, registry, kind):
 
 def _lora_delta(w_down, w_up):
     return einsum(w_up.float(), w_down.float(), 'e r, d r -> e d')
+
+def _adapter_key(path):
+    # the storage key for a dotted module path - suffixed with the module name,
+    # as keys in weight_down / weight_up / the sigma buffers
+
+    return path.replace('.', '_')
+
+def _merge_adapter(linear, w_down, w_up, individual = None):
+    # add one individual's (or an unbroadcast whole) adapter into a Linear's weight
+    # `individual` is an integer index - the caller resolves tensors beforehand
+
+    if exists(individual):
+        w_down = w_down[individual]
+        w_up = w_up[individual]
+
+    delta = _lora_delta(w_down, w_up)
+    linear.weight.add_(delta.to(linear.weight.dtype))
+
+def _iter_adapters(population):
+    # (path, storage key, w_down, w_up) per lora target, paths dotted as in `lora_targets`
+
+    for path in population.lora_targets:
+        key = _adapter_key(path)
+        yield path, key, population.weight_down[key], population.weight_up[key]
 
 def _sigma_param(tensor):
     # wrap a step-size buffer as a parameter once - shared buffers ('pop' /
@@ -98,12 +127,12 @@ def _expand_batch(t, p):
 
     return t
 
-# per-target operator params - mutation_type, epsilon, and crossover_type (and,
-# via PerTarget, any operator kwarg) may be given as a dict keyed by lora
-# target instead of a scalar. keys match a target's dotted module path or its
-# storage key exactly, else by glob pattern ('*' wildcards, first match wins in
-# insertion order); a 'default' or '*' entry catches everything left. every
-# explicit key must match at least one target, and coverage must be total
+def _at(values, indices):
+    return get_at('[p], k -> k', values, indices) if len(indices) > 0 else values[:0]
+
+# per-target operator params - mutation_type / epsilon / crossover_type (or any
+# kwarg via PerTarget) may be a dict keyed by lora target or glob; a 'default'
+# or '*' entry catches the rest, and every explicit key must match a target
 
 _DEFAULT_SPEC_KEYS = ('default', '*')
 
@@ -206,9 +235,8 @@ class _LoRAMixin(Module):
 
         assert not self._merged, 'population was merged into its base model - the lora deltas are baked into the weights, and routing forwards through the population would apply them a second time. re-anchor first (repopulate_ / reinit_individuals_)'
 
-        for path in self.lora_targets:
+        for path, key, _, _ in _iter_adapters(self):
             linear = self.model.get_submodule(path)
-            key = path.replace('.', '_')
             self._hooks.append(linear.register_forward_hook(self._create_hook(key)))
 
         self._hooks_registered = True
@@ -288,7 +316,7 @@ class Population(_LoRAMixin):
             linear = model.get_submodule(path)
             assert isinstance(linear, Linear), f'{path} must point to a Linear module'
 
-            key = path.replace('.', '_')
+            key = _adapter_key(path)
             dim, dim_inner = linear.in_features, linear.out_features
 
             w_down, w_up = init_lora_weights(pop_size, dim, dim_inner, low_rank, device = device, dtype = self._dtype)
@@ -300,24 +328,11 @@ class Population(_LoRAMixin):
         self._individual = None
         self._eval_seed = eval_seed
 
-        # per-individual mutation step size (log-normal self-adaptation,
-        # Schwefel 1981 / Beyer 2001): each individual carries its own mutation
-        # strength in log space, inherited from its parents (geometric mean,
-        # `_sigma_recombine_`) or perturbed in place (`_sigma_perturb_`), and the
-        # perturbed value is what mutates its offspring's weights - so selection
-        # tunes the mutation rate itself, no hand-set schedule. the log-sigma
-        # lives in one buffer per lora target (down and up factor), each shaped
-        # so it broadcasts against that target's weights; `sigma_granularity`
-        # picks the finest structure the step size is tracked at:
-        #
-        #   'pop'    one per individual, shared across the whole genome
-        #   'lora'   one per individual per LoRA adapter (down/up pair share it)
-        #   'rank'   one per individual per singular-value direction
-        #   'weight' one per individual per parameter (every element of every
-        #            LoRA matrix) - roughly doubles the population's storage
-        #
-        # default tau is the textbook 1 / sqrt(2 * sqrt(n_params)), clamped to
-        # stay responsive on small networks
+        self.register_buffer('_ages', torch.zeros(self.pop_size, dtype = torch.long)) # per-individual age in generations, 0 at birth
+
+        # per-individual log-normal step size (Schwefel/Beyer) - inherited by
+        # geometric mean, perturbed in place, selected with the weights it
+        # shaped; granularity 'pop'/'lora'/'rank'/'weight', tau clamped
 
         self.adaptive_epsilon = adaptive_epsilon
         self.sigma_granularity = sigma_granularity
@@ -370,7 +385,8 @@ class Population(_LoRAMixin):
             pop_size = self.pop_size,
             low_rank = self.low_rank,
             lora_targets = list(self.lora_targets),
-            dtype = self._dtype
+            dtype = self._dtype,
+            ages = self._ages.clone()
         )
 
         if self.adaptive_epsilon:
@@ -386,9 +402,7 @@ class Population(_LoRAMixin):
 
     @torch.no_grad()
     def save(self, path: str | Path, save_base_model: bool = True):
-        path = Path(path)
-        path.parent.mkdir(parents = True, exist_ok = True)
-        torch.save(self.state_dict_pkg(save_base_model = save_base_model), path)
+        torch_save(self.state_dict_pkg(save_base_model = save_base_model), path)
         return self
 
     @torch.no_grad()
@@ -415,6 +429,9 @@ class Population(_LoRAMixin):
             for key in self._log_sigma_down.keys():
                 self._log_sigma_down[key].data.copy_(down[key].to(self.device).broadcast_to(self._log_sigma_down[key].shape))
                 self._log_sigma_up[key].data.copy_(up[key].to(self.device).broadcast_to(self._log_sigma_up[key].shape))
+
+        if 'ages' in pkg:
+            self._ages.data.copy_(pkg['ages'].to(self.device))
 
         # a fresh set of adapters re-anchors the population - a prior merge no
         # longer taints routed forwards
@@ -461,9 +478,7 @@ class Population(_LoRAMixin):
             weight_up = {key: weight.clone() for key, weight in weight_up.items()}
         )
 
-        path = Path(path)
-        path.parent.mkdir(parents = True, exist_ok = True)
-        torch.save(pkg, path)
+        torch_save(pkg, path)
         return self
 
     @torch.no_grad()
@@ -509,12 +524,14 @@ class Population(_LoRAMixin):
         # shared eval seed, auto-synced across ranks - None disables
         return self._eval_seed
 
+    @property
+    def ages(self):
+        return self._ages.clone() # generations each individual has survived
+
     def _target_groups(self, knobs, kwargs):
-        # group lora targets by resolved per-target params - among `knobs`
-        # (the canonical params accepting bare dicts, layered over kwargs) and
-        # kwargs itself, any bare dict or PerTarget-wrapped value makes that
-        # param vary per lora target. returns None when nothing varies (scalar
-        # fast path), else [(target keys, resolved kwargs)] per group
+        # group targets by resolved per-target params - a bare dict or PerTarget
+        # (non-tensor values) makes that param vary per target; None when nothing
+        # varies (scalar fast path), else [(target keys, resolved kwargs)]
 
         eligible = dict(kwargs)
         eligible.update(knobs)
@@ -527,7 +544,7 @@ class Population(_LoRAMixin):
         if len(specs) == 0:
             return None
 
-        dotted = {path.replace('.', '_'): path for path in self.lora_targets}
+        dotted = {_adapter_key(path): path for path in self.lora_targets}
         assignments = [_target_spec_assignments(spec, dotted, name) for name, spec in specs]
         spec_names = [name for name, _ in specs]
 
@@ -614,6 +631,9 @@ class Population(_LoRAMixin):
         survive_frac: float = 0.5,
         elite_frac: float = 0.10,
         num_groups: int = 1,
+        max_age: int | None = None, # hard retirement past a max lifetime - https://arxiv.org/abs/2109.13744
+        elite_max_age: int | None = None, # elite-only tenure cap - https://ieeexplore.ieee.org/document/573957
+        aging_decay: float | None = None, # fitness discounted by decay ** age - https://doi.org/10.1145/1569901.1570012
         **kwargs
     ):
         assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
@@ -626,6 +646,12 @@ class Population(_LoRAMixin):
         num_survivors = max(1, int(group_size * survive_frac))
         num_elites = max(1, int(group_size * elite_frac)) if elite_frac > 0. else 0
         all_indices = torch.arange(group_size, device = self.device)
+
+        if exists(max_age) or exists(elite_max_age) or exists(aging_decay):
+            return self._select_aging_(
+                select_fn, fitnesses, num_survivors, num_elites, num_groups,
+                group_size, max_age, elite_max_age, aging_decay, **kwargs
+            )
 
         select_fn = with_elites(select_fn, elite_frac)
 
@@ -669,6 +695,124 @@ class Population(_LoRAMixin):
             rearrange(culled, 'g c -> (g c)'),
             rearrange(elites, 'g e -> (g e)')
         )
+
+    @torch.no_grad()
+    def _select_aging_(
+        self,
+        select_fn,
+        fitnesses: Tensor,
+        num_survivors: int,
+        num_elites: int,
+        num_groups: int,
+        group_size: int,
+        max_age,
+        elite_max_age,
+        aging_decay,
+        **kwargs
+    ):
+        # aging-aware selection - the age knobs filter the selection pool
+
+        assert max_age is None or max_age > 0, 'max_age must be positive'
+        assert elite_max_age is None or elite_max_age > 0, 'elite_max_age must be positive'
+        assert aging_decay is None or 0. < aging_decay <= 1., 'aging_decay must be in (0, 1]'
+
+        ages = self._ages
+        device = fitnesses.device
+
+        scores = fitnesses * aging_decay ** ages.float() if exists(aging_decay) else fitnesses
+
+        survivor_lists, culled_lists, elite_lists = [], [], []
+
+        for g in range(num_groups):
+            start = g * group_size
+
+            idx = torch.arange(group_size, device = device) + start
+
+            # retirement - prune the old before selection
+            if exists(max_age):
+                keep = torch.nonzero(~_at(ages >= max_age, idx)).flatten()
+                idx = _at(idx, keep)
+
+            # sort best first; elites are the top slice
+            order = _at(scores, idx).argsort(descending = True)
+            idx = _at(idx, order)
+
+            if exists(elite_max_age):
+                ok = torch.nonzero(_at(ages < elite_max_age, idx)).flatten()[:num_elites]
+                elite = _at(idx, ok)
+            else:
+                elite = idx[:num_elites]
+
+            elite = elite[:num_survivors]
+
+            other = torch.nonzero(~torch.isin(idx, elite)).flatten()
+            idx_other = _at(idx, other) if len(other) > 0 else idx[:0]
+
+            num_rest = min(num_survivors - len(elite), len(idx_other)) if len(idx_other) > 0 else 0
+
+            if num_rest > 0:
+                sel = select_fn(_at(scores, idx_other), num_rest, **kwargs)
+                rest = _at(idx_other, sel)
+            else:
+                rest = idx[:0]
+
+            survivors = cat((elite, rest))
+            survivor_lists.append(survivors)
+            elite_lists.append(elite)
+
+            # culled - every non-survivor of the group
+            all_idx = torch.arange(group_size, device = device) + start
+            culled = all_idx[~torch.isin(all_idx, survivors)] if len(survivors) < group_size else all_idx[:0]
+            culled_lists.append(culled)
+
+        return SelectionResult(
+            cat(survivor_lists),
+            cat(culled_lists),
+            cat(elite_lists)
+        )
+
+    @torch.no_grad()
+    def _retire_refill_es_(
+        self,
+        indices: Tensor,
+        fitnesses: Tensor,
+        num_groups: int = 1,
+        eta: float = 1.0,
+        elite_frac: float = 0.25,
+        noise_std_min: float = 1e-5
+    ):
+        # refill retired slots from the island-ES update - delegate per island
+        # to the same operator used by island reinitialization, touching only
+        # the retired subset
+
+        assert divisible_by(self.pop_size, num_groups)
+
+        if len(indices) == 0:
+            return self
+
+        group_size = self.pop_size // num_groups
+
+        for g in range(num_groups):
+            island = torch.arange(group_size, device = self.device) + g * group_size
+            refill = indices[torch.isin(indices, island)]
+
+            if len(refill) == 0:
+                continue
+
+            reinit_es(
+                self,
+                island_idx = g,
+                num_islands = num_groups,
+                fitnesses = fitnesses,
+                refill = refill,
+                eta = eta,
+                elite_frac = elite_frac,
+                noise_std_min = noise_std_min
+            )
+
+            self._sigma_reset_(refill)
+
+        return self
 
     @torch.no_grad()
     def select_parents(
@@ -794,12 +938,8 @@ class Population(_LoRAMixin):
         assert num_islands > 1, 'migration requires more than one island'
         assert divisible_by(self.pop_size, num_islands), 'pop_size must be divisible by num_islands'
 
-        if isinstance(migration_type_or_fn, str):
-            migration_registry = default(self.migration_registry, MIGRATION_REGISTRY)
-            assert migration_type_or_fn in migration_registry, f'unknown migration type {migration_type_or_fn}'
-            migration_fn = migration_registry[migration_type_or_fn]
-        else:
-            migration_fn = migration_type_or_fn
+        migration_registry = default(self.migration_registry, MIGRATION_REGISTRY)
+        migration_fn = _resolve_fn(migration_type_or_fn, migration_registry, 'migration')
 
         new_arrangement = migration_fn(fitnesses, num_islands, **kwargs)
 
@@ -813,6 +953,8 @@ class Population(_LoRAMixin):
         if self.adaptive_epsilon:
             for log_sigma in self._sigma_tensors():
                 log_sigma.data.copy_(log_sigma.data[new_arrangement])
+
+        self._ages.data.copy_(_at(self._ages, new_arrangement))
 
         return self
 
@@ -828,12 +970,8 @@ class Population(_LoRAMixin):
         assert num_islands > 1, 'num_islands must be > 1'
         assert divisible_by(self.pop_size, num_islands), 'pop_size must be divisible by num_islands'
 
-        if isinstance(reinit_type_or_fn, str):
-            reinit_registry = default(self.island_reinit_registry, ISLAND_REINIT_REGISTRY)
-            assert reinit_type_or_fn in reinit_registry, f'unknown island reinit type {reinit_type_or_fn}'
-            reinit_fn = reinit_registry[reinit_type_or_fn]
-        else:
-            reinit_fn = reinit_type_or_fn
+        reinit_registry = default(self.island_reinit_registry, ISLAND_REINIT_REGISTRY)
+        reinit_fn = _resolve_fn(reinit_type_or_fn, reinit_registry, 'island reinit')
 
         if isinstance(islands, int):
             islands = [islands]
@@ -886,11 +1024,9 @@ class Population(_LoRAMixin):
         if is_tensor(individual):
             individual = individual.item()
 
-        for path in self.lora_targets:
+        for path, key, w_down, w_up in _iter_adapters(self):
             linear = self.model.get_submodule(path)
-            key = path.replace('.', '_')
-            delta = _lora_delta(self.weight_down[key][individual], self.weight_up[key][individual])
-            linear.weight.add_(delta.to(linear.weight.dtype))
+            _merge_adapter(linear, w_down, w_up, individual)
 
         self.remove_hooks()
         self._merged = True
@@ -932,11 +1068,10 @@ class Population(_LoRAMixin):
 
         weights = F.softmax(topk_fitnesses / temperature, dim = -1)
 
-        for path in self.lora_targets:
+        for path, key, w_down, w_up in _iter_adapters(self):
             linear = self.model.get_submodule(path)
-            key = path.replace('.', '_')
-            w_down_topk = self.weight_down[key][topk_indices].float()
-            w_up_topk = self.weight_up[key][topk_indices].float()
+            w_down_topk = w_down[topk_indices].float()
+            w_up_topk = w_up[topk_indices].float()
 
             delta = einsum(weights, w_up_topk, w_down_topk, 'k, k e r, k d r -> e d')
             linear.weight.add_(delta.to(linear.weight.dtype))
@@ -959,24 +1094,19 @@ class Population(_LoRAMixin):
         individuals = cast_tensor(individuals, device = self.device)
         self._merged = False
 
-        for path in self.lora_targets:
+        for path, key, w_down, w_up in _iter_adapters(self):
             linear = self.model.get_submodule(path)
-            key = path.replace('.', '_')
             dim, dim_inner = linear.in_features, linear.out_features
-            low_rank = self.weight_down[key].shape[-1]
+            low_rank = w_down.shape[-1]
 
-            std_d = default(std_down, dim ** -0.5)
-            std_u = default(std_up, low_rank ** -0.5)
+            w_down, w_up = init_lora_weights(len(individuals), dim, dim_inner, low_rank, device = self.device, dtype = self._dtype, std_down = std_down, std_up = std_up)
 
-            w_down = torch.empty(len(individuals), dim, low_rank, device = self.device)
-            w_up = torch.empty(len(individuals), dim_inner, low_rank, device = self.device)
-            w_down.normal_(std = std_d)
-            w_up.normal_(std = std_u)
-
-            self.weight_down[key].data[individuals] = w_down.to(self._dtype)
-            self.weight_up[key].data[individuals] = w_up.to(self._dtype)
+            self.weight_down[key].data[individuals] = w_down
+            self.weight_up[key].data[individuals] = w_up
 
         self._sigma_reset_(individuals)
+
+        self._ages.data.copy_(set_at('[p], k, k -> [p]', self._ages, individuals, torch.zeros_like(individuals)))
 
         return self
 
@@ -1020,18 +1150,13 @@ class Population(_LoRAMixin):
 
     regularize = regularize_
 
-    # per-individual mutation step size (log-normal self-adaptation) - `epsilon`
-    # for the mutation operators becomes a per-individual tensor, or a per-target
-    # map of (down, up) pairs at `sigma_granularity` finer than 'pop', drawn from
-    # a log-sigma that lives inside the genome: perturbed when an individual
-    # mutates in place, recombined from its parents (geometric mean) when it is
-    # (re)born through crossover, selected along with the weights it shaped
+    # per-individual mutation step size - `epsilon` becomes a per-individual
+    # tensor, or a per-target (down, up) map at granularity finer than 'pop',
+    # driven by the log-sigma carried in the genome
 
     def _sigma_tensors(self):
-        # the unique step-size buffers - 'pop' / 'lora' / 'rank' share a single
-        # tensor between the down and up factor (and, for 'pop', across every
-        # adapter), so a perturb / recombine / reset touches each logical sigma
-        # exactly once instead of double-drawing its noise
+        # the unique step-size buffers - each logical sigma is perturbed /
+        # recombined / reset once, never double-drawing its noise
 
         seen = set()
 
@@ -1097,9 +1222,15 @@ class Population(_LoRAMixin):
         novelty = None,
         burn_in = 0,
         gen = None,
+        max_age: int | None = None, # hard retirement past a max lifetime - https://arxiv.org/abs/2109.13744
+        elite_max_age: int | None = None, # elite-only tenure cap - https://ieeexplore.ieee.org/document/573957
+        aging_decay: float | None = None, # fitness discounted by decay ** age - https://doi.org/10.1145/1569901.1570012
+        retire_refill: str | None = None, # refill retired slots: 'crossover' (default), 'reinit', 'es'
         **kwargs
     ):
         assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+        assert retire_refill in (None, 'crossover', 'reinit', 'es'), f'unknown retire_refill {retire_refill!r} - choose from "crossover", "reinit", "es"'
+        assert not (exists(retire_refill) and not exists(max_age)), 'retire_refill requires max_age'
 
         tiered = tiered or exists(tiers)
 
@@ -1116,6 +1247,9 @@ class Population(_LoRAMixin):
                 epsilon = epsilon,
                 burn_in = burn_in,
                 gen = gen,
+                max_age = max_age,
+                elite_max_age = elite_max_age,
+                aging_decay = aging_decay,
                 **kwargs
             )
 
@@ -1125,8 +1259,23 @@ class Population(_LoRAMixin):
             survive_frac = survive_frac,
             elite_frac = elite_frac,
             num_groups = num_groups,
+            max_age = max_age,
+            elite_max_age = elite_max_age,
+            aging_decay = aging_decay,
             **kwargs
         )
+
+        # age-forced culls, captured before bookkeeping for later refill
+
+        retired = None
+        if exists(max_age):
+            retired = torch.nonzero(self._ages >= max_age).flatten()
+
+        # survivors age a generation, the culled are reborn
+
+        ages = set_at('[p], k, k -> [p]', self._ages, result.culled, torch.zeros_like(result.culled))
+        ages = set_at('[p], k, k -> [p]', ages, result.survivors, _at(ages, result.survivors) + 1)
+        self._ages.data.copy_(ages)
 
         parents = self.select_parents(
             parent_selection_type,
@@ -1144,6 +1293,16 @@ class Population(_LoRAMixin):
         self.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses, **kwargs) \
             .mutate_(mutation_type, individuals = result.culled, epsilon = epsilon, **kwargs) \
             .regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
+
+        if retire_refill is not None and exists(retired) and len(retired) > 0:
+            # 'crossover' is the default path - retired slots were already culled
+            # by select above, so no further handling happens here. only the
+            # alternate refill schemes act on the retired indices
+
+            if retire_refill == 'reinit':
+                self.reinit_individuals_(retired)
+            elif retire_refill == 'es':
+                self._retire_refill_es_(retired, fitnesses, num_groups = num_groups)
 
         return result
 
@@ -1187,17 +1346,14 @@ class Population(_LoRAMixin):
         epsilon = 0.1,
         burn_in: int = 0,
         gen: int | None = None,
+        max_age: int | None = None,
+        elite_max_age: int | None = None,
+        aging_decay: float | None = None,
         **kwargs
     ):
-        # tiered evolve - bin the population into quantile strata of an axis
-        # (fitness, novelty, or per-island fitness) and process each tier by its
-        # rule - keep / mutate / replace (top-tier clones + re-mutate) / crossover
-        # (children of higher tiers) / reinit / archive (hof replay). the default
-        # spec is the clone-and-perturb scheme of bench_tiered.py
-        #
-        # `burn_in` (an N_adapt-style pause) exempts individuals processed within
-        # the last `burn_in` generations from further processing, giving them time
-        # to adapt - requires `gen` (the caller's generation counter)
+        # tiered evolve - quantile strata of an axis (fitness / novelty / group),
+        # each tier with a rule: keep / mutate / replace / crossover / reinit /
+        # archive. `burn_in` skips recently-touched individuals (needs `gen`)
 
         tiers = default(tiers, _TIERED_DEFAULT_TIERS)
 
@@ -1212,6 +1368,11 @@ class Population(_LoRAMixin):
         # stratum axis - 'group' is per-island fitness, which the binning does anyway
 
         axis = novelty if strata == 'novelty' else fitnesses
+
+        if exists(aging_decay) and strata == 'fitness':
+            assert 0. < aging_decay <= 1., 'aging_decay must be in (0, 1]'
+            axis = axis * aging_decay ** self._ages.float()
+
         tier_bins = self._tier_bins(axis, tiers, num_groups)
         rules = [TIER_RULE_REGISTRY[rule] for _, rule in tiers]
 
@@ -1230,7 +1391,20 @@ class Population(_LoRAMixin):
             for i in range(1, len(tier_bins)):
                 tier_bins[i] = tier_bins[i][eligible[tier_bins[i]]]
 
-        top = tier_bins[0]
+        # aging: the elite cap demotes the aged, retirement rotates them into the replace tier
+
+        if exists(elite_max_age):
+            keep = tier_bins[0]
+            aged = get_at('[p], k -> k', self._ages, keep) >= elite_max_age
+            tier_bins[0] = keep[~aged]
+            tier_bins[1] = cat((tier_bins[1], keep[aged]))
+
+        if exists(max_age):
+            aged = self._ages >= max_age
+            retire = cat([tier_bins[i][aged[tier_bins[i]]] for i in range(len(tier_bins) - 1)])
+            tier_bins = [tier_bins[i][~aged[tier_bins[i]]] for i in range(len(tier_bins) - 1)] + [cat((tier_bins[-1], retire))]
+
+        top = tier_bins[0] # replace tier draws from the highest remaining tier
         sources = torch.empty(0, dtype = torch.long, device = self.device)
 
         rule_kwargs = dict(
@@ -1251,8 +1425,12 @@ class Population(_LoRAMixin):
             if burn_in > 0 and i > 0:
                 self._tiered_last_mutated[indices] = gen
 
-        return TieredResult(tier_bins)
+        surviving = cat(tier_bins[:-1])
+        ages = set_at('[p], k, k -> [p]', self._ages, tier_bins[-1], torch.zeros_like(tier_bins[-1]))
+        ages = set_at('[p], k, k -> [p]', ages, surviving, _at(ages, surviving) + 1)
+        self._ages.data.copy_(ages)
 
+        return TieredResult(tier_bins)
     def evaluate_distributed(
         self,
         eval_fn,
@@ -1378,16 +1556,16 @@ class Population(_LoRAMixin):
                 batch_size = next((t.shape[0] for t in (*args, *kwargs.values()) if is_tensor(t) and t.ndim > 0), 0)
             else:
                 def maybe_repeat_batch(t):
-                    # broadcast a singleton batch to each individual, otherwise expect a multiple of the batch
+                    # broadcast singleton batches to each individual, otherwise expect a
+                    # multiple of the batch - `_expand_batch` skips non-tensor leaves
 
                     nonlocal batch_size
 
-                    if t.shape[0] == 1:
-                        t = repeat(t, '1 ... -> p ...', p = p)
-                    else:
-                        assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+                    t = _expand_batch(t, p)
 
-                    batch_size = t.shape[0]
+                    if is_tensor(t) and t.ndim > 0:
+                        batch_size = t.shape[0]
+
                     return t
 
                 args = tuple(
@@ -1400,10 +1578,8 @@ class Population(_LoRAMixin):
                     for k, v in kwargs.items()
                 }
 
-            # with `micro_batch`, run the expanded batch through the model in
-            # chunks. the routes are sliced in lockstep with each chunk - a
-            # chunk's rows are routed by their explicit individual ids, so
-            # any chunk boundary is safe, not only tile-aligned ones
+            # with `micro_batch`, chunk the expanded batch - each chunk is routed
+            # by its explicit individual ids, so any chunk boundary is safe
 
             if exists(micro_batch) and all_individuals and batch_size > 0:
                 per_indiv = batch_size // self.pop_size
@@ -1462,7 +1638,7 @@ class LoRA(_LoRAMixin):
             linear = model.get_submodule(path)
             assert isinstance(linear, Linear), f'{path} must point to a Linear module'
 
-            key = path.replace('.', '_')
+            key = _adapter_key(path)
             dim, dim_inner = linear.in_features, linear.out_features
 
             # a supplied checkpoint must cover every target - silently random
@@ -1518,9 +1694,7 @@ class LoRA(_LoRAMixin):
 
     @torch.no_grad()
     def save(self, path: str | Path):
-        path = Path(path)
-        path.parent.mkdir(parents = True, exist_ok = True)
-        torch.save(self.state_dict_pkg(), path)
+        torch_save(self.state_dict_pkg(), path)
         return self
 
     @torch.no_grad()
@@ -1546,11 +1720,9 @@ class LoRA(_LoRAMixin):
     def merge_(self, model: Module | None = None):
         model = default(model, self.model)
 
-        for path in self.lora_targets:
+        for path, key, w_down, w_up in _iter_adapters(self):
             linear = model.get_submodule(path)
-            key = path.replace('.', '_')
-            delta = _lora_delta(self.weight_down[key], self.weight_up[key])
-            linear.weight.add_(delta.to(linear.weight.dtype))
+            _merge_adapter(linear, w_down, w_up)
 
         self.remove_hooks()
         return model
@@ -1594,10 +1766,8 @@ class Populations(Module):
 
     @torch.no_grad()
     def save(self, path: str | Path, save_base_model: bool = True):
-        path = Path(path)
-        path.parent.mkdir(parents = True, exist_ok = True)
         pkg = {pop_name: pop.state_dict_pkg(save_base_model = save_base_model) for pop_name, pop in self.populations.items()}
-        torch.save(pkg, path)
+        torch_save(pkg, path)
         return self
 
     @torch.no_grad()
@@ -1655,6 +1825,65 @@ class PopuLoRA(Module):
 # module-level evolve - the generation loop for any task that scores the
 # population with a fitness function, the non-env sibling of `evolve_with_env`
 
+def _generation_loop(
+    population: Population,
+    evaluate: Callable,
+    *,
+    num_generations: int,
+    target_fitness: float | None = None,
+    patience: int = 1,
+    progress: bool = False,
+    start_generation: int = 0,
+    initial_state: tuple | None = None,
+    on_generation: Callable | None = None,
+    **evolve_kwargs
+):
+    """the shared generation driver of `evolve` and `EnvInteractor.evolve` -
+    evaluate the population, record best / mean, evolve it, and stop once
+    `target_fitness` has been reached for `patience` consecutive generations.
+
+    `evaluate` is a zero-arg callable returning one fitness per individual;
+    history entries and best tracking stay in the same schema across both
+    entry points. `start_generation` / `initial_state` resume an interrupted
+    run (generation counter plus (best_fitness, best_index, history)), and
+    `on_generation(generation, best_fitness, best_index, history, is_best)`
+    fires after each evolve_, e.g. for checkpointing. returns
+    (best_fitness, best_index, history)."""
+
+    assert num_generations >= 1, 'num_generations must be at least 1'
+    assert patience >= 1, 'patience must be at least 1'
+
+    best_fitness, best_index, history = default(initial_state, (float('-inf'), 0, []))
+    streak = 0
+
+    for generation in maybe_progress(range(start_generation, num_generations), progress, 'evolving'):
+        fitnesses = evaluate()
+
+        gen_best_fitness = float(fitnesses.max())
+        is_best = gen_best_fitness > best_fitness
+
+        if is_best:
+            best_fitness = gen_best_fitness
+            best_index = int(fitnesses.argmax())
+
+        history.append(dict(
+            best_fitness = gen_best_fitness,
+            mean_fitness = float(fitnesses.mean()),
+        ))
+
+        if exists(target_fitness):
+            streak = streak + 1 if gen_best_fitness >= target_fitness else 0
+
+            if streak >= patience:
+                break
+
+        population.evolve_(fitnesses, **evolve_kwargs)
+
+        if exists(on_generation):
+            on_generation(generation, best_fitness, best_index, history, is_best)
+
+    return best_fitness, best_index, history
+
 def evolve(
     population: Population,
     fitness_fn: Callable,
@@ -1677,37 +1906,21 @@ def evolve(
     best / mean) with `return_history = True`."""
 
     assert callable(fitness_fn), 'fitness_fn must be a callable taking the population and returning one fitness per individual'
-    assert num_generations >= 1, 'num_generations must be at least 1'
-    assert patience >= 1, 'patience must be at least 1'
 
-    best_fitness = float('-inf')
-    best_index = 0
-    streak = 0
-    history = []
-
-    for _ in maybe_progress(range(num_generations), progress, 'evolving'):
+    def evaluate_gen():
         fitnesses = cast_tensor(fitness_fn(population)).to(population.device).float()
         assert fitnesses.shape == (population.pop_size,), f'fitness_fn must return one fitness per individual, got {tuple(fitnesses.shape)}'
+        return fitnesses
 
-        gen_best_fitness = float(fitnesses.max())
-        is_best = gen_best_fitness > best_fitness
-
-        if is_best:
-            best_fitness = gen_best_fitness
-            best_index = int(fitnesses.argmax())
-
-        history.append(dict(
-            best_fitness = gen_best_fitness,
-            mean_fitness = float(fitnesses.mean()),
-        ))
-
-        if exists(target_fitness):
-            streak = streak + 1 if gen_best_fitness >= target_fitness else 0
-
-            if streak >= patience:
-                break
-
-        population.evolve_(fitnesses, **evolve_kwargs)
+    _, best_index, history = _generation_loop(
+        population,
+        evaluate_gen,
+        num_generations = num_generations,
+        target_fitness = target_fitness,
+        patience = patience,
+        progress = progress,
+        **evolve_kwargs
+    )
 
     policy = population.merge_(best_index)
 

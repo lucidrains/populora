@@ -49,12 +49,9 @@ def _efficient_svd_of_lora(weight_down, weight_up):
 def skew_symmetrize(t):
     return (t - rearrange(t, '... i j -> ... j i')) / 2
 
-# noise helpers - numpy's ziggurat generator is ~2x faster than torch's
-# box-muller for the big elementwise draws. a numpy generator is seeded from
-# the torch generator's live state each call (advanced by one draw, so every
-# call gets a distinct stream): seeded runs stay reproducible, a fresh
-# torch.manual_seed restarts the noise exactly, and cuda keeps torch's own
-# generator, which is device-fast
+# noise helpers - numpy's ziggurat is ~2x faster for the big elementwise draws;
+# a numpy generator is seeded from torch's live state each call (advanced by one
+# draw, so every call gets a distinct stream); cuda stays on torch's generator
 
 def _cpu_rng():
     torch.rand(1)
@@ -78,10 +75,9 @@ def _noise_like(w, epsilon):
     return epsilon * w.std(dim = (1, 2), keepdim = True) * _normal_noise(w.shape, w.device)
 
 def _resolve_epsilon(epsilon, key):
-    # epsilon may be a scalar or per-individual tensor (applied to every
-    # target), or a dict keyed by lora target with the (down, up) step-size pair
-    # per target - the adaptive-epsilon (self-adaptation) output. returns the
-    # (down, up) pair, down and up sharing a value when they share a sigma
+    # epsilon: a scalar, a per-individual tensor, or a per-target dict of
+    # (down, up) step-size pairs (the adaptive-epsilon output); down and up
+    # share a value when they share a sigma
 
     if isinstance(epsilon, dict):
         return epsilon[key]
@@ -250,6 +246,10 @@ def mutation_neftune_style(
     alpha: float = 10.0,
     **kwargs
 ):
+    # NEFTune-style input dropout - noise is applied on the down (input) factor
+    # only, keeping the up factor intact so the adapter's output map stays
+    # interpretable as an input perturbation
+
     for weight_down in population.weight_down.values():
         dtype = weight_down.dtype
         w_down = weight_down.data[idx].float()
@@ -676,8 +676,8 @@ def tier_rule_crossover(population, indices, sources = None, top = None, fitness
     _tier_reproduce(population, indices, sources, fitnesses, **kwargs)
 
 def tier_rule_reinit(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
+    # reinit_individuals_ resets the sigma buffers itself
     population.reinit_individuals_(indices)
-    population._sigma_reset_(indices)
 
 def tier_rule_archive(population, indices, sources = None, top = None, fitnesses = None, **kwargs):
     # replay archived individuals into the tier - requires hof = HallOfFame(...)
@@ -773,8 +773,13 @@ def reinit_es(
     elite_frac: float = 0.25,
     eta: float = 1.0,
     noise_std_min: float = 1e-5,
+    refill: Tensor | None = None,
     **kwargs
 ):
+    # island-ES update - island mean nudged along the z-scored fitness and
+    # refilled with elite-std noise; `refill` (an absolute-index subset) scatters
+    # into those slots only, which is how retire_refill='es' re-seeds the retired
+
     assert exists(fitnesses), 'ES reinit requires fitnesses'
     pop_size = population.pop_size
     island_size = pop_size // num_islands
@@ -788,6 +793,8 @@ def reinit_es(
     num_elites = max(1, int(island_size * elite_frac))
     elite_local_indices = island_fitnesses.topk(num_elites, dim = -1).indices
 
+    target = island_indices if refill is None else refill
+
     for w_down, w_up in zip(population.weight_down.values(), population.weight_up.values()):
         w_down_island = w_down.data[island_indices].float()
         w_up_island = w_up.data[island_indices].float()
@@ -798,8 +805,8 @@ def reinit_es(
         w_down_std = w_down_island[elite_local_indices].std(dim = 0, unbiased = False).clamp(min = noise_std_min)
         w_up_std = w_up_island[elite_local_indices].std(dim = 0, unbiased = False).clamp(min = noise_std_min)
 
-        w_down.data[island_indices] = (w_down_mean + torch.randn_like(w_down_island) * w_down_std).to(w_down.dtype)
-        w_up.data[island_indices] = (w_up_mean + torch.randn_like(w_up_island) * w_up_std).to(w_up.dtype)
+        w_down.data[target] = (w_down_mean + torch.randn_like(w_down.data[target].float()) * w_down_std).to(w_down.dtype)
+        w_up.data[target] = (w_up_mean + torch.randn_like(w_up.data[target].float()) * w_up_std).to(w_up.dtype)
 
 def reinit_pool_and_breed(
     population: Population,

@@ -162,10 +162,8 @@ def preserve_rng():
 # broadcast helpers
 
 def broadcast_object(value, src = 0):
-    # broadcast a tensor, or any picklable value. tensors travel raw - far cheaper
-    # than pickling - announced by their (shape, dtype) on the object broadcast;
-    # anything else (dicts, lists, small payloads, ...) is pickled in the same
-    # call. `value` is only used on the `src` rank
+    # tensors broadcast raw - shape / dtype announced on the object broadcast;
+    # anything else (dicts, lists, small payloads) is pickled in the same call
 
     if not is_distributed():
         return value

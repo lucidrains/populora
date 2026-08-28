@@ -24,10 +24,8 @@ from x_mlps_pytorch import MLP
 from populora import interact_with_env, make_action
 from populora.populora import exists
 
-# gymnasium's inverted pendulum - torque in [-2, 2], policy emits a squashed
-# gaussian or unimodal beta (both (-1, 1) via --distribution), rescaled to the
-# env bounds by passing `to_range` to interact_with_env - an example of
-# rescaling a (-1, 1) policy output to an env's action range
+# inverted pendulum (torque in [-2, 2]): squashed gaussian or beta emit (-1, 1)
+# rescaled to env bounds via `to_range` on interact_with_env
 
 def _flag(value: bool | str, default: bool = True) -> bool:
     # fire hands **kwargs through as strings, which are always truthy - coerce

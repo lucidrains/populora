@@ -532,10 +532,9 @@ def test_interact_mixed_env_list():
     assert torch.equal(fitnesses, torch.full((5,), 40.))
 
 def test_interact_staggered_vector():
-    # sub-envs end episodes at different times - the whole-env reset path kicks
-    # in while the slots of the first two sub-envs still have individuals to
-    # play, discarding their cut-off autoreset episodes. the exact slot tours
-    # are rank-dependent, so single-process only
+    # sub-envs end at different times - the whole-env reset path kicks in while
+    # the early slots still have individuals to play, discarding cut-off
+    # autoreset episodes. slot tours are rank-dependent, so single-process only
 
     if is_distributed():
         return

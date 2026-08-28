@@ -6,6 +6,8 @@ from populora.populora import (
     Coevolve,
     evolve,
     PerTarget,
+    linear_layer_paths,
+    init_lora_weights,
     register_mutation,
     register_selection,
     register_parent_selection,
@@ -38,7 +40,6 @@ from populora.interact import (
     EnvInteractor,
     evolve_with_env,
     interact_with_env,
-    linear_layer_paths,
 )
 from populora.memory import Memory, rollout
 from populora.generate import generate

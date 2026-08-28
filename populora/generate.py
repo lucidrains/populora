@@ -15,10 +15,9 @@ from populora.population import Population
 # helpers
 
 def _split_output(output, cache_enabled):
-    # a model call yields logits, and (when a cache is requested) the updated
-    # cache alongside - as a tuple, or as a `past_key_values` attribute (hf).
-    # tuple outputs are only interpreted as a cache when the user opted in, so
-    # models returning (logits, anything-else) keep working without a cache
+    # a model call yields logits, plus the updated cache when requested (a
+    # tuple or a `past_key_values` attribute) - tuples count as cache only when
+    # the user opted in
 
     if is_tensor(output):
         return output, None
@@ -74,20 +73,9 @@ def generate(
     cache_kwargs: dict | None = None,
     micro_batch: int | None = None
 ) -> Tensor:
-    # autoregressively generate from a population of loras, with one routed
-    # forward per step over the samples still active. each sample is routed to
-    # its individual, so a population can be decoded in a single batched loop
-    #
-    # kv caching is opt-in via `cache_kwarg` + `cache_kwargs` - the updated cache
-    # returned by the model is passed back under `cache_kwarg` on the next step,
-    # e.g. `cache_kwargs = dict(return_intermediates = True)` for x-transformers
-    # or `cache_kwarg = 'past_key_values', cache_kwargs = dict(use_cache = True)`
-    # for huggingface
-    #
-    # `sample_fn` receives the (b, vocab) logits and returns the next tokens;
-    # default is greedy argmax. `stop_fn` receives (tokens, logits, step) and
-    # returns which samples are done, in addition to `eos_token`. samples that
-    # finish early are compacted out of the batch, and their cache rows dropped
+    # autoregressive generation from a population of loras - one routed forward
+    # per step over active samples. kv caching is opt-in via cache_kwarg /
+    # cache_kwargs; stop_fn / eos_token compact finished samples out of the batch
 
     assert sum((exists(individual), exists(individuals), all_individuals)) == 1
 
@@ -181,10 +169,8 @@ def generate(
                 active = active[active]
 
             if step > 0:
-                # x-transformers expects the full prefix with its cache (it
-                # trims internally, so the lora hooks only see the new token);
-                # huggingface expects only the last token - pass
-                # cache_last_token for that
+                # x-transformers wants the full prefix with its cache (it trims
+                # internally), huggingface only the last token - cache_last_token
 
                 if cache_enabled and cache_last_token:
                     x = seqs[rows, length - 1][:, None]

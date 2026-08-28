@@ -182,11 +182,8 @@ def validate_with_lunar(
             parents = pop.select_parents(parent_selection_type, fitnesses = fitnesses, num_children = len(result.culled), num_elites = num_elites, culled = result.culled)
 
             if pop.adaptive_epsilon:
-                # per-individual mutation rate (log-normal self-adaptation) -
-                # recombined from the parents (geometric mean) and used to
-                # mutate each child with its own step size, at the granularity
-                # picked by `sigma_granularity` ('weight' = one per individual
-                # per parameter, every element of every LoRA matrix)
+                # per-individual mutation rate: log-normal self-adaptation,
+                # recombined from parents (geometric mean), per-param via sigma_granularity
                 pop._sigma_recombine_(result.culled, parents)
                 epsilon = pop._sigma_epsilon_(result.culled)
 

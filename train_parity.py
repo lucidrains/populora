@@ -8,29 +8,9 @@
 # populora = { path = "." }
 # ///
 
-# sequential parity with resets - the input is a stream of symbols 0, 1 and 2:
-# predict the running xor of the 1-bits since the last reset, one symbol at a
-# time, where a 2 clears the running parity and starts a new segment. scoring
-# high requires carrying state across steps, so the population must learn to
-# use its memory - and to clear it, since a register that can only be toggled
-# would carry stale parity into the next segment. two recurrent policies, both
-# wrapped in Memory:
-
-#   gru     - a GRU cell written out as Linear layers, so the recurrent weights
-#             themselves are LoRA targets and get evolved like everything else.
-#             clearing the state on a 2 is the update gate's job
-#   explicit- a memory made of a binarized {-1, +1} register, with three small
-#             MLPs: write proposes per-bit flips and sees only the input symbol
-#             (a pure toggle, it cannot clear anything), forget proposes
-#             per-bit clears and is the only mechanism that can reset the
-#             register, read maps the register into the answer. the write and
-#             forget decisions are hard thresholds and the register is updated
-#             piecewise - no gradient could flow through this forward even if
-#             we asked for one. the population never needs one, so it trains
-#             exactly like the GRU
-
-# everything else - the routed per-timestep rollout, the generation loop, early
-# stopping and the merge - is two calls into populora: `rollout` and `evolve`
+# task: sequential parity with resets - stream of 0/1 symbols plus 2 (clear); predict the
+# running xor of 1-bits since the last reset. two Memory-wrapped policies: gru (GRU cell
+# written as Linear layers, evolved like everything else) and explicit ({-1,+1} register)
 
 from __future__ import annotations
 

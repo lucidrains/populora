@@ -2169,12 +2169,8 @@ def test_per_target_custom_kwarg(two_layer_pop):
     assert received[('encoder_proj_in', 'head')] == 1.
 
 # per-individual mutation step size - log-normal self-adaptation
-# (adaptive_epsilon): each individual carries its own sigma in log space,
-# recombined from parents at birth and perturbed before mutating, so selection
-# tunes the mutation rate instead of a hand-set schedule. `sigma_granularity`
-# picks the finest structure tracked - shared across the genome ('pop'), one per
-# LoRA adapter ('lora'), one per singular-value direction ('rank'), or one per
-# parameter ('weight')
+# (adaptive_epsilon): sigma lives in the genome, recombined from parents at
+# birth and perturbed before mutating, so selection tunes the mutation rate
 
 def _sigma_tensors(pop):
     return list(dict.fromkeys((*pop._log_sigma_down.values(), *pop._log_sigma_up.values())))

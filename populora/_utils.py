@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import is_tensor, tensor
 
@@ -30,6 +32,12 @@ maybe_cast_tuple = maybe(cast_tuple)
 
 def cast_tensor(val, device = None):
     return val if is_tensor(val) else tensor(val, device = device)
+
+def torch_save(pkg, path: str | Path):
+    # torch.save with directory creation - one canonical save path
+    path = Path(path)
+    path.parent.mkdir(parents = True, exist_ok = True)
+    torch.save(pkg, path)
 
 def maybe_progress(iterable, enabled = False, desc = ''):
     if not enabled:

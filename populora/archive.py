@@ -85,6 +85,19 @@ class HallOfFame:
         return arange(len(indices), device = population.device)
 
     @no_grad()
+    def reseed(self, population, individual, entry = 0):
+        # manual directed evolution - drop an archived champion into a slot of
+        # the population, one call; `entry` is an index (negative = newest).
+        # a re-seed, not a merge: the slot's weights become the archived ones
+
+        entry = self.entries[entry]
+
+        return population.load_individual(
+            dict(weight_down = entry.weight_down, weight_up = entry.weight_up),
+            individual = individual
+        )
+
+    @no_grad()
     def probe(self, population, x, num, mode = 'uniform', generator = None):
         # route x through `num` sampled archived champions, returning (k, *x.shape[:-1], -1)
         # outputs - None when nothing has been archived yet. the replay population

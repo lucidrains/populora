@@ -12,7 +12,7 @@ from env_ssl_wrapper import AutoBatchedWrapper, DoneTrackerWrapper, StandardizeW
 from env_ssl_wrapper.utils import parse_wrapper
 from torch_einops_utils import temp_eval
 
-from populora._utils import cast_tensor, default, exists, maybe_progress, rescale_from_range_to_range
+from populora._utils import cast_tensor, default, exists, rescale_from_range_to_range, torch_save
 from populora.distributed import (
     broadcast_object,
     distributed_device,
@@ -21,7 +21,7 @@ from populora.distributed import (
     preserve_rng,
 )
 from populora.memory import Memory, init_memory_tensor
-from populora.population import Population, linear_layer_paths
+from populora.population import Population, _generation_loop
 
 # helpers
 
@@ -112,13 +112,9 @@ def _try_seed(env, seed):
         pass
 
 def _fitness_mode(fn):
-    # infer how a researcher's custom fitness function evaluates a population:
-    #   (population, individuals = ...) or (population, indices = ...)  -> batch mode, distributed per rank
-    #   (population, idx) or (population, individual)                  -> per-index mode, distributed per rank
-    #   (population)                                                   -> all-at-once, main rank evaluates and broadcasts
-    #
-    # a **kwargs signature cannot receive the individuals positionally, so it
-    # falls through to all-at-once, same as anything uninspectable
+    # infer a custom fitness function's mode: (pop, individuals/indices) -> batch;
+    # (pop, idx/individual) -> per-index; (pop) -> all-at-once. a **kwargs
+    # signature falls through to all-at-once
 
     try:
         params = inspect.signature(fn).parameters
@@ -253,13 +249,9 @@ class EnvInteractor:
             **kwargs
         )
 
-    # rollout engine - the heart of the interactor. every slot (sub-env) plays
-    # the individuals assigned to it, one model forward per timestep over the
-    # whole batch with per-sample routing, and each individual's fitness is its
-    # mean episode return over all slots and episodes. with as many slots as
-    # individuals, each slot plays exactly one individual - the classic setup;
-    # otherwise the slots tile the individuals cyclically (num_slots >= pop) or
-    # each slot plays its share in turn (num_slots < pop)
+    # rollout engine - every slot plays its assigned individuals, one routed
+    # forward per timestep; fitness = mean episode return over slots. slots tile
+    # the individuals cyclically (slots >= pop) or play their share in turn
 
     @torch.no_grad()
     def _rollout_fitness(
@@ -297,10 +289,8 @@ class EnvInteractor:
         num_slots = sum(env.num_envs for env in envs)
         assert num_slots > 0, 'interact_with_env requires at least one environment'
 
-        # memory threading - when the policy is wrapped in Memory, each slot
-        # carries the memory emitted by the previous timestep, fed back in on
-        # the next, initialized to the researcher's init and reset to it
-        # wherever episodes reset
+        # memory threading - each slot carries the last emitted memory, fed back
+        # next step, initialized to the researcher's init and reset on episode end
 
         memory_wrapped = isinstance(population.model, Memory)
         memories = None
@@ -428,10 +418,8 @@ class EnvInteractor:
                 reward_arr = _flatten_batch(reward)
                 done_arr = _flatten_batch(terminated) | _flatten_batch(truncated)
 
-                # some envs return no reward on terminal / reset transitions
-                # (e.g. dm_control) - treat those steps as zero reward. rewards
-                # accumulate in one tensor op per env; the per-slot state machine
-                # below only runs on episode endings
+                # envs with no reward on terminal / reset transitions count zero
+                # reward; rewards accumulate in one tensor op per env
 
                 locs = [k - env_slot_offsets[e] for k in e_slots]
                 current_return.index_add_(0, route_ids[e_slots], _gather_slot_rewards(reward_arr, locs, device))
@@ -468,10 +456,8 @@ class EnvInteractor:
                         _try_seed(env, _mix_seed(base_seed, k, episode_counter[k]))
                         last_obs[e], _ = env.reset()
 
-                # a vector env whose sub-envs have all had an episode end, while
-                # individuals remain to be played, is reset onto a fresh seeded
-                # episode. any in-progress (autoreset) episodes of the next
-                # individuals are discarded - they never completed
+                # a vector env fully done while individuals remain resets onto a
+                # fresh seeded episode; autoreset episodes in progress are discarded
 
                 if num_env_slots > 1 and env.needs_reset and any(
                     cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]
@@ -498,10 +484,8 @@ class EnvInteractor:
 
         return fitness
 
-    # fitness function - the built-in rollout evaluator, distributed-friendly:
-    # `fitness(population, individuals)` evaluates exactly those individuals,
-    # which is what `evaluate_population_distributed` needs to partition the
-    # population across ranks
+    # built-in rollout evaluator, distributed-friendly: (pop, individuals)
+    # evaluates exactly those - what evaluate_population_distributed partitions
 
     def fitness(
         self,
@@ -567,10 +551,9 @@ class EnvInteractor:
 
         return broadcast_object(res, src = 0)
 
-    # high level evolution loop - accepts a bare model (a population is built
-    # around it) or an existing population, and returns the merged best policy.
-    # pass `target_fitness` to stop early once it is reached, and
-    # `return_history = True` to also get the per-generation best / mean
+    # high-level evolve - a bare model (population built around it) or an
+    # existing population in, merged best policy out; target_fitness (+ patience)
+    # stops early, return_history gives per-generation best / mean
 
     def evolve(
         self,
@@ -588,6 +571,7 @@ class EnvInteractor:
         eval_seed: int = 0,
         progress: bool = False,
         target_fitness: float | None = None,
+        patience: int = 1,
         return_history: bool = False,
         evolve_kwargs: dict | None = None,
         evaluate_kwargs: dict | None = None,
@@ -616,10 +600,8 @@ class EnvInteractor:
         if exists(checkpoint_dir):
             checkpoint_every = default(checkpoint_every, 1)
 
-        best_fitness = float('-inf')
-        best_index = 0
-        history = []
         start_generation = 0
+        initial_state = None
 
         # resume from the latest checkpoint, so a killed run picks up where it
         # left off - with exact_resume, the rng state is restored too, making
@@ -630,9 +612,10 @@ class EnvInteractor:
 
             if exists(resumed):
                 start_generation, best_fitness, best_index, history = resumed
+                initial_state = (best_fitness, best_index, history)
 
-        for generation in maybe_progress(range(start_generation, num_generations), progress, desc = 'evolving'):
-            fitnesses = self.evaluate(
+        def evaluate_gen():
+            return self.evaluate(
                 population,
                 action = action,
                 fitness = fitness,
@@ -641,23 +624,7 @@ class EnvInteractor:
                 **evaluate_kwargs
             )
 
-            gen_best_fitness = float(fitnesses.max())
-            is_best = gen_best_fitness > best_fitness
-
-            if is_best:
-                best_fitness = gen_best_fitness
-                best_index = int(fitnesses.argmax())
-
-            history.append(dict(
-                best_fitness = gen_best_fitness,
-                mean_fitness = float(fitnesses.mean()),
-            ))
-
-            if exists(target_fitness) and gen_best_fitness >= target_fitness:
-                break
-
-            population.evolve_(fitnesses, **evolve_kwargs)
-
+        def on_generation(generation, best_fitness, best_index, history, is_best):
             if exists(checkpoint_dir) and ((generation + 1) % checkpoint_every == 0 or generation == num_generations - 1):
                 self._save_checkpoint(
                     population,
@@ -669,6 +636,19 @@ class EnvInteractor:
                     exact_resume = exact_resume,
                     as_best = is_best
                 )
+
+        _, best_index, history = _generation_loop(
+            population,
+            evaluate_gen,
+            num_generations = num_generations,
+            target_fitness = target_fitness,
+            patience = patience,
+            progress = progress,
+            start_generation = start_generation,
+            initial_state = initial_state,
+            on_generation = on_generation,
+            **evolve_kwargs
+        )
 
         policy = population.merge_(best_index)
 
@@ -724,10 +704,10 @@ class EnvInteractor:
         if exact_resume:
             pkg['rng_state'] = torch.random.get_rng_state().clone()
 
-        torch.save(pkg, checkpoint_dir / 'latest.pt')
+        torch_save(pkg, checkpoint_dir / 'latest.pt')
 
         if as_best:
-            torch.save(pkg, checkpoint_dir / 'best.pt')
+            torch_save(pkg, checkpoint_dir / 'best.pt')
 
         return self
 
@@ -850,6 +830,7 @@ def evolve_with_env(
     wrappers: Sequence | None = None,
     progress: bool = False,
     target_fitness: float | None = None,
+    patience: int = 1,
     return_history: bool = False,
     evolve_kwargs: dict | None = None,
     evaluate_kwargs: dict | None = None,
@@ -883,6 +864,7 @@ def evolve_with_env(
         num_episodes = num_episodes,
         progress = progress,
         target_fitness = target_fitness,
+        patience = patience,
         return_history = return_history,
         evolve_kwargs = evolve_kwargs,
         evaluate_kwargs = evaluate_kwargs

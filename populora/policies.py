@@ -12,15 +12,9 @@ from torch.nn import functional as F
 
 from populora._utils import default, exists
 
-# policy distribution parametrizations - map network logits to env actions.
-# every container is a uniform interface: an nn.Module whose forward maps
-# logits to a torch Distribution, with an exact `mean`, a `log_prob` (one
-# scalar per item, so RL losses just consume it), and a `from_range` telling
-# the interactor what range its samples live in. every action factory returns
-# an ActionFn wrapping that container - callable (logits -> env actions) and
-# exposing the container through distribution / mean / log_prob. researchers
-# can subclass ActionDist and pass their own instance / factory / registered
-# name straight into make_action
+# policy distribution parametrizations - nn.Modules mapping logits to a torch
+# distribution with mean / log_prob / from_range; every action factory returns
+# an ActionFn (logits -> actions). subclass or register through make_action
 
 class ActionDist(Module):
     from_range = None
@@ -39,10 +33,8 @@ class ActionDist(Module):
         sum_action_dim = True,
         eps = None
     ):
-        # sum exactly the trailing event dims, never the batch dims - the
-        # container's distribution may or may not reduce its own event dim
-        # (categorical emits one scalar per item, beta / gaussian one per
-        # action dim), so `event_dim` decides
+        # sum exactly the trailing event dims, never the batch dims - `event_dim`
+        # decides, since distributions reduce their own event dims or not
 
         dist = params if isinstance(params, Distribution) else self.distribution(params)
         log_prob = dist.log_prob(action)
@@ -100,10 +92,9 @@ class Categorical(ActionDist):
     def distribution(self, params, temperature = 1.0):
         return TorchCategorical(logits = params / temperature)
 
-# unimodal beta distribution - mean-concentration reparameterization. the
-# first action_dim logits map through a sigmoid to the exact distribution
-# mean, the second action_dim to a positive concentration, so the mean and the
-# precision are independent knobs at reachable logit magnitudes
+# unimodal beta, mean-concentration reparam - the first action_dim logits
+# sigmoid to the exact mean, the second to a positive concentration, so mean
+# and precision are independent knobs at reachable logits
 
 class Beta(ActionDist):
     from_range = (0., 1.)
@@ -206,17 +197,8 @@ class AlphaBeta(ActionDist):
 
         return TorchBeta(alpha, beta)
 
-# the uniform wrapper every action factory returns - callable mapping logits
-# to env actions, exposing the underlying distribution container:
-#
-#   action_fn(logits)                  -> actions (sampled or deterministic mean)
-#   action_fn.distribution(logits)     -> the torch Distribution at these logits
-#   action_fn.mean(logits)             -> deterministic actions, same space as the call
-#   action_fn.log_prob(logits, action) -> log prob of the actions actually stepped,
-#                                         one scalar per item - env-space actions
-#                                         are mapped back to the dist's native domain
-#   action_fn.container                -> the underlying ActionDist module
-#   action_fn.from_range               -> range the emitted actions live in
+# the uniform ActionFn wrapper every factory returns - callable on logits,
+# exposing distribution / mean / log_prob / container / from_range
 
 class ActionFn:
     def __init__(
@@ -322,10 +304,8 @@ def make_beta_action(
     mean_concentration: bool = True,
     **kwargs
 ):
-    # unimodal beta on (0, 1), rescaled to (-1, 1) by default. the
-    # mean-concentration reparam (default) decouples the exact mean from the
-    # precision; set mean_concentration = False for the legacy alpha/beta
-    # mode parametrization
+    # unimodal beta on (0, 1), rescaled to (-1, 1) by default;
+    # mean_concentration = False gives the legacy alpha / beta parametrization
 
     factory = make_mean_concentration_beta_action if mean_concentration else make_alpha_beta_action
     return factory(sample = sample, temperature = temperature, beta_rescale_neg_one_one = beta_rescale_neg_one_one, **kwargs)
@@ -396,17 +376,9 @@ def make_action(
     temperature: float = 1.0,
     **kwargs
 ):
-    # one entry point - 'categorical' for discrete, 'squashed_gaussian' /
-    # 'beta' for continuous, or any name registered through
-    # register_action_dist. a researcher can also bring their own:
-    #
-    #   - an ActionFn passes through as-is
-    #   - an ActionDist instance (or subclass) is wrapped in an ActionFn
-    #   - any other callable is invoked as a factory, receiving `sample` and
-    #     `temperature` when accepted, plus the kwargs it accepts
-    #
-    # unknown keyword args on the string / factory paths are dropped rather
-    # than erroring, so one config works across distributions
+    # one entry point - a builtin or registered name passes through, an ActionFn
+    # passes through as-is, an ActionDist instance / class is wrapped, any other
+    # callable is used as a factory. unknown kwargs are dropped
 
     if isinstance(distribution, ActionFn):
         return distribution
