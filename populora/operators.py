@@ -69,10 +69,12 @@ def _uniform_noise(shape, device, low, high):
         return torch.from_numpy(_cpu_rng().uniform(low, high, shape).astype(np.float32))
     return torch.empty(shape, device = device).uniform_(low, high)
 
-def _noise_like(w, epsilon):
+def _noise_like(w, epsilon, eps = 1e-6):
     # epsilon-scaled per-individual-std gaussian noise, in w's precision
-
-    return epsilon * w.std(dim = (1, 2), keepdim = True) * _normal_noise(w.shape, w.device)
+    std = w.std(dim = (1, 2), keepdim = True) if w.ndim >= 3 else w.std()
+    default_std = 1.0 / math.sqrt(w.shape[-1])
+    std = torch.where(std > eps, std, torch.full_like(std, default_std))
+    return epsilon * std * _normal_noise(w.shape, w.device)
 
 def _resolve_epsilon(epsilon, key):
     # epsilon: a scalar, a per-individual tensor, or a per-target dict of
@@ -670,6 +672,9 @@ def crossover_extrapolative(population, parent_indices, child_indices, eta_min =
     num_children, num_parents = parent_indices.shape
     assert num_parents == 2, 'extrapolative crossover requires exactly 2 parents'
     device = population.device
+
+    if exists(fitnesses):
+        parent_indices = parent_indices.gather(-1, fitnesses[parent_indices].argsort(dim = -1))
 
     eta = torch.empty((num_children, 1, 1), device = device).uniform_(eta_min, eta_max)
 

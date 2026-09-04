@@ -1080,7 +1080,8 @@ class Population(_LoRAMixin):
         temperature: float = 1.0,
         use_z_score: bool = True,
         indices: Tensor | Sequence[int] | int | None = None,
-        remove_hooks: bool = False
+        remove_hooks: bool = False,
+        scale: float = 1.0
     ):
         indices = maybe_cast_tuple(indices)
         assert exists(fitnesses) or exists(indices), 'either fitnesses or indices must be passed to select_and_merge_'
@@ -1112,7 +1113,7 @@ class Population(_LoRAMixin):
             w_up_topk = w_up[topk_indices].float()
 
             delta = einsum(weights, w_up_topk, w_down_topk, 'k, k e r, k d r -> e d')
-            linear.weight.add_(delta.to(linear.weight.dtype))
+            linear.weight.add_((scale * delta).to(linear.weight.dtype))
 
         if remove_hooks:
             self.remove_hooks()
@@ -1173,12 +1174,13 @@ class Population(_LoRAMixin):
         fitnesses: Tensor | None = None,
         individual: int | None = None,
         repopulate: bool = True,
-        save_champion: bool = True
+        save_champion: bool = True,
+        scale: float = 1.0
     ):
         assert exists(fitnesses) or exists(individual), 'either fitnesses or individual must be passed to merge_champion_'
         champion_idx = fitnesses.argmax().item() if exists(fitnesses) else individual
 
-        self.select_and_merge_(indices = champion_idx, remove_hooks = False)
+        self.select_and_merge_(indices = champion_idx, remove_hooks = False, scale = scale)
 
         if repopulate:
             self.repopulate_(save_champion = save_champion)
@@ -1377,6 +1379,10 @@ class Population(_LoRAMixin):
             for key in self.weight_down:
                 self.weight_down[key].data[yin_culled] = self.weight_down[key].data[yang_culled]
                 self.weight_up[key].data[yin_culled] = self.weight_up[key].data[yang_culled]
+            if self.adaptive_epsilon:
+                for log_sigma in self._sigma_tensors():
+                    log_sigma.data[yin_culled] = log_sigma.data[yang_culled]
+                epsilon = self._sigma_epsilon_(result.culled)
         else:
             self._twin_pairs = None
 
