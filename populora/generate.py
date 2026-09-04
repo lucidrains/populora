@@ -80,14 +80,15 @@ def generate(
     assert sum((exists(individual), exists(individuals), all_individuals)) == 1
 
     device = population.device
-    ids = cast_tensor(ids, device)
+    ids = cast_tensor(ids, device = device)
     assert ids.ndim == 2, 'ids must be a 2d tensor of token ids'
 
     batch_size, prompt_len = ids.shape
     assert max_len >= prompt_len, f'max_len {max_len} must be at least the prompt length {prompt_len}'
 
     if exists(individual):
-        individuals = torch.full((batch_size,), individual, dtype = torch.long, device = device)
+        dd = dict(device = device, dtype = torch.long)
+        individuals = torch.full((batch_size,), individual, **dd)
     elif all_individuals:
         assert divisible_by(batch_size, population.pop_size), f'batch {batch_size} must be a multiple of the population size {population.pop_size}'
         individuals = repeat(torch.arange(population.pop_size, device = device), 'p -> (p b)', b = batch_size // population.pop_size)
@@ -104,7 +105,8 @@ def generate(
 
     fill = default(eos_token, 0)
 
-    seqs = torch.full((batch_size, max_len), fill, dtype = torch.long, device = device)
+    dd_long = dict(device = device, dtype = torch.long)
+    seqs = torch.full((batch_size, max_len), fill, **dd_long)
     seqs[:, :prompt_len] = ids
 
     # `seqs` stays full-size and final - dropped rows never change again, so
@@ -112,7 +114,8 @@ def generate(
     # `rows`, which maps each compacted row back to its original index
 
     rows = torch.arange(batch_size, device = device)
-    active = torch.ones(batch_size, dtype = torch.bool, device = device)
+    dd_bool = dict(device = device, dtype = torch.bool)
+    active = torch.ones(batch_size, **dd_bool)
 
     cache = None
     length = prompt_len
@@ -131,13 +134,14 @@ def generate(
     def next_tokens(logits):
         logits = logits[:, -1]
         tokens = sample_fn(logits) if exists(sample_fn) else logits.argmax(dim = -1)
-        return cast_tensor(tokens, device), logits
+        return cast_tensor(tokens, device = device), logits
 
     def done(tokens, logits, step):
-        mask = (tokens == eos_token) if exists(eos_token) else torch.zeros(len(tokens), dtype = torch.bool, device = device)
+        dd_bool = dict(device = device, dtype = torch.bool)
+        mask = (tokens == eos_token) if exists(eos_token) else torch.zeros(len(tokens), **dd_bool)
 
         if exists(stop_fn):
-            mask = mask | cast_tensor(stop_fn(tokens, logits, step), device).bool()
+            mask = mask | cast_tensor(stop_fn(tokens, logits, step), device = device).bool()
 
         return mask
 

@@ -9,6 +9,7 @@ import torch
 from torch import atleast_1d, is_tensor, nn
 
 from env_ssl_wrapper import AutoBatchedWrapper, DoneTrackerWrapper, StandardizeWrapper
+from env_ssl_wrapper.helpers import env_autoresets, first_existing, get_attr
 from env_ssl_wrapper.utils import parse_wrapper
 from torch_einops_utils import temp_eval
 
@@ -21,14 +22,35 @@ from populora.distributed import (
     preserve_rng,
 )
 from populora.memory import Memory, init_memory_tensor
+from populora.policies import make_categorical_action
 from populora.population import Population, _generation_loop
+from populora.spaces import action_space_bounds, action_space_is_discrete
+from populora.vector import MultiprocessingVecEnv, action_dim_of
 
 # helpers
+
+def _safe_close(env):
+    if not exists(env):
+        return
+
+    try:
+        env.close()
+    except (AttributeError, TypeError):
+        pass
 
 def _flatten_batch(t):
     if is_tensor(t):
         return t.reshape(-1)
     return np.asarray(t).reshape(-1)
+
+def _env_autoresets(env) -> bool:
+    # whether a vector env resets terminated slots on its own. the rollout
+    # engine relies on autoresetting vector envs for its per-slot tour
+    # bookkeeping - only non-autoresetting envs may be force-reset mid-run.
+    # detection is the canonical one from env-ssl-wrapper (autoreset_mode /
+    # autoresets markers, or the gymnasium 1.x VectorEnv base class).
+
+    return env_autoresets(env)
 
 def _gather_slot_rewards(reward_arr, locs, device):
     # per-slot rewards for a step, tensorized - `None` entries (some envs emit
@@ -99,7 +121,10 @@ def _compose_env(env, wrappers):
         env = func(env)
 
     if not _has_wrapper(env, DoneTrackerWrapper):
-        env = DoneTrackerWrapper(env)
+        # autoresetting vector envs self-reset terminated slots and skip tracker;
+        # single or non-autoresetting envs keep it for needs_reset tracking
+        if get_attr(env, 'num_envs', 1) <= 1 or not env_autoresets(env):
+            env = DoneTrackerWrapper(env)
 
     return env
 
@@ -139,6 +164,7 @@ class EnvInteractor:
         self,
         envs,
         *,
+        num_envs: int | None = None,
         device: torch.device | str | None = None,
         wrappers: Sequence | None = None,
         # policy outputs live on from_range (-1, 1) by default - an action fn
@@ -154,6 +180,7 @@ class EnvInteractor:
         self.to_range = to_range
         self.from_range = from_range
 
+        envs = self._maybe_vectorize(envs, num_envs)
         envs = self._normalize_envs(envs)
 
         if isinstance(wrappers, str):
@@ -168,8 +195,59 @@ class EnvInteractor:
 
         self.num_envs = sum(env.num_envs for env in self.envs)
 
+        self.obs_dim, self.action_dim, self.action_space = self._probe()
+
+        # policies emit on (-1, 1) - map them onto a Box action space for
+        # free; discrete and unclassifiable spaces are left untouched
+        self.to_range = default(to_range, action_space_bounds(self.action_space))
+
     def __repr__(self):
         return f'{self.__class__.__name__}(num_envs = {self.num_envs}, device = {self.device})'
+
+    def close(self):
+        for env in self.envs:
+            _safe_close(env)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    # a factory / class plus num_envs becomes a parallel vector env; an env
+    # instance cannot be cloned, and lists / vector envs pass through as-is
+
+    def _maybe_vectorize(self, envs, num_envs):
+        if not exists(num_envs) or num_envs <= 1 or isinstance(envs, (list, dict)):
+            return envs
+
+        if not isinstance(envs, (type, str)) and callable(get_attr(envs, 'step')):
+            if get_attr(envs, 'num_envs', 1) > 1:
+                return envs
+
+            spec_id = getattr(get_attr(envs, 'spec'), 'id', None)
+            if exists(spec_id):
+                spec_kwargs = getattr(get_attr(envs, 'spec'), 'kwargs', {}) or {}
+                return MultiprocessingVecEnv(lambda: __import__('gymnasium').make(spec_id, **spec_kwargs), num_envs, seed = self.seed)
+
+            raise ValueError('num_envs > 1 needs a factory or class - a single env instance cannot be cloned')
+
+        return MultiprocessingVecEnv(envs, num_envs, seed = self.seed)
+
+    # probe the first env once for observation / action dimensions
+
+    def _probe(self):
+        env = self.envs[0]
+        obs, _ = env.reset()
+
+        if isinstance(obs, dict):
+            obs_dim = None
+        else:
+            shape = obs.shape if is_tensor(obs) else np.asarray(obs).shape
+            obs_dim = int(shape[1]) if len(shape) > 1 else int(shape[0])
+
+        action_space = first_existing(env, 'single_action_space', 'action_space')
+        return obs_dim, action_dim_of(env), action_space
 
     def _rescale_actions(self, actions, action = None):
         if not exists(self.to_range):
@@ -179,7 +257,7 @@ class EnvInteractor:
         # beats the interactor-level default - e.g. a beta with
         # beta_rescale_neg_one_one = False emits on (0, 1), not (-1, 1)
 
-        from_range = default(getattr(action, 'from_range', None), self.from_range)
+        from_range = default(get_attr(action, 'from_range'), self.from_range)
         return rescale_from_range_to_range(actions, from_range = from_range, to_range = self.to_range)
 
     # environment normalization - a single env, a list / dict of envs, a
@@ -189,6 +267,14 @@ class EnvInteractor:
     def _normalize_envs(envs):
         if envs is None:
             raise ValueError('interact_with_env requires an environment')
+
+        if isinstance(envs, str):
+            import gymnasium as gym
+            return EnvInteractor._normalize_envs(gym.make(envs))
+
+        if isinstance(envs, type):
+            envs = envs()
+            return EnvInteractor._normalize_envs(envs)
 
         if hasattr(envs, 'step'):
             return [envs]
@@ -225,11 +311,23 @@ class EnvInteractor:
 
         return envs
 
-    # population construction
+    # population construction - model = None builds a default MLP from the
+    # probed dims (logits for discrete action spaces, tanh for continuous)
+
+    def _default_backbone(self) -> nn.Module:
+        if not exists(self.obs_dim) or not exists(self.action_dim):
+            raise ValueError('cannot auto-build a policy - pass a model explicitly')
+
+        layers = [nn.Linear(self.obs_dim, 128), nn.ELU(), nn.Linear(128, 128), nn.ELU(), nn.Linear(128, self.action_dim)]
+
+        if not action_space_is_discrete(self.action_space):
+            layers.append(nn.Tanh())
+
+        return nn.Sequential(*layers)
 
     def population(
         self,
-        model: nn.Module,
+        model: nn.Module | None = None,
         *,
         pop_size: int,
         low_rank: int,
@@ -239,7 +337,7 @@ class EnvInteractor:
         **kwargs
     ):
         return Population(
-            model,
+            default(model, self._default_backbone()),
             pop_size = pop_size,
             low_rank = low_rank,
             lora_targets = lora_targets,
@@ -262,7 +360,8 @@ class EnvInteractor:
         action = None,
         horizon = 1000,
         num_episodes = 1,
-        seed = None
+        seed = None,
+        agg = 'mean'
     ):
         envs = self.envs
         device = population.device
@@ -331,156 +430,163 @@ class EnvInteractor:
         episode_counts = torch.zeros(num_individuals, dtype = torch.long, device = device)
         env_reset_count = [0] * len(envs)
 
-        while True:
-            active_slots = [
-                k for k in range(num_slots)
-                if cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]
-            ]
+        with temp_eval(population):
+            while True:
+                active_slots = [
+                    k for k in range(num_slots)
+                    if cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]
+                ]
 
-            if not active_slots:
-                break
+                if not active_slots:
+                    break
 
-            all_live = len(active_slots) == num_slots
+                all_live = len(active_slots) == num_slots
 
-            # one routed forward over the batch of current observations; when
-            # every slot of a single env is live, the obs and routes are already
-            # batched, so the per-step assembly is skipped entirely
-
-            if single_env and all_live:
-                obs_batch = last_obs[0]
-                obs_batch = obs_batch.to(device) if is_tensor(obs_batch) else torch.as_tensor(obs_batch).to(device)
-                individuals_batch = route_ids
-            else:
-                positions = {k: i for i, k in enumerate(active_slots)}
-
-                active_obs = []
-
-                for k in active_slots:
-                    e = slot_to_env[k]
-                    local = k - env_slot_offsets[e]
-                    active_obs.append(last_obs[e][local])
-
-                obs_batch = torch.stack([
-                    obs if is_tensor(obs) else torch.as_tensor(obs)
-                    for obs in active_obs
-                ]).to(device)
-                individuals_batch = route_ids[active_slots]
-
-            if memory_wrapped:
-                active_mem = memories[active_slots]
-                outputs = population(active_mem, obs_batch, individuals = individuals_batch, eval_and_no_grad = True)
-                policy_out, mem_next = outputs
-
-                mem_next = cast_tensor(mem_next, device)
-                mem_next = atleast_1d(mem_next)
-
-                assert mem_next.shape == memories[active_slots].shape, f'network emitted memory {tuple(mem_next.shape)} does not match the carried memory {tuple(memories[active_slots].shape)}'
-                memories[active_slots] = mem_next
-            else:
-                outputs = population(obs_batch, individuals = individuals_batch, eval_and_no_grad = True)
-                policy_out = outputs
-
-            actions = action(policy_out) if exists(action) else policy_out
-            actions = actions if is_tensor(actions) else torch.as_tensor(actions)
-            actions = atleast_1d(actions)
-            actions = self._rescale_actions(actions, action)
-
-            # step every environment with active slots; inactive sub-envs of a
-            # vector env still have to step along, so they get zero actions
-
-            for e, env in enumerate(envs):
-                # when every slot of the single env is live, the actions are
-                # the whole env batch - no zero-pad scatter
+                # one routed forward over the batch of current observations; when
+                # every slot of a single env is live, the obs and routes are already
+                # batched, so the per-step assembly is skipped entirely
 
                 if single_env and all_live:
-                    e_slots = active_slots
-                    e_actions = actions
-                    num_env_slots = env.num_envs
+                    obs_batch = last_obs[0]
+                    obs_batch = obs_batch.to(device) if is_tensor(obs_batch) else torch.as_tensor(obs_batch).to(device)
+                    individuals_batch = route_ids
                 else:
-                    e_slots = [k for k in active_slots if slot_to_env[k] == e]
+                    positions = {k: i for i, k in enumerate(active_slots)}
 
-                    if not e_slots:
-                        continue
+                    active_obs = []
 
-                    num_env_slots = env.num_envs
-                    e_actions = torch.zeros(
-                        (num_env_slots, *actions.shape[1:]),
-                        dtype = actions.dtype,
-                        device = actions.device
-                    )
+                    for k in active_slots:
+                        e = slot_to_env[k]
+                        local = k - env_slot_offsets[e]
+                        active_obs.append(last_obs[e][local])
+
+                    obs_batch = torch.stack([
+                        obs if is_tensor(obs) else torch.as_tensor(obs)
+                        for obs in active_obs
+                    ]).to(device)
+                    individuals_batch = route_ids[active_slots]
+
+                if memory_wrapped:
+                    active_mem = memories[active_slots]
+                    outputs = population(active_mem, obs_batch, individuals = individuals_batch, eval_and_no_grad = True)
+                    policy_out, mem_next = outputs
+
+                    mem_next = cast_tensor(mem_next, device = device)
+                    mem_next = atleast_1d(mem_next)
+
+                    assert mem_next.shape == memories[active_slots].shape, f'network emitted memory {tuple(mem_next.shape)} does not match the carried memory {tuple(memories[active_slots].shape)}'
+                    memories[active_slots] = mem_next
+                else:
+                    outputs = population(obs_batch, individuals = individuals_batch, eval_and_no_grad = True)
+                    policy_out = outputs
+
+                actions = action(policy_out) if exists(action) else policy_out
+                actions = actions if is_tensor(actions) else torch.as_tensor(actions)
+                actions = atleast_1d(actions)
+                actions = self._rescale_actions(actions, action)
+
+                # step every environment with active slots; inactive sub-envs of a
+                # vector env still have to step along, so they get zero actions
+
+                for e, env in enumerate(envs):
+                    # when every slot of the single env is live, the actions are
+                    # the whole env batch - no zero-pad scatter
+
+                    if single_env and all_live:
+                        e_slots = active_slots
+                        e_actions = actions
+                        num_env_slots = env.num_envs
+                    else:
+                        e_slots = [k for k in active_slots if slot_to_env[k] == e]
+
+                        if not e_slots:
+                            continue
+
+                        num_env_slots = env.num_envs
+                        e_actions = torch.zeros(
+                            (num_env_slots, *actions.shape[1:]),
+                            dtype = actions.dtype,
+                            device = actions.device
+                        )
+
+                        for k in e_slots:
+                            e_actions[k - env_slot_offsets[e]] = actions[positions[k]]
+
+                    obs, reward, terminated, truncated, info = env.step(e_actions)
+                    last_obs[e] = obs
+
+                    reward_arr = _flatten_batch(reward)
+                    done_arr = _flatten_batch(terminated) | _flatten_batch(truncated)
+
+                    # envs with no reward on terminal / reset transitions count zero
+                    # reward; rewards accumulate in one tensor op per env
+
+                    locs = [k - env_slot_offsets[e] for k in e_slots]
+                    current_return.index_add_(0, route_ids[e_slots], _gather_slot_rewards(reward_arr, locs, device))
 
                     for k in e_slots:
-                        e_actions[k - env_slot_offsets[e]] = actions[positions[k]]
+                        steps_used[k] += 1
 
-                obs, reward, terminated, truncated, info = env.step(e_actions)
-                last_obs[e] = obs
+                    if done_arr.any():
+                        for k in e_slots:
+                            if not bool(done_arr[k - env_slot_offsets[e]]):
+                                continue
 
-                reward_arr = _flatten_batch(reward)
-                done_arr = _flatten_batch(terminated) | _flatten_batch(truncated)
+                            idx = route_ids[k]
 
-                # envs with no reward on terminal / reset transitions count zero
-                # reward; rewards accumulate in one tensor op per env
-
-                locs = [k - env_slot_offsets[e] for k in e_slots]
-                current_return.index_add_(0, route_ids[e_slots], _gather_slot_rewards(reward_arr, locs, device))
-
-                for k in e_slots:
-                    steps_used[k] += 1
-
-                for k in e_slots:
-                    if not bool(done_arr[k - env_slot_offsets[e]]):
-                        continue
-
-                    idx = route_ids[k]
-
-                    returns[idx] += current_return[idx]
-                    current_return[idx] = 0.
-                    episode_counts[idx] += 1
-                    episodes_done[k] += 1
-                    episode_counter[k] += 1
-
-                    if memory_wrapped:
-                        memories[k] = init_memories[k]
-
-                    if episodes_done[k] >= num_episodes:
-                        cursor[k] += 1
-                        episodes_done[k] = 0
-
-                        if cursor[k] < len(tours[k]):
-                            route_ids[k] = tours[k][cursor[k]]
-
-                    # single envs advance to the next episode with a fresh seed;
-                    # vector envs autoreset on their own
-
-                    if num_env_slots == 1 and cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]:
-                        _try_seed(env, _mix_seed(base_seed, k, episode_counter[k]))
-                        last_obs[e], _ = env.reset()
-
-                # a vector env fully done while individuals remain resets onto a
-                # fresh seeded episode; autoreset episodes in progress are discarded
-
-                if num_env_slots > 1 and env.needs_reset and any(
-                    cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]
-                    for k in e_slots
-                ):
-                    for k in e_slots:
-                        if cursor[k] < len(tours[k]):
-                            current_return[route_ids[k]] = 0.
+                            returns[idx] = torch.maximum(returns[idx], current_return[idx]) if agg == 'max' else returns[idx] + current_return[idx]
+                            current_return[idx] = 0.
+                            episode_counts[idx] += 1
+                            episodes_done[k] += 1
+                            episode_counter[k] += 1
 
                             if memory_wrapped:
                                 memories[k] = init_memories[k]
 
-                    _try_seed(env, _mix_seed(base_seed, e, env_reset_count[e]))
-                    env_reset_count[e] += 1
-                    last_obs[e], _ = env.reset()
+                            if episodes_done[k] >= num_episodes:
+                                cursor[k] += 1
+                                episodes_done[k] = 0
+
+                                if cursor[k] < len(tours[k]):
+                                    route_ids[k] = tours[k][cursor[k]]
+
+                            # single envs advance to the next episode with a fresh seed;
+                            # vector envs autoreset on their own
+
+                            if num_env_slots == 1 and cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]:
+                                _try_seed(env, _mix_seed(base_seed, k, episode_counter[k]))
+                                last_obs[e], _ = env.reset()
+
+                    # non-autoresetting vector envs reset on full completion;
+                    # autoresetting envs advance slots independently and are left untouched
+                    if num_env_slots > 1 and not _env_autoresets(env) and env.needs_reset and any(
+                        cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]
+                        for k in e_slots
+                    ):
+                        for k in e_slots:
+                            if cursor[k] < len(tours[k]):
+                                current_return[route_ids[k]] = 0.
+
+                                if memory_wrapped:
+                                    memories[k] = init_memories[k]
+
+                        _try_seed(env, _mix_seed(base_seed, e, env_reset_count[e]))
+                        env_reset_count[e] += 1
+                        last_obs[e], _ = env.reset()
 
         # mean return over completed episodes, falling back to the partial
         # return of an in-progress episode when the budget ran out
 
         completed = episode_counts > 0
         fitness = torch.zeros(num_individuals, device = device)
-        fitness[completed] = returns[completed] / episode_counts[completed]
-        fitness[~completed] = current_return[~completed]
+
+        # 'mean' averages episodes; 'max' keeps the best episode (optimistic)
+        if agg == 'max':
+            fitness[completed] = returns[completed]
+            fitness[~completed] = torch.maximum(returns[~completed], current_return[~completed])
+        else:
+            fitness[completed] = returns[completed] / episode_counts[completed]
+            fitness[~completed] = current_return[~completed]
 
         return fitness
 
@@ -494,7 +600,8 @@ class EnvInteractor:
         action = None,
         horizon = 1000,
         num_episodes = 1,
-        seed = None
+        seed = None,
+        agg = 'mean'
     ):
         def fitness_fn(population, individuals = None):
             individuals = default(individuals, range(population.pop_size))
@@ -504,7 +611,8 @@ class EnvInteractor:
                 action = action,
                 horizon = horizon,
                 num_episodes = num_episodes,
-                seed = seed
+                seed = seed,
+                agg = agg
             )
 
         fitness_fn.batch_eval = True
@@ -522,34 +630,51 @@ class EnvInteractor:
         horizon = 1000,
         num_episodes = 1,
         seed = None,
+        agg = 'mean',
         contiguous = False,
         sync_base_model = False
     ):
+        # discrete action spaces sample categorically when no action fn is given
+        action = default(action, self._auto_action())
+
         if not exists(fitness):
-            fitness = self.fitness(population, action = action, horizon = horizon, num_episodes = num_episodes, seed = seed)
+            fitness = self.fitness(population, action = action, horizon = horizon, num_episodes = num_episodes, seed = seed, agg = agg)
 
         mode = 'batch' if getattr(fitness, 'batch_eval', False) else _fitness_mode(fitness)
 
         if mode != 'all':
-            return evaluate_population_distributed(
+            fitnesses = evaluate_population_distributed(
                 population,
                 fitness,
                 batch_eval = mode == 'batch',
                 contiguous = contiguous,
                 sync_base_model = sync_base_model
             )
+        else:
+            # all-at-once fitness - evaluated on the main rank and broadcast,
+            # so every rank derives the same fitnesses and evolves in lockstep
 
-        # all-at-once fitness - evaluated on the main rank and broadcast, so
-        # every rank derives the same fitnesses and evolves in lockstep
+            with preserve_rng():
+                res = fitness(population) if is_main_rank() else None
 
-        with preserve_rng():
-            res = fitness(population) if is_main_rank() else None
+                if exists(res):
+                    dd = dict(device = population.device, dtype = torch.float32)
+                    res = cast_tensor(res, **dd)
+                    assert res.shape[0] == population.pop_size, f'all-at-once fitness must return one fitness per individual, got {tuple(res.shape)}'
 
-            if exists(res):
-                res = cast_tensor(res, population.device).to(dtype = torch.float32)
-                assert res.shape[0] == population.pop_size, f'all-at-once fitness must return one fitness per individual, got {tuple(res.shape)}'
+            fitnesses = broadcast_object(res, src = 0)
 
-        return broadcast_object(res, src = 0)
+        # a NaN fitness would poison selection - rank it dead last instead
+        if not torch.isfinite(fitnesses).all():
+            fitnesses = torch.nan_to_num(fitnesses, nan = torch.finfo(torch.float32).min)
+
+        return fitnesses
+
+    def _auto_action(self):
+        if action_space_is_discrete(self.action_space):
+            return make_categorical_action()
+
+        return None
 
     # high-level evolve - a bare model (population built around it) or an
     # existing population in, merged best policy out; target_fitness (+ patience)
@@ -557,7 +682,7 @@ class EnvInteractor:
 
     def evolve(
         self,
-        model: nn.Module,
+        model: nn.Module | None = None,
         *,
         pop_size: int | None = None,
         low_rank: int | None = None,
@@ -575,6 +700,10 @@ class EnvInteractor:
         return_history: bool = False,
         evolve_kwargs: dict | None = None,
         evaluate_kwargs: dict | None = None,
+        on_generation = None,
+        adaptive_epsilon: bool = False,
+        target_success_rate: float = 0.20,
+        epsilon_factor: float = 1.15,
         checkpoint_dir: str | Path | None = None,
         checkpoint_every: int | None = None,
         resume: bool = False,
@@ -624,7 +753,7 @@ class EnvInteractor:
                 **evaluate_kwargs
             )
 
-        def on_generation(generation, best_fitness, best_index, history, is_best):
+        def _checkpoint(generation, best_fitness, best_index, history, is_best):
             if exists(checkpoint_dir) and ((generation + 1) % checkpoint_every == 0 or generation == num_generations - 1):
                 self._save_checkpoint(
                     population,
@@ -637,6 +766,9 @@ class EnvInteractor:
                     as_best = is_best
                 )
 
+            if exists(on_generation):
+                on_generation(generation, best_fitness, best_index, history, is_best)
+
         _, best_index, history = _generation_loop(
             population,
             evaluate_gen,
@@ -646,7 +778,10 @@ class EnvInteractor:
             progress = progress,
             start_generation = start_generation,
             initial_state = initial_state,
-            on_generation = on_generation,
+            on_generation = _checkpoint,
+            adaptive_epsilon = adaptive_epsilon,
+            target_success_rate = target_success_rate,
+            epsilon_factor = epsilon_factor,
             **evolve_kwargs
         )
 
@@ -672,7 +807,7 @@ class EnvInteractor:
         if 'eval_seed' in pkg:
             population._eval_seed = pkg['eval_seed']
 
-        if exact_resume:
+        if exact_resume and 'rng_state' in pkg:
             torch.random.set_rng_state(pkg['rng_state'].to('cpu'))
 
         return pkg['generation'] + 1, pkg['best_fitness'], pkg['best_index'], pkg['history']
@@ -756,7 +891,7 @@ class EnvInteractor:
                         if memory_wrapped:
                             policy_out, mem = policy(mem, obs_t)
 
-                            mem = cast_tensor(mem, device)
+                            mem = cast_tensor(mem, device = device)
                             mem = atleast_1d(mem)
 
                             assert mem.shape == init_memories.shape, f'network emitted memory {tuple(mem.shape)} does not match the carried memory {tuple(init_memories.shape)}'
@@ -794,6 +929,7 @@ class EnvInteractor:
 def interact_with_env(
     envs,
     *,
+    num_envs: int | None = None,
     device: torch.device | str | None = None,
     wrappers: Sequence | None = None,
     seed: int = 0,
@@ -802,6 +938,7 @@ def interact_with_env(
 ):
     return EnvInteractor(
         envs,
+        num_envs = num_envs,
         device = device,
         wrappers = wrappers,
         seed = seed,
@@ -814,10 +951,11 @@ def interact_with_env(
 
 def evolve_with_env(
     envs,
-    model: nn.Module,
+    model: nn.Module | None = None,
     *,
-    pop_size: int,
-    low_rank: int,
+    num_envs: int | None = None,
+    pop_size: int = 16,
+    low_rank: int = 16,
     lora_targets: Sequence[str] | None = None,
     action = None,
     fitness = None,
@@ -834,11 +972,20 @@ def evolve_with_env(
     return_history: bool = False,
     evolve_kwargs: dict | None = None,
     evaluate_kwargs: dict | None = None,
+    on_generation = None,
+    adaptive_epsilon: bool = False,
+    target_success_rate: float = 0.20,
+    epsilon_factor: float = 1.15,
+    checkpoint_dir: str | Path | None = None,
+    checkpoint_every: int | None = None,
+    resume: bool = False,
+    exact_resume: bool = False,
     to_range = None,
     from_range = (-1., 1.)
 ):
     interactor = interact_with_env(
         envs,
+        num_envs = num_envs,
         device = device,
         wrappers = wrappers,
         seed = seed,
@@ -867,5 +1014,13 @@ def evolve_with_env(
         patience = patience,
         return_history = return_history,
         evolve_kwargs = evolve_kwargs,
-        evaluate_kwargs = evaluate_kwargs
+        evaluate_kwargs = evaluate_kwargs,
+        on_generation = on_generation,
+        adaptive_epsilon = adaptive_epsilon,
+        target_success_rate = target_success_rate,
+        epsilon_factor = epsilon_factor,
+        checkpoint_dir = checkpoint_dir,
+        checkpoint_every = checkpoint_every,
+        resume = resume,
+        exact_resume = exact_resume
     )

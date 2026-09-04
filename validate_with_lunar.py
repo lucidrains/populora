@@ -95,6 +95,8 @@ def validate_with_lunar(
     elite_frac: float = 0.25,
     crossover_type: str = 'extrapolative',
     mutation_type: str = 'full_gaussian',
+    yin_yang: bool = False,
+    twin_duel: bool | None = None,
     horizon: int = 1000,
 ):
     torch.manual_seed(seed)
@@ -128,9 +130,15 @@ def validate_with_lunar(
     tau = pop.epsilon_tau if adaptive_epsilon else 'n/a'
     mut_eps = f'per-individual ({sigma_granularity})' if adaptive_epsilon else f'fixed {epsilon}'
 
+    if twin_duel is None:
+        twin_duel = yin_yang
+
+    selection_type = 'twin_duel' if twin_duel else 'deterministic'
+
     print(f'[PopuLoRA Lunar] pop_size: {pop_size} | low_rank: {low_rank} | generations: {max_generations} | episodes: {num_episodes} | distribution: {distribution} | horizon: {horizon}')
     print(f'  mutation: {mut_eps} | adaptive_epsilon: {adaptive_epsilon} | sigma_granularity: {sigma_granularity} | epsilon_init: {epsilon_init} | epsilon_tau: {tau}')
     print(f'  crossover: {crossover_type} | mutation_type: {mutation_type} | survive_frac: {survive_frac} | elite_frac: {elite_frac} | sample_actions: {sample_actions} | temperature: {temperature}')
+    print(f'  yin_yang: {yin_yang} | twin_duel: {twin_duel} | selection_type: {selection_type}')
 
     recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
@@ -156,7 +164,7 @@ def validate_with_lunar(
             seed = pop.eval_seed
         )
 
-        result = pop.select('deterministic', fitnesses = fitnesses, survive_frac = survive_frac, elite_frac = elite_frac)
+        result = pop.select(selection_type, fitnesses = fitnesses, survive_frac = survive_frac, elite_frac = elite_frac)
         best_reward = fitnesses.max().item()
         mean_reward = fitnesses.mean().item()
         recent_rewards.append(mean_reward)
@@ -179,7 +187,14 @@ def validate_with_lunar(
             pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature, use_z_score = True)
             pop.repopulate()
         else:
-            parents = pop.select_parents(parent_selection_type, fitnesses = fitnesses, num_children = len(result.culled), num_elites = num_elites, culled = result.culled)
+            parents = pop.select_parents(
+                parent_selection_type,
+                fitnesses = fitnesses,
+                num_children = len(result.culled),
+                num_elites = num_elites,
+                culled = result.culled,
+                yin_yang = yin_yang,
+            )
 
             if pop.adaptive_epsilon:
                 # per-individual mutation rate: log-normal self-adaptation,
@@ -187,7 +202,21 @@ def validate_with_lunar(
                 pop._sigma_recombine_(result.culled, parents)
                 epsilon = pop._sigma_epsilon_(result.culled)
 
-            pop.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses).mutate_(mutation_type, individuals = result.culled, epsilon = epsilon).regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
+            pop.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses)
+
+            if yin_yang and len(result.culled) >= 2:
+                num_pairs = len(result.culled) // 2
+                yang_culled = result.culled[:num_pairs * 2:2]
+                yin_culled = result.culled[1:num_pairs * 2:2]
+                pop._twin_pairs = (yang_culled.clone(), yin_culled.clone())
+                for key in pop.weight_down:
+                    pop.weight_down[key].data[yin_culled] = pop.weight_down[key].data[yang_culled]
+                    pop.weight_up[key].data[yin_culled] = pop.weight_up[key].data[yang_culled]
+            else:
+                pop._twin_pairs = None
+
+            eff_mutation = 'yin_yang' if yin_yang else mutation_type
+            pop.mutate_(eff_mutation, individuals = result.culled, epsilon = epsilon).regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
 
     env.close()
     assert False, f'LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})'

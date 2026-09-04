@@ -41,6 +41,7 @@ from populora.interact import (
     evolve_with_env,
     interact_with_env,
 )
+from populora.vector import MultiprocessingVecEnv
 from populora.memory import Memory, rollout
 from populora.generate import generate
 from populora.archive import HallOfFame

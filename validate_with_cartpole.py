@@ -29,6 +29,7 @@ from populora.populora import exists
 def run_cartpole_experiment(
     target_avg_reward: float = 490.0,
     pop_size: int = 64,
+    num_envs: int = 32,
     low_rank: int = 4,
     max_generations: int = 100,
     horizon: int = 1000,
@@ -40,15 +41,24 @@ def run_cartpole_experiment(
     survive_frac: float = 0.5,
     elite_frac: float = 0.25,
     crossover_type: str = 'extrapolative',
+    yin_yang: bool = False,
+    twin_duel: bool | None = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    env = gym.make('CartPole-v1')
+    if num_envs > 1:
+        env = gym.make_vec('CartPole-v1', num_envs = num_envs)
+        obs_dim = env.single_observation_space.shape[0]
+        action_dim = env.single_action_space.n
+    else:
+        env = gym.make('CartPole-v1')
+        obs_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.n
 
     interactor = interact_with_env(env, seed = seed)
     pop = interactor.population(
-        MLP(env.observation_space.shape[0], 32, env.action_space.n),
+        MLP(obs_dim, 32, action_dim),
         pop_size = pop_size,
         low_rank = low_rank,
         eval_seed = seed,
@@ -70,8 +80,12 @@ def run_cartpole_experiment(
             elite_frac = elite_frac,
             crossover_type = crossover_type,
             epsilon = epsilon,
+            yin_yang = yin_yang,
+            twin_duel = twin_duel,
         ),
     )
+
+    env.close()
 
     best_reward = max(h['best_fitness'] for h in history)
     gen_to_solve = next(

@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from torch import is_tensor, tensor
 
-from torch_einops_utils import maybe
+from torch_einops_utils import cast_tensor, maybe
 
 def exists(v):
     return v is not None
@@ -29,9 +29,6 @@ def cast_tuple(val, length = 1):
     return val if isinstance(val, (tuple, list)) else ((val,) * length)
 
 maybe_cast_tuple = maybe(cast_tuple)
-
-def cast_tensor(val, device = None):
-    return val if is_tensor(val) else tensor(val, device = device)
 
 def torch_save(pkg, path: str | Path):
     # torch.save with directory creation - one canonical save path
@@ -63,21 +60,11 @@ def resolve_dtype(dtype):
 
     raise TypeError(f'invalid dtype {dtype}')
 
-def rescale_from_range_to_range(value, from_range = (-1., 1.), to_range = (0., 1.)):
-    # affine map of a value (or tensor, or per-dimension range pair) from one
-    # range to another, e.g. policy outputs on (-1, 1) to an env action range.
-    # a pure rescale - no clamping
+def rescale_from_range_to_range(val, from_range = (-1., 1.), to_range = (0., 1.)):
+    (from_min, from_max), (to_min, to_max) = from_range, to_range
 
-    from_lo, from_hi = maybe_cast_tuple(from_range, 2)
-    to_lo, to_hi = maybe_cast_tuple(to_range, 2)
+    if is_tensor(val):
+        dd = dict(device = val.device, dtype = val.dtype)
+        from_min, from_max, to_min, to_max = [torch.as_tensor(t, **dd) for t in (from_min, from_max, to_min, to_max)]
 
-    from_lo, from_hi = torch.as_tensor(from_lo), torch.as_tensor(from_hi)
-    to_lo, to_hi = torch.as_tensor(to_lo), torch.as_tensor(to_hi)
-
-    if is_tensor(value):
-        device = value.device
-        from_lo, from_hi = from_lo.to(device), from_hi.to(device)
-        to_lo, to_hi = to_lo.to(device), to_hi.to(device)
-
-    ratio = (to_hi - to_lo) / (from_hi - from_lo)
-    return to_lo + (value - from_lo) * ratio
+    return (val - from_min) / (from_max - from_min) * (to_max - to_min) + to_min

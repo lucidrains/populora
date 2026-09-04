@@ -259,11 +259,71 @@ def mutation_neftune_style(
 
         weight_down.data[idx] = w_down.to(dtype)
 
+# M6 - yin-yang: antipodal twin mutation pairing individuals (2k, 2k+1)
+@batchable
+def mutation_yin_yang(
+    population: Population,
+    idx: Tensor,
+    epsilon: float = 0.15,
+    **kwargs
+):
+    if len(idx) < 2:
+        return mutation_full_gaussian(population, idx, epsilon = epsilon, **kwargs)
+
+    num_pairs = len(idx) // 2
+    yang_idx = idx[:num_pairs * 2:2]
+    yin_idx = idx[1:num_pairs * 2:2]
+    leftover = idx[num_pairs * 2:]
+
+    for key, weight_down in population.weight_down.items():
+        weight_up = population.weight_up[key]
+        dtype = weight_down.dtype
+
+        eps_down, eps_up = _resolve_epsilon(epsilon, key)
+
+        if is_tensor(eps_down):
+            eps_down_yang = eps_down[:num_pairs * 2:2] if eps_down.ndim > 0 and len(eps_down) == len(idx) else eps_down
+            eps_up_yang = eps_up[:num_pairs * 2:2] if eps_up.ndim > 0 and len(eps_up) == len(idx) else eps_up
+        else:
+            eps_down_yang = eps_down
+            eps_up_yang = eps_up
+
+        base_down = weight_down.data[yang_idx].float()
+        base_up = weight_up.data[yang_idx].float()
+
+        # Sample perturbations once for the pair
+        delta_down = _noise_like(base_down, eps_down_yang)
+        delta_up = _noise_like(base_up, eps_up_yang)
+
+        # Yang gets +delta_down, +delta_up
+        # Yin gets -delta_down, -delta_up
+        # Yielding exact first-order antipodal parameter perturbations:
+        # Delta W_yang = W_up delta_down + delta_up W_down + O(delta^2)
+        # Delta W_yin  = -(W_up delta_down + delta_up W_down) + O(delta^2)
+        w_down_yang = base_down + delta_down
+        w_up_yang = base_up + delta_up
+
+        w_down_yin = base_down - delta_down
+        w_up_yin = base_up - delta_up
+
+        weight_down.data[yang_idx] = w_down_yang.to(dtype)
+        weight_up.data[yang_idx] = w_up_yang.to(dtype)
+
+        weight_down.data[yin_idx] = w_down_yin.to(dtype)
+        weight_up.data[yin_idx] = w_up_yin.to(dtype)
+
+        if len(leftover) > 0:
+            w_down_left = weight_down.data[leftover].float() + _noise_like(weight_down.data[leftover].float(), eps_down)
+            w_up_left = weight_up.data[leftover].float() + _noise_like(weight_up.data[leftover].float(), eps_up)
+            weight_down.data[leftover] = w_down_left.to(dtype)
+            weight_up.data[leftover] = w_up_left.to(dtype)
+
 register_mutation('svd_structured', mutation_svd_structured)
 register_mutation('layer_selective_gaussian', mutation_layer_selective_gaussian)
 register_mutation('component_masking', mutation_component_masking)
 register_mutation('full_gaussian', mutation_full_gaussian)
 register_mutation('neftune_style', mutation_neftune_style)
+register_mutation('yin_yang', mutation_yin_yang)
 
 # survivor selection
 
@@ -361,9 +421,79 @@ def select_fuss(fitnesses, num_select, eps = 1e-5, **kwargs):
     selected = torch.multinomial(voronoi_cell_sizes + eps, num_select, replacement = False)
     return sort_indices.gather(-1, selected)
 
+def select_twin_duel(fitnesses, num_select, twin_pairs = None, **kwargs):
+    # If twin_pairs is explicitly provided (e.g. from Population._twin_pairs tracking
+    # which offspring slots were generated as antipodal twins), duel each twin pair directly.
+    # The losing twin is strictly culled, and the winning twins compete on fitness alongside
+    # the non-twin survivor candidates (elites / previous generation).
+    device = fitnesses.device
+    pop_size = fitnesses.shape[-1]
+    batch_shape = fitnesses.shape[:-1]
+
+    if twin_pairs is not None:
+        yang_idx, yin_idx = twin_pairs
+        assert len(yang_idx) == len(yin_idx)
+
+        yang_fit = fitnesses[..., yang_idx]
+        yin_fit = fitnesses[..., yin_idx]
+        yang_wins = yang_fit >= yin_fit
+
+        twin_winners = torch.where(yang_wins, yang_idx, yin_idx)
+        twin_losers = torch.where(yang_wins, yin_idx, yang_idx)
+
+        if fitnesses.ndim == 1:
+            is_loser = torch.zeros(pop_size, dtype = torch.bool, device = device)
+            is_loser[twin_losers] = True
+
+            candidates = torch.arange(pop_size, device = device)[~is_loser]
+            candidate_fitness = fitnesses[candidates]
+
+            sort_order = candidate_fitness.argsort(descending = True)
+            sorted_candidates = candidates[sort_order]
+
+            if num_select <= len(sorted_candidates):
+                return sorted_candidates[:num_select]
+
+            loser_fitness = fitnesses[twin_losers]
+            loser_sort = loser_fitness.argsort(descending = True)
+            sorted_losers = twin_losers[loser_sort]
+            return cat((sorted_candidates, sorted_losers[:num_select - len(sorted_candidates)]), dim = -1)
+
+    # Fallback (e.g. generation 0 where entire population is organized as adjacent pairs (2k, 2k+1)):
+    num_pairs = pop_size // 2
+
+    if num_pairs == 0:
+        return fitnesses.topk(num_select, dim = -1).indices
+
+    paired_fit = fitnesses[..., :num_pairs * 2].reshape(*batch_shape, num_pairs, 2)
+    winner_sub = paired_fit.argmax(dim = -1)
+    loser_sub = 1 - winner_sub
+
+    pair_offsets = torch.arange(num_pairs, device = device) * 2
+    winners = pair_offsets + winner_sub
+    losers = pair_offsets + loser_sub
+
+    if pop_size % 2 == 1:
+        leftover = torch.full((*batch_shape, 1), pop_size - 1, device = device, dtype = torch.long)
+        winners = cat((winners, leftover), dim = -1)
+
+    winner_fitness = fitnesses.gather(-1, winners)
+    sort_order = winner_fitness.argsort(dim = -1, descending = True)
+    sorted_winners = winners.gather(-1, sort_order)
+
+    if num_select <= sorted_winners.shape[-1]:
+        return sorted_winners[..., :num_select]
+
+    loser_fitness = fitnesses.gather(-1, losers)
+    loser_sort = loser_fitness.argsort(dim = -1, descending = True)
+    sorted_losers = losers.gather(-1, loser_sort)
+
+    return cat((sorted_winners, sorted_losers[..., :num_select - sorted_winners.shape[-1]]), dim = -1)
+
 register_selection('deterministic', select_deterministic)
 register_selection('probabilistic', select_probabilistic)
 register_selection('fuss', select_fuss)
+register_selection('twin_duel', select_twin_duel)
 
 # parent selection
 

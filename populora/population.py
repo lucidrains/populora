@@ -372,6 +372,8 @@ class Population(_LoRAMixin):
             self._log_sigma_down[key] = sigma_down
             self._log_sigma_up[key] = sigma_up
 
+        self._twin_pairs = None
+
         if exists(device):
             self.to(device)
 
@@ -653,7 +655,10 @@ class Population(_LoRAMixin):
                 group_size, max_age, elite_max_age, aging_decay, **kwargs
             )
 
-        select_fn = with_elites(select_fn, elite_frac)
+        if selection_type == 'twin_duel':
+            kwargs.setdefault('twin_pairs', getattr(self, '_twin_pairs', None))
+        else:
+            select_fn = with_elites(select_fn, elite_frac)
 
         # single-group selection fns keep the 1-d fitnesses contract; multi-group
         # selection works on the grouped fitnesses
@@ -825,11 +830,43 @@ class Population(_LoRAMixin):
         culled: Tensor | Sequence[int] | None = None,
         survivors: Tensor | Sequence[int] | None = None,
         ignore_indices: Tensor | Sequence[int] | None = None,
+        yin_yang: bool = False,
         **kwargs
     ):
         assert fitnesses.ndim == 1
         assert divisible_by(self.pop_size, num_groups)
         assert divisible_by(num_children, num_groups)
+
+        if yin_yang and num_children >= 2:
+            num_pairs = num_children // 2
+            half_parents = self.select_parents(
+                selection_type = selection_type,
+                fitnesses = fitnesses,
+                num_children = num_pairs,
+                num_parents_per_child = num_parents_per_child,
+                num_groups = num_groups,
+                culled = culled,
+                survivors = survivors,
+                ignore_indices = ignore_indices,
+                yin_yang = False,
+                **kwargs
+            )
+            paired_parents = torch.repeat_interleave(half_parents, 2, dim = 0)
+            if num_children > len(paired_parents):
+                extra_parents = self.select_parents(
+                    selection_type = selection_type,
+                    fitnesses = fitnesses,
+                    num_children = num_children - len(paired_parents),
+                    num_parents_per_child = num_parents_per_child,
+                    num_groups = num_groups,
+                    culled = culled,
+                    survivors = survivors,
+                    ignore_indices = ignore_indices,
+                    yin_yang = False,
+                    **kwargs
+                )
+                paired_parents = torch.cat([paired_parents, extra_parents], dim = 0)
+            return paired_parents
 
         # unwrap SelectionResult if passed
 
@@ -843,16 +880,17 @@ class Population(_LoRAMixin):
         eligible_indices = None
 
         if exists(survivors):
-            eligible_indices = cast_tensor(survivors, self.device).flatten()
+            eligible_indices = cast_tensor(survivors, device = self.device).flatten()
         elif exists(culled) or exists(ignore_indices):
             to_ignore = []
             if exists(culled):
-                to_ignore.append(cast_tensor(culled, self.device).flatten())
+                to_ignore.append(cast_tensor(culled, device = self.device).flatten())
             if exists(ignore_indices):
-                to_ignore.append(cast_tensor(ignore_indices, self.device).flatten())
+                to_ignore.append(cast_tensor(ignore_indices, device = self.device).flatten())
 
             ignored_tensor = cat(to_ignore)
-            mask = torch.ones(self.pop_size, dtype = torch.bool, device = self.device)
+            dd = dict(device = self.device, dtype = torch.bool)
+            mask = torch.ones(self.pop_size, **dd)
             mask[ignored_tensor] = False
             eligible_indices = torch.arange(self.pop_size, device = self.device)[mask]
 
@@ -1116,11 +1154,38 @@ class Population(_LoRAMixin):
     def repopulate_(
         self,
         std_down: float | None = None,
-        std_up: float | None = None
+        std_up: float | None = None,
+        save_champion: bool = False
     ):
-        return self.reinit_individuals_(torch.arange(self.pop_size, device = self.device), std_down = std_down, std_up = std_up)
+        self.reinit_individuals_(torch.arange(self.pop_size, device = self.device), std_down = std_down, std_up = std_up)
+
+        if save_champion:
+            for key in self.weight_up:
+                self.weight_up[key].data[0].zero_()
+
+        return self
 
     repopulate = repopulate_
+
+    @torch.no_grad()
+    def merge_champion_(
+        self,
+        fitnesses: Tensor | None = None,
+        individual: int | None = None,
+        repopulate: bool = True,
+        save_champion: bool = True
+    ):
+        assert exists(fitnesses) or exists(individual), 'either fitnesses or individual must be passed to merge_champion_'
+        champion_idx = fitnesses.argmax().item() if exists(fitnesses) else individual
+
+        self.select_and_merge_(indices = champion_idx, remove_hooks = False)
+
+        if repopulate:
+            self.repopulate_(save_champion = save_champion)
+
+        return self
+
+    merge_champion = merge_champion_
 
     @torch.no_grad()
     def regularize_(
@@ -1212,6 +1277,8 @@ class Population(_LoRAMixin):
         parent_selection_type = 'tournament',
         crossover_type = 'average',
         mutation_type = 'full_gaussian',
+        yin_yang = False,
+        twin_duel: bool | None = None,
         num_groups = 1,
         epsilon = 0.1,
         weight_decay = 0.0,
@@ -1253,6 +1320,12 @@ class Population(_LoRAMixin):
                 **kwargs
             )
 
+        if twin_duel is None:
+            twin_duel = yin_yang
+
+        if twin_duel:
+            selection_type = 'twin_duel'
+
         result = self.select(
             selection_type,
             fitnesses,
@@ -1277,12 +1350,16 @@ class Population(_LoRAMixin):
         ages = set_at('[p], k, k -> [p]', ages, result.survivors, _at(ages, result.survivors) + 1)
         self._ages.data.copy_(ages)
 
+        if yin_yang:
+            mutation_type = 'yin_yang'
+
         parents = self.select_parents(
             parent_selection_type,
             fitnesses,
             num_children = len(result.culled),
             culled = result.culled,
             num_groups = num_groups,
+            yin_yang = yin_yang,
             **kwargs
         )
 
@@ -1290,8 +1367,20 @@ class Population(_LoRAMixin):
             self._sigma_recombine_(result.culled, parents)
             epsilon = self._sigma_epsilon_(result.culled)
 
-        self.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses, **kwargs) \
-            .mutate_(mutation_type, individuals = result.culled, epsilon = epsilon, **kwargs) \
+        self.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses, **kwargs)
+
+        if yin_yang and len(result.culled) >= 2:
+            num_pairs = len(result.culled) // 2
+            yang_culled = result.culled[:num_pairs * 2:2]
+            yin_culled = result.culled[1:num_pairs * 2:2]
+            self._twin_pairs = (yang_culled.clone(), yin_culled.clone())
+            for key in self.weight_down:
+                self.weight_down[key].data[yin_culled] = self.weight_down[key].data[yang_culled]
+                self.weight_up[key].data[yin_culled] = self.weight_up[key].data[yang_culled]
+        else:
+            self._twin_pairs = None
+
+        self.mutate_(mutation_type, individuals = result.culled, epsilon = epsilon, **kwargs) \
             .regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
 
         if retire_refill is not None and exists(retired) and len(retired) > 0:
@@ -1479,7 +1568,7 @@ class Population(_LoRAMixin):
         # setattrs - skipped when the model tree is already fully in eval
         # mode, which is the rollout / decode steady state
 
-        if any(module.training for module in self.model.modules()):
+        if self.model.training:
             with temp_eval(self), torch.no_grad():
                 yield
             return
@@ -1648,8 +1737,8 @@ class LoRA(_LoRAMixin):
                 assert exists(weight_down) and exists(weight_up), 'weight_down and weight_up must be provided together'
                 assert key in weight_down and key in weight_up, f'missing lora weights for target {path} in the provided checkpoint'
 
-                w_down = cast_tensor(weight_down[key], device)
-                w_up = cast_tensor(weight_up[key], device)
+                w_down = cast_tensor(weight_down[key], device = device)
+                w_up = cast_tensor(weight_up[key], device = device)
 
                 assert w_down.shape == (dim, low_rank), f'weight_down for {path} must be {dim, low_rank}'
                 assert w_up.shape == (dim_inner, low_rank), f'weight_up for {path} must be {dim_inner, low_rank}'
@@ -1836,6 +1925,9 @@ def _generation_loop(
     start_generation: int = 0,
     initial_state: tuple | None = None,
     on_generation: Callable | None = None,
+    adaptive_epsilon: bool = False,
+    target_success_rate: float = 0.20,
+    epsilon_factor: float = 1.15,
     **evolve_kwargs
 ):
     """the shared generation driver of `evolve` and `EnvInteractor.evolve` -
@@ -1855,9 +1947,12 @@ def _generation_loop(
 
     best_fitness, best_index, history = default(initial_state, (float('-inf'), 0, []))
     streak = 0
+    epsilon = evolve_kwargs.get('epsilon', 0.2)
+    smoothed_success = None
+    prev_median = None
 
     for generation in maybe_progress(range(start_generation, num_generations), progress, 'evolving'):
-        fitnesses = evaluate()
+        fitnesses = evaluate().detach()
 
         gen_best_fitness = float(fitnesses.max())
         is_best = gen_best_fitness > best_fitness
@@ -1871,6 +1966,17 @@ def _generation_loop(
             mean_fitness = float(fitnesses.mean()),
         ))
 
+        # Rechenberg 1/5 rule with exponential smoothing - adapts epsilon
+        # based on the fraction of individuals beating the prior median
+        if adaptive_epsilon and prev_median is not None:
+            success = float((fitnesses >= prev_median).float().mean())
+            smoothed_success = success if smoothed_success is None else 0.30 * success + 0.70 * smoothed_success
+
+            epsilon = Population.adapt_mutation_epsilon(
+                epsilon, smoothed_success, target_success_rate = target_success_rate, factor = epsilon_factor
+            )
+            evolve_kwargs['epsilon'] = epsilon
+
         if exists(target_fitness):
             streak = streak + 1 if gen_best_fitness >= target_fitness else 0
 
@@ -1878,6 +1984,7 @@ def _generation_loop(
                 break
 
         population.evolve_(fitnesses, **evolve_kwargs)
+        prev_median = float(fitnesses.median())
 
         if exists(on_generation):
             on_generation(generation, best_fitness, best_index, history, is_best)
@@ -1908,7 +2015,8 @@ def evolve(
     assert callable(fitness_fn), 'fitness_fn must be a callable taking the population and returning one fitness per individual'
 
     def evaluate_gen():
-        fitnesses = cast_tensor(fitness_fn(population)).to(population.device).float()
+        dd = dict(device = population.device, dtype = torch.float32)
+        fitnesses = cast_tensor(fitness_fn(population), **dd)
         assert fitnesses.shape == (population.pop_size,), f'fitness_fn must return one fitness per individual, got {tuple(fitnesses.shape)}'
         return fitnesses
 

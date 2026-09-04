@@ -1007,6 +1007,28 @@ def test_select_and_merge_single_individual(kwargs_factory):
     out_after_merge = model(x)
     assert allclose(out_best_before_merge, out_after_merge, atol = 1e-5)
 
+def test_merge_champion_and_save_champion():
+    model = get_model()
+    x = torch.randint(0, 1000, (1, 16))
+
+    pop = Population(
+        model,
+        pop_size = 4,
+        low_rank = 4,
+        lora_targets = ['attn_layers.layers.0.1.to_q']
+    )
+
+    fitnesses = torch.tensor([1.0, 4.0, 2.0, 3.0])
+    best_idx = fitnesses.argmax().item()
+
+    out_champ_before = pop(x, individual = best_idx)
+
+    # merge champion and repopulate with champion preserved at index 0
+    pop.merge_champion_(fitnesses = fitnesses, repopulate = True, save_champion = True)
+
+    out_ind0_after = pop(x, individual = 0)
+    assert allclose(out_champ_before, out_ind0_after, atol = 1e-5)
+
 def test_culled_excluded_from_parents():
     pop = Population(
         get_model(),
@@ -2398,3 +2420,80 @@ def test_mutate_per_target_epsilon_map():
 
     for key in pop.weight_down.keys():
         assert not allclose(before[key], pop.weight_down[key]), 'per-target epsilon should mutate every target'
+
+def test_mutation_yin_yang():
+    torch.manual_seed(42)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 4,
+        low_rank = 2,
+    )
+    # Ensure individuals 0 and 1 have identical starting weights
+    for key in pop.weight_down:
+        pop.weight_down[key].data[1].copy_(pop.weight_down[key].data[0])
+        pop.weight_up[key].data[1].copy_(pop.weight_up[key].data[0])
+
+    base_down = {key: pop.weight_down[key].data[0].clone() for key in pop.weight_down}
+    base_up = {key: pop.weight_up[key].data[0].clone() for key in pop.weight_up}
+
+    # Mutate with yin_yang
+    pop.mutate_('yin_yang', individuals = [0, 1], epsilon = 0.1)
+
+    for key in pop.weight_down:
+        # Both factors should perturb in exact opposite directions
+        delta_down_0 = pop.weight_down[key].data[0] - base_down[key]
+        delta_down_1 = pop.weight_down[key].data[1] - base_down[key]
+        assert torch.allclose(delta_down_0, -delta_down_1, atol = 1e-6)
+
+        delta_up_0 = pop.weight_up[key].data[0] - base_up[key]
+        delta_up_1 = pop.weight_up[key].data[1] - base_up[key]
+        assert torch.allclose(delta_up_0, -delta_up_1, atol = 1e-6)
+
+        # First-order directional perturbation is exactly antipodal:
+        first_order_0 = base_up[key] @ delta_down_0.t() + delta_up_0 @ base_down[key].t()
+        first_order_1 = base_up[key] @ delta_down_1.t() + delta_up_1 @ base_down[key].t()
+        assert torch.allclose(first_order_0, -first_order_1, atol = 1e-6)
+
+def test_evolve_yin_yang():
+    torch.manual_seed(42)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+    fitnesses = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    res = pop.evolve_(fitnesses, yin_yang = True, survive_frac = 0.5)
+    assert len(res.culled) == 4
+    assert pop._twin_pairs is not None
+
+def test_select_twin_duel():
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+    # Pairs: (0, 1), (2, 3), (4, 5), (6, 7)
+    # Pair 0: 0 beats 1 (10.0 > 2.0) -> winner 0
+    # Pair 1: 3 beats 2 (8.0 > 1.0) -> winner 3
+    # Pair 2: 4 beats 5 (6.0 > 0.5) -> winner 4
+    # Pair 3: 7 beats 6 (9.0 > 3.0) -> winner 7
+    fitnesses = torch.tensor([10.0, 2.0, 1.0, 8.0, 6.0, 0.5, 3.0, 9.0])
+    res = pop.select('twin_duel', fitnesses, survive_frac = 0.5)
+    assert set(res.survivors.tolist()) == {0, 3, 4, 7}
+    assert set(res.culled.tolist()) == {1, 2, 5, 6}
+
+    # Multi-generation tracked twin duel:
+    pop._twin_pairs = (torch.tensor([1, 3]), torch.tensor([5, 7]))
+    # Twins: 1 vs 5 -> 1 wins (10 > 2)
+    # Twins: 3 vs 7 -> 7 wins (9 > 1)
+    # Losers culled: [5, 3]
+    # Candidates: [0, 2, 4, 6] (old) + [1, 7] (twin winners)
+    fitnesses_g1 = torch.tensor([6.0, 10.0, 4.0, 1.0, 8.0, 2.0, 3.0, 9.0])
+    res_g1 = pop.select('twin_duel', fitnesses_g1, survive_frac = 0.5)
+    assert set(res_g1.survivors.tolist()) == {1, 7, 4, 0}
+    assert set(res_g1.culled.tolist()) == {5, 3, 2, 6}
+
+    # Evolve with twin_duel
+    res_evolve = pop.evolve_(fitnesses, yin_yang = True, twin_duel = True, survive_frac = 0.5)
+    assert len(res_evolve.culled) == 4
+    assert pop._twin_pairs is not None

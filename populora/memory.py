@@ -15,7 +15,7 @@ def init_memory_tensor(init_memory, num, device = None):
     # every slot, a (1, ...) tensor is expanded, a tensor matching `num` is used as-is.
     # always returns a fresh tensor, never an alias of the caller's
 
-    init = cast_tensor(init_memory, device).to(device)
+    init = cast_tensor(init_memory, device = device)
     init = atleast_1d(init)
 
     if init.shape[0] == 1:

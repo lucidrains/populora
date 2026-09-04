@@ -765,6 +765,113 @@ def test_evolve_with_env_to_range():
 
     assert isinstance(policy, nn.Module)
 
+def test_interact_num_envs_wraps_factory(monkeypatch):
+    captured = {}
+
+    class DummyVecEnv:
+        autoresets = True
+        action_dim = 1
+        action_space = type('Box', (), {'shape': (1,), 'low': -2.0, 'high': 2.0})()
+
+        def __init__(self, factory, num_envs, seed = 0):
+            captured['factory'] = factory
+            captured['num_envs'] = num_envs
+            captured['seed'] = seed
+            self.num_envs = num_envs
+
+        def reset(self):
+            return np.zeros((2, 2)), {}
+
+        def step(self, actions):
+            return np.zeros((2, 2)), np.ones(2), np.zeros(2, dtype = bool), np.zeros(2, dtype = bool), {}
+
+        def seed(self, seed):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr('populora.interact.MultiprocessingVecEnv', DummyVecEnv)
+
+    interactor = interact_with_env(ActionAimMockEnv, num_envs = 2, seed = 7)
+    assert captured['num_envs'] == 2
+    assert captured['seed'] == 7
+    assert interactor.num_envs == 2
+    assert interactor.action_dim == 1
+    assert interactor.to_range == (-2.0, 2.0)  # Box bounds picked up off the vec env
+    interactor.close()
+
+def test_interact_num_envs_instance_raises():
+    with pytest.raises(ValueError, match = 'cannot be cloned'):
+        interact_with_env(ActionAimMockEnv(), num_envs = 2)
+
+def test_interact_probe_dims():
+    interactor = interact_with_env(ActionAimMockEnv, seed = 0)
+    assert interactor.obs_dim == 4
+    assert interactor.action_dim == 1
+
+def test_interact_default_backbone():
+    interactor = interact_with_env(ActionAimMockEnv, seed = 0)
+    pop = interactor.population(pop_size = 8, low_rank = 2)
+
+    assert pop.model[-1].__class__.__name__ == 'Tanh'
+    assert pop.model[0].in_features == 4
+    assert pop.model[4].out_features == 1
+
+class DiscreteAimMockEnv(ActionAimMockEnv):
+    # gymnasium-style Discrete space: n + empty shape, no low / high
+    action_space = type('Discrete', (), {'n': 3, 'shape': ()})()
+
+    def step(self, action):
+        action = int(np.asarray(action).reshape(-1)[0])
+        self.t += 1
+        return self.obs(), 1.0 - abs(action - 1) / 2, self.t >= self.max_steps, False, {}
+
+def test_interact_discrete_auto_action():
+    interactor = interact_with_env(DiscreteAimMockEnv, seed = 0)
+    pop = interactor.population(pop_size = 8, low_rank = 2)
+
+    assert pop.model[-1].__class__.__name__ != 'Tanh'  # logits, no tanh for discrete
+    fitnesses = interactor.evaluate(pop, horizon = 30)
+    assert fitnesses.shape == (8,)
+    assert torch.isfinite(fitnesses).all()
+
+def test_interact_discrete_to_range_untouched():
+    # regression: a gymnasium Discrete (shape = ()) was misread as a Box and
+    # crashed probing its low / high - the auto-rescale must never fire on it
+    interactor = interact_with_env(DiscreteAimMockEnv, seed = 0)
+
+    assert interactor.action_space.n == 3
+    assert interactor.to_range is None
+    assert interactor.action_dim == 3
+
+class NanRewardMockEnv(ActionAimMockEnv):
+    def step(self, action):
+        return self.obs(), float('nan'), True, False, {}
+
+def test_interact_nan_sanitize():
+    interactor = interact_with_env(NanRewardMockEnv, seed = 0)
+    pop = interactor.population(make_policy(out_dim = 1), pop_size = 8, low_rank = 2)
+
+    fitnesses = interactor.evaluate(pop, action = lambda a: a, horizon = 10)
+    assert torch.isfinite(fitnesses).all()
+    assert fitnesses.min() < -1e30
+
+def test_evolve_with_env_checkpoint(tmp_path):
+    evolve_with_env(
+        ActionAimMockEnv,
+        make_policy(out_dim = 1),
+        pop_size = 8,
+        low_rank = 2,
+        num_generations = 2,
+        horizon = 30,
+        checkpoint_dir = tmp_path,
+        seed = 0,
+    )
+
+    assert (tmp_path / 'best.pt').exists()
+    assert (tmp_path / 'latest.pt').exists()
+
 if __name__ == '__main__':
     test_linear_layer_paths()
     test_interact_single_env()
