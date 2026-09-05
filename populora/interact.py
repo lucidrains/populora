@@ -24,8 +24,12 @@ from populora.distributed import (
 from populora.memory import Memory, init_memory_tensor
 from populora.policies import make_categorical_action
 from populora.population import Population, _generation_loop
-from populora.spaces import action_space_bounds, action_space_is_discrete
-from populora.vector import MultiprocessingVecEnv, action_dim_of
+from env_ssl_wrapper import (
+    MultiprocessingVecEnv,
+    action_dim_of,
+    action_space_bounds,
+    action_space_is_discrete,
+)
 
 # helpers
 

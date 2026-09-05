@@ -71,3 +71,15 @@ from populora.operators import (
     tier_rule_replace,
     with_elites,
 )
+from populora.schedules import (
+    Schedule,
+    CosineAnnealingSchedule,
+    OscillatingNoiseSchedule,
+    LinearSchedule,
+    ConstantSchedule,
+    as_schedule,
+)
+from populora.rl_finetune import (
+    rl_finetune_elites,
+    rl_finetune_elites_,
+)

@@ -329,6 +329,7 @@ class Population(_LoRAMixin):
         self._eval_seed = eval_seed
 
         self.register_buffer('_ages', torch.zeros(self.pop_size, dtype = torch.long)) # per-individual age in generations, 0 at birth
+        self.register_buffer('_generation', torch.tensor(0, dtype = torch.long))
 
         # per-individual log-normal step size (Schwefel/Beyer) - inherited by
         # geometric mean, perturbed in place, selected with the weights it
@@ -388,7 +389,8 @@ class Population(_LoRAMixin):
             low_rank = self.low_rank,
             lora_targets = list(self.lora_targets),
             dtype = self._dtype,
-            ages = self._ages.clone()
+            ages = self._ages.clone(),
+            generation = self.generation,
         )
 
         if self.adaptive_epsilon:
@@ -434,6 +436,9 @@ class Population(_LoRAMixin):
 
         if 'ages' in pkg:
             self._ages.data.copy_(pkg['ages'].to(self.device))
+
+        if 'generation' in pkg:
+            self.generation = pkg['generation']
 
         # a fresh set of adapters re-anchors the population - a prior merge no
         # longer taints routed forwards
@@ -499,6 +504,23 @@ class Population(_LoRAMixin):
 
         return self
 
+    @torch.no_grad()
+    def backup_individual(self, individual = 0):
+        individual, (weight_down, weight_up) = self.individual_weights(individual)
+        return {
+            'down': {key: weight.clone() for key, weight in weight_down.items()},
+            'up': {key: weight.clone() for key, weight in weight_up.items()}
+        }
+
+    @torch.no_grad()
+    def restore_individual(self, individual, backup: dict):
+        individual, (weight_down, weight_up) = self.individual_weights(individual)
+        for key, w_down in backup['down'].items():
+            weight_down[key].copy_(w_down)
+        for key, w_up in backup['up'].items():
+            weight_up[key].copy_(w_up)
+        return self
+
     def to_lora(self, individual = 0, requires_grad: bool = True):
         # extract an individual as a standalone trainable adapter, removing this population's hooks
         # so the delta is applied exactly once
@@ -529,6 +551,14 @@ class Population(_LoRAMixin):
     @property
     def ages(self):
         return self._ages.clone() # generations each individual has survived
+
+    @property
+    def generation(self) -> int:
+        return int(self._generation.item())
+
+    @generation.setter
+    def generation(self, value: int):
+        self._generation.copy_(torch.as_tensor(value, dtype = torch.long, device = self.device))
 
     def _target_groups(self, knobs, kwargs):
         # group targets by resolved per-target params - a bare dict or PerTarget
@@ -610,6 +640,13 @@ class Population(_LoRAMixin):
                 for idx in indices.tolist():
                     fn(population, idx, **params)
 
+        eps = kwargs.get('epsilon', None)
+        if callable(eps):
+            try:
+                kwargs['epsilon'] = float(eps(self.generation))
+            except TypeError:
+                kwargs['epsilon'] = float(eps())
+
         groups = self._target_groups(dict(mutation_type = mutation_type, epsilon = kwargs.get('epsilon')), kwargs)
 
         if groups is None:
@@ -632,6 +669,7 @@ class Population(_LoRAMixin):
 
         survive_frac: float = 0.5,
         elite_frac: float = 0.10,
+        num_elites: int | None = None,
         num_groups: int = 1,
         max_age: int | None = None, # hard retirement past a max lifetime - https://arxiv.org/abs/2109.13744
         elite_max_age: int | None = None, # elite-only tenure cap - https://ieeexplore.ieee.org/document/573957
@@ -646,7 +684,10 @@ class Population(_LoRAMixin):
 
         group_size = self.pop_size // num_groups
         num_survivors = max(1, int(group_size * survive_frac))
-        num_elites = max(1, int(group_size * elite_frac)) if elite_frac > 0. else 0
+        if num_elites is None:
+            num_elites = max(1, int(group_size * elite_frac)) if elite_frac > 0. else 0
+        else:
+            num_elites = min(int(num_elites), num_survivors)
         all_indices = torch.arange(group_size, device = self.device)
 
         if exists(max_age) or exists(elite_max_age) or exists(aging_decay):
@@ -680,6 +721,20 @@ class Population(_LoRAMixin):
 
             if num_groups == 1:
                 survivors = rearrange(survivors, 's -> 1 s')
+
+            if num_elites > 0:
+                top_elites = fitnesses_grouped.topk(num_elites, dim = -1).indices
+                if num_groups == 1 and top_elites.ndim == 1:
+                    top_elites = rearrange(top_elites, 'e -> 1 e')
+
+                survivor_list = []
+                for g in range(num_groups):
+                    g_elites = top_elites[g]
+                    g_surv = survivors[g]
+                    keep = g_surv[~torch.isin(g_surv, g_elites)]
+                    merged = torch.cat([g_elites, keep])[:num_survivors]
+                    survivor_list.append(merged)
+                survivors = torch.stack(survivor_list, dim = 0)
 
             mask = torch.ones(num_groups, group_size, dtype = torch.bool, device = self.device)
             mask.scatter_(-1, survivors, False)
@@ -1190,6 +1245,145 @@ class Population(_LoRAMixin):
     merge_champion = merge_champion_
 
     @torch.no_grad()
+    def _shared_fitnesses_(
+        self,
+        fitnesses: Tensor,
+        quantile: float = 0.5,
+        kernel_power: float = 1.0,
+    ):
+        """Goldberg & Richardson (1987) fitness sharing over genotype distance.
+
+        Each individual's fitness is divided by its niche count - the number of
+        other individuals within a sharing radius of its LoRA genome (scaled by
+        a triangular kernel). Dense basins (e.g. every offspring in the same
+        stable-shuffle niche) are discounted, so underrepresented niches (e.g.
+        a rare but promising flight gait) survive selection and are refined
+        instead of being crowded out. `quantile` picks the sharing radius as a
+        quantile of all pairwise genome distances, so it adapts to the scale of
+        the population without manual tuning."""
+        assert 0.0 < quantile <= 1.0, 'sharing quantile must be in (0, 1]'
+
+        n = self.pop_size
+        device, dtype = self.device, self._dtype
+
+        # squared LoRA genome distance matrix, summed over all targets
+
+        sq = torch.zeros(n, n, device = device, dtype = torch.float32)
+
+        for key in self.weight_down:
+            wd = self.weight_down[key].float()
+            wu = self.weight_up[key].float()
+            wd_flat = wd.reshape(n, -1)
+            wu_flat = wu.reshape(n, -1)
+
+            for w in (wd_flat, wu_flat):
+                sq += (w * w).sum(-1, keepdim = True)
+                sq -= 2 * w @ w.T
+                sq += (w * w).sum(-1, keepdim = True).T
+
+        dist = sq.clamp(min = 0.0).sqrt()
+
+        # sharing radius from pairwise distances, then shared fitness
+
+        triu = dist.masked_select(torch.triu(torch.ones(n, n, dtype = torch.bool, device = device), diagonal = 1))
+        radius = triu.quantile(quantile).item() if n > 1 else 1.0
+        radius = max(radius, 1e-8)
+
+        overlap = (1.0 - (dist / radius).clamp(max = 1.0)) ** kernel_power
+        niche_count = overlap.sum(dim = -1).clamp(min = 1e-6)
+
+        shared = fitnesses.to(device).float() / niche_count
+        return shared
+
+    @torch.no_grad()
+    def mirror_antithetic_(self):
+        """Rearrange the adapter population into antithetic pairs in *weight*
+        space: individual 2k and 2k+1 share the same `down` factor while the
+        `up` factor is negated, so their LoRA deltas exactly cancel
+        (ΔW = U · Dᵀ negates when only one factor flips). This is the
+        variance-reduced mirror sampling of Salimans et al. (2017), made
+        correct for the bilinear LoRA reparameterization."""
+        n = self.pop_size
+        assert divisible_by(n, 2), 'pop_size must be even for mirror_antithetic_'
+
+        for key in self.weight_down:
+            wd = self.weight_down[key]
+            wu = self.weight_up[key]
+            wd.data[1::2] = wd[0::2].clone()
+            wu.data[1::2] = (-wu[0::2]).clone()
+
+        return self
+
+    @torch.no_grad()
+    def evolve_es_(
+        self,
+        fitnesses: Tensor,
+        *,
+        mirrored: bool = True,
+        lr: float = 1.0,
+        weight_decay: float = 0.0,
+        soft_threshold: float = 0.0,
+        temperature: float = 1.0,
+    ):
+        """OpenAI-ES style rank-weighted update (Salimans et al. 2017) on the
+        LoRA population, merged directly into the base network. Individuals are
+        the perturbation directions (fresh noise drawn around the base each
+        generation); fitnesses become centered ranks in [-0.5, 0.5] and the
+        base takes a step along the fitness-weighted mean delta. When
+        `mirrored` is True the population must be arranged in antithetic pairs
+        (see mirror_antithetic_) so each pair contributes its fitness
+        difference - a low-variance directional estimate.
+
+        The gradient is normalized by the realized population noise scale,
+        making the step size scale-free (only `lr` matters)."""
+        assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+
+        n = self.pop_size
+        f = fitnesses.to(self.device).float()
+
+        # centered ranks in [-0.5, 0.5]
+        ranks = f.argsort().argsort().float()
+        ranks = ranks / max(n - 1, 1) - 0.5
+
+        if mirrored:
+            assert divisible_by(n, 2), 'pop_size must be even when mirrored = True'
+            ranks = ranks.view(-1, 2)
+            weights = ranks[:, 0] - ranks[:, 1]   # (pairs,) - zero-mean per pair
+            selected = torch.arange(0, n, 2, device = self.device)
+        else:
+            weights = ranks
+            selected = torch.arange(n, device = self.device)
+
+        for path, key, w_down, w_up in _iter_adapters(self):
+            linear = self.model.get_submodule(path)
+            wd = w_down[selected].float()
+            wu = w_up[selected].float()
+
+            # realized LoRA deltas of the selected individuals
+            delta_all = einsum(wu, wd, 'k e r, k d r -> k e d')   # (k, out, in)
+            sigma = delta_all.std() + 1e-8
+
+            grad = einsum(weights, delta_all, 'k, k e d -> e d') / (sigma * n * 0.5)
+            linear.weight.add_((lr * grad).to(linear.weight.dtype))
+
+            if has_(weight_decay):
+                linear.weight.mul_(1. - weight_decay)
+
+            if has_(soft_threshold):
+                w = linear.weight
+                w.copy_(w.sign() * (w.abs() - soft_threshold).clamp(min = 0.))
+
+        return self
+
+    evolve_es = evolve_es_
+
+    def rl_finetune_elites_(self, fitnesses, env, **kwargs):
+        from populora.rl_finetune import rl_finetune_elites_
+        return rl_finetune_elites_(self, fitnesses, env, **kwargs)
+
+    rl_finetune_elites = rl_finetune_elites_
+
+    @torch.no_grad()
     def regularize_(
         self,
         weight_decay: float = 0.0,
@@ -1275,6 +1469,7 @@ class Population(_LoRAMixin):
         *,
         survive_frac = 0.5,
         elite_frac = 0.10,
+        num_elites: int | None = None,
         selection_type = 'deterministic',
         parent_selection_type = 'tournament',
         crossover_type = 'average',
@@ -1282,6 +1477,7 @@ class Population(_LoRAMixin):
         yin_yang = False,
         twin_duel: bool | None = None,
         num_groups = 1,
+        sharing_quantile: float = 0.0, # > 0: Goldberg-Richardson fitness sharing over LoRA genome distance
         epsilon = 0.1,
         weight_decay = 0.0,
         soft_threshold = 0.0,
@@ -1301,10 +1497,20 @@ class Population(_LoRAMixin):
         assert retire_refill in (None, 'crossover', 'reinit', 'es'), f'unknown retire_refill {retire_refill!r} - choose from "crossover", "reinit", "es"'
         assert not (exists(retire_refill) and not exists(max_age)), 'retire_refill requires max_age'
 
+        cur_gen = self.generation if gen is None else int(gen)
+        if exists(gen):
+            self.generation = gen
+
+        if callable(epsilon):
+            try:
+                epsilon = float(epsilon(cur_gen))
+            except TypeError:
+                epsilon = float(epsilon())
+
         tiered = tiered or exists(tiers)
 
         if tiered:
-            return self._evolve_tiered_(
+            res = self._evolve_tiered_(
                 fitnesses,
                 tiers = tiers,
                 strata = strata,
@@ -1315,30 +1521,55 @@ class Population(_LoRAMixin):
                 num_groups = num_groups,
                 epsilon = epsilon,
                 burn_in = burn_in,
-                gen = gen,
+                gen = cur_gen,
                 max_age = max_age,
                 elite_max_age = elite_max_age,
                 aging_decay = aging_decay,
                 **kwargs
             )
+            self._generation.add_(1)
+            return res
 
-        if twin_duel is None:
-            twin_duel = yin_yang
+        twin_duel = default(twin_duel, yin_yang)
+        selection_type = 'twin_duel' if twin_duel else selection_type
 
-        if twin_duel:
-            selection_type = 'twin_duel'
+        # Goldberg-Richardson fitness sharing: selection and parent choice see
+        # fitness discounted by niche density, so crowded basins cannot crowd
+        # out underrepresented ones. The raw champion is always retained.
+
+        if sharing_quantile > 0.:
+            shared_fitnesses = self._shared_fitnesses_(fitnesses, quantile = sharing_quantile)
+        else:
+            shared_fitnesses = fitnesses
+
+        raw_fitnesses = fitnesses
 
         result = self.select(
             selection_type,
-            fitnesses,
+            shared_fitnesses,
             survive_frac = survive_frac,
             elite_frac = elite_frac,
+            num_elites = num_elites,
             num_groups = num_groups,
             max_age = max_age,
             elite_max_age = elite_max_age,
             aging_decay = aging_decay,
             **kwargs
         )
+
+        if sharing_quantile > 0.:
+            # strict elitism on the raw fitness: the true champion always survives
+            best_raw = int(raw_fitnesses.argmax().item())
+            survivors = result.survivors
+            culled = result.culled
+
+            if best_raw not in survivors.tolist():
+                drop = shared_fitnesses[survivors].argmin().item()
+                dropped = int(survivors[drop].item())
+                survivors = torch.cat((survivors[:drop], survivors[drop + 1:], torch.tensor([best_raw], device = self.device)))
+                culled = culled[culled != best_raw]
+                culled = torch.cat((culled, torch.tensor([dropped], device = self.device)))
+                result = SelectionResult(survivors, culled, result.elites)
 
         # age-forced culls, captured before bookkeeping for later refill
 
@@ -1399,6 +1630,7 @@ class Population(_LoRAMixin):
             elif retire_refill == 'es':
                 self._retire_refill_es_(retired, fitnesses, num_groups = num_groups)
 
+        self._generation.add_(1)
         return result
 
     evolve = evolve_

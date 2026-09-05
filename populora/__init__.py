@@ -22,6 +22,8 @@ from populora.populora import (
     MIGRATION_REGISTRY,
     ISLAND_REINIT_REGISTRY,
     TIER_RULE_REGISTRY,
+    rl_finetune_elites,
+    rl_finetune_elites_,
 )
 from populora.distributed import (
     broadcast_object,
@@ -41,7 +43,7 @@ from populora.interact import (
     evolve_with_env,
     interact_with_env,
 )
-from populora.vector import MultiprocessingVecEnv
+from env_ssl_wrapper import MultiprocessingVecEnv
 from populora.memory import Memory, rollout
 from populora.generate import generate
 from populora.archive import HallOfFame
@@ -60,3 +62,11 @@ from populora.policies import (
     register_action_dist,
 )
 from populora._utils import rescale_from_range_to_range
+from populora.schedules import (
+    Schedule,
+    CosineAnnealingSchedule,
+    OscillatingNoiseSchedule,
+    LinearSchedule,
+    ConstantSchedule,
+    as_schedule,
+)
