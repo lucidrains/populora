@@ -125,7 +125,8 @@ def validate_with_xor(
     survive_frac = 0.5,
     elite_frac = 0.25,
     tournament_size = 3,
-    seed = 42
+    seed = 42,
+    brood_size = 1,
 ):
     results = []
 
@@ -204,6 +205,35 @@ def validate_with_xor(
         )
         label = f'{name}+{auxiliary}' if exists(auxiliary) else name
         results.append(('mutation', label, loss))
+
+    # brood selection
+
+    if brood_size > 1:
+        def xor_eval_fn(cand, idxs):
+            preds = cand(XOR_X, individuals = idxs)
+            return -xor_mse(preds)
+
+        pop = Population(
+            MLP(2, hidden_dim, 1),
+            pop_size = pop_size,
+            low_rank = low_rank,
+            lora_targets = ['layers.0.0', 'layers.1']
+        )
+        for _ in tqdm(range(crossover_generations), desc = f'brood: size={brood_size}', leave = False):
+            preds = pop(XOR_X, all_individuals = True)
+            fitnesses = -xor_mse(preds)
+            pop.evolve_(
+                fitnesses,
+                survive_frac = survive_frac,
+                elite_frac = elite_frac,
+                crossover_type = 'extrapolative',
+                epsilon = crossover_epsilon,
+                brood_size = brood_size,
+                brood_eval_fn = xor_eval_fn,
+            )
+        preds = pop(XOR_X, all_individuals = True)
+        loss = xor_mse(preds).min().item()
+        results.append(('brood', f'size_{brood_size}', loss))
 
     # print results
 

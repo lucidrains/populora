@@ -57,8 +57,8 @@ def run_inverted_pendulum_experiment(
     survive_frac: float = 0.5,
     elite_frac: float = 0.25,
     crossover_type: str = 'extrapolative',
-    yin_yang: bool = False,
-    twin_duel: bool | None = None,
+    brood_size: int = 1,
+    brood_horizon: int | None = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -110,8 +110,8 @@ def run_inverted_pendulum_experiment(
             elite_frac = elite_frac,
             crossover_type = crossover_type,
             epsilon = epsilon,
-            yin_yang = yin_yang,
-            twin_duel = twin_duel,
+            brood_size = brood_size,
+            brood_horizon = brood_horizon,
         ),
     )
 

@@ -68,6 +68,8 @@ def run_cartpole_memory_experiment(
     survive_frac: float = 0.5,
     elite_frac: float = 0.25,
     crossover_type: str = 'extrapolative',
+    brood_size: int = 1,
+    brood_horizon: int | None = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -97,6 +99,8 @@ def run_cartpole_memory_experiment(
         eval_seed = seed,
     )
 
+    action = make_categorical_action(sample = True, temperature = 1.0)
+
     _, history = interactor.evolve(
         pop,
         action = action,
@@ -110,6 +114,8 @@ def run_cartpole_memory_experiment(
             elite_frac = elite_frac,
             crossover_type = crossover_type,
             epsilon = epsilon,
+            brood_size = brood_size,
+            brood_horizon = brood_horizon,
         ),
     )
 

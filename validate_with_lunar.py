@@ -34,16 +34,16 @@ from populora import Population, interact_with_env, make_action
 def divisible_by(num, den):
     return (num % den) == 0
 
-def make_env(distribution: str, render_mode = None, **env_kwargs):
-    if distribution == 'categorical':
-        return gym.make('LunarLander-v3', render_mode = render_mode, **env_kwargs)
-
-    return gym.make('LunarLanderContinuous-v3', render_mode = render_mode, **env_kwargs)
+def make_env(distribution: str, num_envs: int = 1, render_mode = None, **env_kwargs):
+    env_id = 'LunarLander-v3' if distribution == 'categorical' else 'LunarLanderContinuous-v3'
+    if num_envs > 1 and render_mode is None:
+        return gym.make_vec(env_id, num_envs = num_envs, **env_kwargs)
+    return gym.make(env_id, render_mode = render_mode, **env_kwargs)
 
 def make_record_env(distribution: str, video_folder: str, name_prefix: str):
     # record the raw env - continuous action spaces already emit (-1, 1)
 
-    env = make_env(distribution, render_mode = 'rgb_array')
+    env = make_env(distribution, num_envs = 1, render_mode = 'rgb_array')
     return gym.wrappers.RecordVideo(env, video_folder = video_folder, name_prefix = name_prefix)
 def evaluate_individual(
     env: gym.Env,
@@ -95,21 +95,27 @@ def validate_with_lunar(
     elite_frac: float = 0.25,
     crossover_type: str = 'extrapolative',
     mutation_type: str = 'full_gaussian',
-    yin_yang: bool = False,
-    twin_duel: bool | None = None,
     horizon: int = 1000,
+    brood_size: int = 1,
+    brood_horizon: int | None = None,
+    num_envs: int = 16,
+    record_video: bool = True,
+    record_every: int = 5,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    shutil.rmtree('videos', ignore_errors = True)
-    os.makedirs('videos', exist_ok = True)
-    print('\nlogging videos of the best individual per generation to ./videos/\n')
+    if record_video:
+        shutil.rmtree('videos', ignore_errors = True)
+        os.makedirs('videos', exist_ok = True)
+        print('\nlogging videos of the best individual per generation to ./videos/\n')
 
-    env = make_env(distribution)
-    state_dim = env.observation_space.shape[0]
-    continuous = isinstance(env.action_space, gym.spaces.Box)
-    action_dim = env.action_space.shape[0] if continuous else env.action_space.n
+    env = make_env(distribution, num_envs = num_envs)
+    obs_space = getattr(env, 'single_observation_space', env.observation_space)
+    act_space = getattr(env, 'single_action_space', env.action_space)
+    state_dim = obs_space.shape[0]
+    continuous = isinstance(act_space, gym.spaces.Box)
+    action_dim = act_space.shape[0] if continuous else act_space.n
 
     interactor = interact_with_env(env, seed = seed)
 
@@ -130,15 +136,10 @@ def validate_with_lunar(
     tau = pop.epsilon_tau if adaptive_epsilon else 'n/a'
     mut_eps = f'per-individual ({sigma_granularity})' if adaptive_epsilon else f'fixed {epsilon}'
 
-    if twin_duel is None:
-        twin_duel = yin_yang
-
-    selection_type = 'twin_duel' if twin_duel else 'deterministic'
-
     print(f'[PopuLoRA Lunar] pop_size: {pop_size} | low_rank: {low_rank} | generations: {max_generations} | episodes: {num_episodes} | distribution: {distribution} | horizon: {horizon}')
+    print(f'  num_envs: {num_envs} | brood_size: {brood_size} | brood_horizon: {brood_horizon or horizon}')
     print(f'  mutation: {mut_eps} | adaptive_epsilon: {adaptive_epsilon} | sigma_granularity: {sigma_granularity} | epsilon_init: {epsilon_init} | epsilon_tau: {tau}')
     print(f'  crossover: {crossover_type} | mutation_type: {mutation_type} | survive_frac: {survive_frac} | elite_frac: {elite_frac} | sample_actions: {sample_actions} | temperature: {temperature}')
-    print(f'  yin_yang: {yin_yang} | twin_duel: {twin_duel} | selection_type: {selection_type}')
 
     recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
@@ -164,7 +165,6 @@ def validate_with_lunar(
             seed = pop.eval_seed
         )
 
-        result = pop.select(selection_type, fitnesses = fitnesses, survive_frac = survive_frac, elite_frac = elite_frac)
         best_reward = fitnesses.max().item()
         mean_reward = fitnesses.mean().item()
         recent_rewards.append(mean_reward)
@@ -173,9 +173,13 @@ def validate_with_lunar(
         pbar.write(f'gen {gen:03d} | best_reward: {best_reward:6.1f} | mean_reward: {mean_reward:6.1f} | avg_last_{avg_generations}_generations: {avg_recent:6.1f}')
 
         best_idx = fitnesses.argmax().item()
-        record_env = make_record_env(distribution, video_folder = 'videos', name_prefix = f'gen_{gen:03d}')
-        evaluate_individual(record_env, pop, best_idx, action_fn = action_fn)
-        record_env.close()
+        if record_video and (gen % record_every == 0 or gen == max_generations - 1):
+            try:
+                record_env = make_record_env(distribution, video_folder = 'videos', name_prefix = f'gen_{gen:03d}')
+                evaluate_individual(record_env, pop, best_idx, action_fn = action_fn)
+                record_env.close()
+            except Exception as e:
+                pbar.write(f'video recording error: {e}')
 
         if len(recent_rewards) >= avg_generations and avg_recent > target_avg_reward:
             print(f'\n✓ PopuLoRA LunarLander Validation Passed! Last {avg_generations} generations avg reward: {avg_recent:.2f} > {target_avg_reward}')
@@ -187,36 +191,31 @@ def validate_with_lunar(
             pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature, use_z_score = True)
             pop.repopulate()
         else:
-            parents = pop.select_parents(
-                parent_selection_type,
-                fitnesses = fitnesses,
-                num_children = len(result.culled),
+            def brood_eval_fn(p, inds):
+                fits = interactor.evaluate(
+                    p,
+                    action = action_fn,
+                    horizon = brood_horizon or horizon,
+                    num_episodes = 1,
+                    seed = pop.eval_seed
+                )
+                return fits[inds]
+
+            pop.evolve_(
+                fitnesses,
+                survive_frac = survive_frac,
+                elite_frac = elite_frac,
                 num_elites = num_elites,
-                culled = result.culled,
-                yin_yang = yin_yang,
+                selection_type = 'deterministic',
+                parent_selection_type = parent_selection_type,
+                crossover_type = crossover_type,
+                mutation_type = mutation_type,
+                epsilon = epsilon,
+                weight_decay = weight_decay,
+                soft_threshold = soft_threshold,
+                brood_size = brood_size,
+                brood_eval_fn = brood_eval_fn if brood_size > 1 else None,
             )
-
-            if pop.adaptive_epsilon:
-                # per-individual mutation rate: log-normal self-adaptation,
-                # recombined from parents (geometric mean), per-param via sigma_granularity
-                pop._sigma_recombine_(result.culled, parents)
-                epsilon = pop._sigma_epsilon_(result.culled)
-
-            pop.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses)
-
-            if yin_yang and len(result.culled) >= 2:
-                num_pairs = len(result.culled) // 2
-                yang_culled = result.culled[:num_pairs * 2:2]
-                yin_culled = result.culled[1:num_pairs * 2:2]
-                pop._twin_pairs = (yang_culled.clone(), yin_culled.clone())
-                for key in pop.weight_down:
-                    pop.weight_down[key].data[yin_culled] = pop.weight_down[key].data[yang_culled]
-                    pop.weight_up[key].data[yin_culled] = pop.weight_up[key].data[yang_culled]
-            else:
-                pop._twin_pairs = None
-
-            eff_mutation = 'yin_yang' if yin_yang else mutation_type
-            pop.mutate_(eff_mutation, individuals = result.culled, epsilon = epsilon).regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
 
     env.close()
     assert False, f'LunarLander average cumulative reward failed to reach > {target_avg_reward} (got {avg_recent:.2f})'

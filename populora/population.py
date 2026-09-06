@@ -28,6 +28,7 @@ from populora.operators import (
     TIER_RULE_REGISTRY,
     TieredResult,
     SelectionResult,
+    is_deterministic_crossover,
     reinit_es,
     with_elites,
 )
@@ -696,10 +697,7 @@ class Population(_LoRAMixin):
                 group_size, max_age, elite_max_age, aging_decay, **kwargs
             )
 
-        if selection_type == 'twin_duel':
-            kwargs.setdefault('twin_pairs', getattr(self, '_twin_pairs', None))
-        else:
-            select_fn = with_elites(select_fn, elite_frac)
+        select_fn = with_elites(select_fn, elite_frac)
 
         # single-group selection fns keep the 1-d fitnesses contract; multi-group
         # selection works on the grouped fitnesses
@@ -885,43 +883,11 @@ class Population(_LoRAMixin):
         culled: Tensor | Sequence[int] | None = None,
         survivors: Tensor | Sequence[int] | None = None,
         ignore_indices: Tensor | Sequence[int] | None = None,
-        yin_yang: bool = False,
         **kwargs
     ):
         assert fitnesses.ndim == 1
         assert divisible_by(self.pop_size, num_groups)
         assert divisible_by(num_children, num_groups)
-
-        if yin_yang and num_children >= 2:
-            num_pairs = num_children // 2
-            half_parents = self.select_parents(
-                selection_type = selection_type,
-                fitnesses = fitnesses,
-                num_children = num_pairs,
-                num_parents_per_child = num_parents_per_child,
-                num_groups = num_groups,
-                culled = culled,
-                survivors = survivors,
-                ignore_indices = ignore_indices,
-                yin_yang = False,
-                **kwargs
-            )
-            paired_parents = torch.repeat_interleave(half_parents, 2, dim = 0)
-            if num_children > len(paired_parents):
-                extra_parents = self.select_parents(
-                    selection_type = selection_type,
-                    fitnesses = fitnesses,
-                    num_children = num_children - len(paired_parents),
-                    num_parents_per_child = num_parents_per_child,
-                    num_groups = num_groups,
-                    culled = culled,
-                    survivors = survivors,
-                    ignore_indices = ignore_indices,
-                    yin_yang = False,
-                    **kwargs
-                )
-                paired_parents = torch.cat([paired_parents, extra_parents], dim = 0)
-            return paired_parents
 
         # unwrap SelectionResult if passed
 
@@ -1462,6 +1428,106 @@ class Population(_LoRAMixin):
                 log_sigma.data[indices] = math.log(self.epsilon_init)
         return self
 
+    def _evaluate_brood(self, fn: Callable, individuals: Tensor) -> Tensor:
+        # evaluate candidate children during brood selection
+        try:
+            res = fn(self, individuals)
+        except TypeError:
+            try:
+                res = fn(individuals)
+            except TypeError:
+                res = fn(self)
+
+        if is_tensor(res) and res.shape[0] == self.pop_size and len(individuals) < self.pop_size:
+            res = res[individuals]
+
+        fits = cast_tensor(res, device = self.device, dtype = torch.float32)
+        assert fits.ndim == 1 and fits.shape[0] == len(individuals), \
+            f'brood_eval_fn must return 1 fitness per candidate individual ({len(individuals)}), got {tuple(fits.shape)}'
+
+        return fits
+
+    def _adapter_tensors(self) -> list[Tensor]:
+        adapters = [t for _, _, w_down, w_up in _iter_adapters(self) for t in (w_down, w_up)]
+        if self.adaptive_epsilon:
+            adapters.extend(self._sigma_tensors())
+        return adapters
+
+    @torch.no_grad()
+    def _reproduce_offspring_(
+        self,
+        indices: Tensor,
+        parents: Tensor,
+        *,
+        fitnesses: Tensor | None = None,
+        crossover_type: str = 'average',
+        mutation_type: str = 'full_gaussian',
+        epsilon: float = 0.1,
+        weight_decay: float = 0.0,
+        soft_threshold: float = 0.0,
+        brood_size: int = 1,
+        brood_eval_fn: Callable | None = None,
+        **kwargs
+    ):
+        if len(indices) == 0:
+            return self
+
+        assert brood_size >= 1, f'brood_size must be >= 1, got {brood_size}'
+
+        if brood_size > 1:
+            if not exists(brood_eval_fn):
+                raise ValueError(f'brood_size={brood_size} > 1 requires a brood_eval_fn callable to evaluate candidate offspring')
+
+            if is_deterministic_crossover(crossover_type):
+                raise ValueError(
+                    f"brood_size={brood_size} > 1 is disallowed with crossover_type={crossover_type!r} "
+                    f"because it produces identical children across brood candidates. "
+                    f"Use a stochastic crossover operator (e.g. 'extrapolative', 'dare', 'svd_subspace', 'layer_wise', 'xes')."
+                )
+
+        def produce_candidate():
+            cand_eps = epsilon
+            if self.adaptive_epsilon:
+                self._sigma_recombine_(indices, parents)
+                cand_eps = self._sigma_epsilon_(indices)
+
+            self.crossover_(crossover_type, parents, indices, fitnesses = fitnesses, **kwargs)
+            self.mutate_(mutation_type, individuals = indices, epsilon = cand_eps, **kwargs) \
+                .regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold, individuals = indices)
+
+        if brood_size <= 1:
+            produce_candidate()
+            return self
+
+        # brood selection (Tackett 1994)
+
+        best_fits = None
+        best_tensors = None
+
+        for _ in range(brood_size):
+            produce_candidate()
+            cand_fits = self._evaluate_brood(brood_eval_fn, indices)
+
+            if not exists(best_fits):
+                best_fits = cand_fits.clone()
+                best_tensors = [t.data[indices].clone() for t in self._adapter_tensors()]
+                continue
+
+            better = cand_fits > best_fits
+            if not better.any():
+                continue
+
+            best_fits = torch.where(better, cand_fits, best_fits)
+            better_inds = indices[better]
+
+            for best, t in zip(best_tensors, self._adapter_tensors()):
+                best[better] = t.data[better_inds]
+
+        for best, t in zip(best_tensors, self._adapter_tensors()):
+            t.data[indices] = best
+
+        return self
+
     @torch.no_grad()
     def evolve_(
         self,
@@ -1474,8 +1540,6 @@ class Population(_LoRAMixin):
         parent_selection_type = 'tournament',
         crossover_type = 'average',
         mutation_type = 'full_gaussian',
-        yin_yang = False,
-        twin_duel: bool | None = None,
         num_groups = 1,
         sharing_quantile: float = 0.0, # > 0: Goldberg-Richardson fitness sharing over LoRA genome distance
         epsilon = 0.1,
@@ -1491,11 +1555,24 @@ class Population(_LoRAMixin):
         elite_max_age: int | None = None, # elite-only tenure cap - https://ieeexplore.ieee.org/document/573957
         aging_decay: float | None = None, # fitness discounted by decay ** age - https://doi.org/10.1145/1569901.1570012
         retire_refill: str | None = None, # refill retired slots: 'crossover' (default), 'reinit', 'es'
+        brood_size: int = 1, # Tackett (1994) / Altenberg (1994) brood selection
+        brood_eval_fn: Callable | None = None, # evaluation function for brood candidate selection
         **kwargs
     ):
         assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
         assert retire_refill in (None, 'crossover', 'reinit', 'es'), f'unknown retire_refill {retire_refill!r} - choose from "crossover", "reinit", "es"'
-        assert not (exists(retire_refill) and not exists(max_age)), 'retire_refill requires max_age'
+        assert not exists(retire_refill) or exists(max_age), 'retire_refill requires max_age to be set'
+        assert brood_size >= 1, f'brood_size must be >= 1, got {brood_size}'
+        if brood_size > 1:
+            if not exists(brood_eval_fn):
+                raise ValueError(f'brood_size={brood_size} > 1 requires a brood_eval_fn callable to evaluate candidate offspring')
+
+            if is_deterministic_crossover(crossover_type):
+                raise ValueError(
+                    f"brood_size={brood_size} > 1 is disallowed with crossover_type={crossover_type!r} "
+                    f"because it produces identical children across brood candidates. "
+                    f"Use a stochastic crossover operator (e.g. 'extrapolative', 'dare', 'svd_subspace', 'layer_wise', 'xes')."
+                )
 
         cur_gen = self.generation if gen is None else int(gen)
         if exists(gen):
@@ -1525,13 +1602,12 @@ class Population(_LoRAMixin):
                 max_age = max_age,
                 elite_max_age = elite_max_age,
                 aging_decay = aging_decay,
+                brood_size = brood_size,
+                brood_eval_fn = brood_eval_fn,
                 **kwargs
             )
             self._generation.add_(1)
             return res
-
-        twin_duel = default(twin_duel, yin_yang)
-        selection_type = 'twin_duel' if twin_duel else selection_type
 
         # Goldberg-Richardson fitness sharing: selection and parent choice see
         # fitness discounted by niche density, so crowded basins cannot crowd
@@ -1583,42 +1659,28 @@ class Population(_LoRAMixin):
         ages = set_at('[p], k, k -> [p]', ages, result.survivors, _at(ages, result.survivors) + 1)
         self._ages.data.copy_(ages)
 
-        if yin_yang:
-            mutation_type = 'yin_yang'
-
         parents = self.select_parents(
             parent_selection_type,
             fitnesses,
             num_children = len(result.culled),
             culled = result.culled,
             num_groups = num_groups,
-            yin_yang = yin_yang,
             **kwargs
         )
 
-        if self.adaptive_epsilon:
-            self._sigma_recombine_(result.culled, parents)
-            epsilon = self._sigma_epsilon_(result.culled)
-
-        self.crossover_(crossover_type, parents, result.culled, fitnesses = fitnesses, **kwargs)
-
-        if yin_yang and len(result.culled) >= 2:
-            num_pairs = len(result.culled) // 2
-            yang_culled = result.culled[:num_pairs * 2:2]
-            yin_culled = result.culled[1:num_pairs * 2:2]
-            self._twin_pairs = (yang_culled.clone(), yin_culled.clone())
-            for key in self.weight_down:
-                self.weight_down[key].data[yin_culled] = self.weight_down[key].data[yang_culled]
-                self.weight_up[key].data[yin_culled] = self.weight_up[key].data[yang_culled]
-            if self.adaptive_epsilon:
-                for log_sigma in self._sigma_tensors():
-                    log_sigma.data[yin_culled] = log_sigma.data[yang_culled]
-                epsilon = self._sigma_epsilon_(result.culled)
-        else:
-            self._twin_pairs = None
-
-        self.mutate_(mutation_type, individuals = result.culled, epsilon = epsilon, **kwargs) \
-            .regularize_(weight_decay = weight_decay, soft_threshold = soft_threshold)
+        self._reproduce_offspring_(
+            result.culled,
+            parents,
+            fitnesses = fitnesses,
+            crossover_type = crossover_type,
+            mutation_type = mutation_type,
+            epsilon = epsilon,
+            weight_decay = weight_decay,
+            soft_threshold = soft_threshold,
+            brood_size = brood_size,
+            brood_eval_fn = brood_eval_fn,
+            **kwargs
+        )
 
         if retire_refill is not None and exists(retired) and len(retired) > 0:
             # 'crossover' is the default path - retired slots were already culled
@@ -2251,6 +2313,10 @@ def evolve(
     best / mean) with `return_history = True`."""
 
     assert callable(fitness_fn), 'fitness_fn must be a callable taking the population and returning one fitness per individual'
+
+    evolve_kwargs = dict(evolve_kwargs)
+    if evolve_kwargs.get('brood_size', 1) > 1 and 'brood_eval_fn' not in evolve_kwargs:
+        evolve_kwargs['brood_eval_fn'] = fitness_fn
 
     def evaluate_gen():
         dd = dict(device = population.device, dtype = torch.float32)

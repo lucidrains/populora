@@ -190,6 +190,7 @@ def validate_with_mario(
     video_dir = "./videos-mario",
     checkpoint_dir = "./checkpoints-mario",
     resume_from: str | Path | None = None,
+    brood_size: int = 1,
 ):
     level_str = parse_level(level)
 
@@ -323,6 +324,10 @@ def validate_with_mario(
             pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature, use_z_score = True)
             pop.repopulate()
         else:
+            def brood_eval_fn(p, inds):
+                fits = p.evaluate_distributed(evaluate_episodes, batch_eval = True, device = device)
+                return fits[inds]
+
             pop.evolve_(
                 fitnesses,
                 survive_frac = survive_frac,
@@ -334,7 +339,9 @@ def validate_with_mario(
                 epsilon = epsilon,
                 weight_decay = weight_decay,
                 soft_threshold = soft_threshold,
-                tournament_size = tournament_size
+                tournament_size = tournament_size,
+                brood_size = brood_size,
+                brood_eval_fn = brood_eval_fn if brood_size > 1 else None,
             )
 
     for env in envs:

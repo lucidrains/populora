@@ -41,8 +41,8 @@ def run_cartpole_experiment(
     survive_frac: float = 0.5,
     elite_frac: float = 0.25,
     crossover_type: str = 'extrapolative',
-    yin_yang: bool = False,
-    twin_duel: bool | None = None,
+    brood_size: int = 1,
+    brood_horizon: int | None = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -58,18 +58,14 @@ def run_cartpole_experiment(
 
     interactor = interact_with_env(env, seed = seed)
     pop = interactor.population(
-        MLP(obs_dim, 32, action_dim),
+        MLP(obs_dim, 64, 64, action_dim),
         pop_size = pop_size,
         low_rank = low_rank,
-        eval_seed = seed,
-        dtype = dtype,  # 'float32' | 'bfloat16' | 'float16' | 'float8_e4m3fn'
     )
-
-    action = make_categorical_action(sample = True, temperature = temperature)
 
     _, history = interactor.evolve(
         pop,
-        action = action,
+        action = make_categorical_action(temperature = temperature),
         num_generations = max_generations,
         horizon = horizon,
         target_fitness = target_avg_reward,
@@ -80,8 +76,8 @@ def run_cartpole_experiment(
             elite_frac = elite_frac,
             crossover_type = crossover_type,
             epsilon = epsilon,
-            yin_yang = yin_yang,
-            twin_duel = twin_duel,
+            brood_size = brood_size,
+            brood_horizon = brood_horizon,
         ),
     )
 

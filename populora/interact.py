@@ -725,8 +725,19 @@ class EnvInteractor:
                 eval_seed = eval_seed
             )
 
-        evolve_kwargs = default(evolve_kwargs, dict())
+        evolve_kwargs = dict(default(evolve_kwargs, dict()))
         evaluate_kwargs = default(evaluate_kwargs, dict())
+
+        if evolve_kwargs.get('brood_size', 1) > 1 and 'brood_eval_fn' not in evolve_kwargs:
+            brood_h = evolve_kwargs.pop('brood_horizon', None) or horizon
+            brood_ep = evolve_kwargs.pop('brood_episodes', None) or num_episodes
+
+            def _interactor_brood_eval(pop, inds):
+                if not exists(fitness):
+                    return self._rollout_fitness(pop, inds, action = action, horizon = brood_h, num_episodes = brood_ep)
+                return self.evaluate(pop, action = action, fitness = fitness, horizon = brood_h, num_episodes = brood_ep, **evaluate_kwargs)[inds]
+
+            evolve_kwargs['brood_eval_fn'] = _interactor_brood_eval
 
         checkpoint_dir = Path(checkpoint_dir) if exists(checkpoint_dir) else None
 
