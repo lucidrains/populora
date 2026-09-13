@@ -51,7 +51,6 @@ from populora.policies import (
     ACTION_DIST_REGISTRY,
     ActionDist,
     ActionFn,
-    AlphaBeta,
     Beta,
     Categorical,
     SquashedGaussian,

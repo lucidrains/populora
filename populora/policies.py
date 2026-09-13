@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import inspect
-import math
 
 import torch
-from torch.distributions import Beta as TorchBeta
 from torch.distributions import Categorical as TorchCategorical
 from torch.distributions import Distribution, Normal, TanhTransform, TransformedDistribution
 from torch.nn import Module
-from torch.nn import functional as F
+
+from env_ssl_wrapper import action_space_bounds, action_space_is_box, action_space_is_discrete
+from mean_conc_beta import Beta as MeanConcBeta
 
 from populora._utils import default, exists
 
@@ -92,110 +92,43 @@ class Categorical(ActionDist):
     def distribution(self, params, temperature = 1.0):
         return TorchCategorical(logits = params / temperature)
 
-# unimodal beta, mean-concentration reparam - the first action_dim logits
-# sigmoid to the exact mean, the second to a positive concentration, so mean
-# and precision are independent knobs at reachable logits
+# unimodal beta, mean-concentration reparam
 
 class Beta(ActionDist):
-    from_range = (0., 1.)
+    from_range = (-1., 1.)
     event_dim = 1
 
-    def __init__(
-        self,
-        pos_fn = 'softplus',
-        init_conc = 10.,
-        min_conc = 0.,
-        eps = 1e-5
-    ):
+    def __init__(self, bounds = (-1., 1.), **kwargs):
         super().__init__()
-        assert pos_fn in ('exp', 'softplus')
-        assert init_conc > min_conc, 'init_conc must be greater than min_conc'
+        accepted = inspect.signature(MeanConcBeta.__init__).parameters
+        beta_kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        self.beta = MeanConcBeta(bounds = bounds, **beta_kwargs)
+        self.from_range = tuple(map(float, self.beta.bounds))
 
-        self.pos_fn = pos_fn
-        self.init_conc = init_conc
-        self.min_conc = min_conc
-        self.eps = eps
-
-        # raw offset into the positive fn so the concentration at raw 0 is exactly init_conc
-
-        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc)) if pos_fn == 'softplus' else math.log(init_conc - min_conc)
-
-    def concentration(
-        self,
-        raw_conc
-    ):
-        if self.pos_fn == 'softplus':
-            return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
-        elif self.pos_fn == 'exp':
-            return (raw_conc + self.raw_init_conc).exp() + self.min_conc
-
-    def mean(
-        self,
-        params
-    ):
-        raw_mean, _ = params.chunk(2, dim = -1)
-        return raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
-
-    def _concentrations(self, params):
-        # mean via sigmoid, concentration via the positive fn, floored to keep
-        # alpha, beta > 1 (unimodal) with exact mean = alpha / (alpha + beta)
+    def _format_params(self, params):
+        if params.ndim >= 3 and params.shape[-1] == 2:
+            return params
 
         raw_mean, raw_conc = params.chunk(2, dim = -1)
+        return torch.stack([raw_mean, raw_conc], dim = -1)
 
-        mean = raw_mean.sigmoid().clamp(min = self.eps, max = 1. - self.eps)
-        min_mean = torch.minimum(mean, 1. - mean).clamp(min = self.eps)
+    def concentration(self, params, indexed = False):
+        if isinstance(params, Distribution):
+            return self.beta.concentration(params)
 
-        conc = self.concentration(raw_conc) + 1. / min_mean
-        return mean, conc
+        if indexed or (params.ndim == 1 and params.shape[0] % 2 != 0):
+            return self.beta.concentration(params, indexed = True)
 
-    def distribution(self, params, temperature = 1.0):
-        mean, conc = self._concentrations(params)
-
-        if temperature != 1.0:
-            # scaling both concentrations preserves the exact mean - smaller temperature sharpens
-
-            conc = conc / temperature
-
-        return TorchBeta(mean * conc, (1. - mean) * conc)
-
-    def log_prob(
-        self,
-        params_or_dist,
-        action,
-        sum_action_dim = True,
-        eps = None
-    ):
-        eps = default(eps, self.eps)
-        action = action.clamp(min = eps, max = 1. - eps)
-        return super().log_prob(params_or_dist, action, sum_action_dim = sum_action_dim)
-
-# legacy alpha = 1 + softplus, beta = 1 + softplus - the mode is a ratio of
-# the two concentrations, entangling the mean and the precision
-
-class AlphaBeta(ActionDist):
-    from_range = (0., 1.)
-    event_dim = 1
-
-    def _params(self, params):
-        alpha_pre, beta_pre = params.chunk(2, dim = -1)
-        alpha = 1.0 + F.softplus(alpha_pre)
-        beta = 1.0 + F.softplus(beta_pre)
-        return alpha, beta
+        return self.beta.concentration(self._format_params(params))
 
     def mean(self, params):
-        alpha, beta = self._params(params)
-        return (alpha - 1.0) / (alpha + beta - 2.0)
+        if isinstance(params, Distribution):
+            return params.mean
+
+        return self.beta.mean(self._format_params(params))
 
     def distribution(self, params, temperature = 1.0):
-        alpha, beta = self._params(params)
-
-        if temperature != 1.0:
-            # scaling keeps the mode fixed
-
-            alpha = 1.0 + (alpha - 1.0) / temperature
-            beta = 1.0 + (beta - 1.0) / temperature
-
-        return TorchBeta(alpha, beta)
+        return self.beta(self._format_params(params), temperature = temperature)
 
 # the uniform ActionFn wrapper every factory returns - callable on logits,
 # exposing distribution / mean / log_prob / container / from_range
@@ -207,32 +140,18 @@ class ActionFn:
         *,
         sample: bool = True,
         temperature: float = 1.0,
-        to_env_space = None,
-        to_env_space_inv = None
     ):
         self.container = container
         self.sample = sample
         self.temperature = temperature
-
-        # optional mapping from the container's native domain to the env
-        # action space, e.g. beta's (0, 1) -> (-1, 1) rescale, and its
-        # inverse - log_prob maps env-space actions back
-
-        self.to_env_space = to_env_space
-        self.to_env_space_inv = to_env_space_inv
-        self.from_range = default(getattr(to_env_space, 'from_range', None), container.from_range)
+        self.from_range = container.from_range
 
     def distribution(self, params, temperature = None):
-        # temperature 0 is the deterministic mean, handled in __call__ - the
-        # dist itself clamps to a tiny positive floor so the beta's
-        # concentration scaling stays finite
-
         temperature = default(temperature, self.temperature)
         return self.container.distribution(params, temperature = max(temperature, 1e-5))
 
     def mean(self, params):
-        action = self.container.mean(params)
-        return self.to_env_space(action) if exists(self.to_env_space) else action
+        return self.container.mean(params)
 
     def log_prob(
         self,
@@ -241,30 +160,13 @@ class ActionFn:
         sum_action_dim = True,
         eps = None
     ):
-        if exists(self.to_env_space_inv):
-            action = self.to_env_space_inv(action)
-
         return self.container.log_prob(params, action, sum_action_dim = sum_action_dim, eps = eps)
 
     def __call__(self, params):
         if not self.sample or self.temperature == 0:
             return self.mean(params)
 
-        action = self.distribution(params).sample()
-        return self.to_env_space(action) if exists(self.to_env_space) else action
-
-# helper - the affine maps carrying a container's native (0, 1) domain out to
-# the (-1, 1) env action space and back, tagging the output range so the
-# ActionFn picks it up as its from_range
-
-def _unit_rescale(beta_rescale_neg_one_one):
-    if not beta_rescale_neg_one_one:
-        return None, None
-
-    to_env = lambda action: 2.0 * action - 1.0
-    to_env.from_range = (-1., 1.)
-
-    return to_env, lambda action: (action + 1.0) / 2.0
+        return self.distribution(params).sample()
 
 # action factories - each returns an ActionFn (logits -> actions) carrying a
 # `from_range` the interactor rescales from into the env's to_range
@@ -300,51 +202,21 @@ def make_beta_action(
     *,
     sample: bool = True,
     temperature: float = 1.0,
-    beta_rescale_neg_one_one: bool = True,
-    mean_concentration: bool = True,
-    **kwargs
-):
-    # unimodal beta on (0, 1), rescaled to (-1, 1) by default;
-    # mean_concentration = False gives the legacy alpha / beta parametrization
-
-    factory = make_mean_concentration_beta_action if mean_concentration else make_alpha_beta_action
-    return factory(sample = sample, temperature = temperature, beta_rescale_neg_one_one = beta_rescale_neg_one_one, **kwargs)
-
-def make_mean_concentration_beta_action(
-    *,
-    sample: bool = True,
-    temperature: float = 1.0,
+    bounds: tuple[float, float] | None = None,
     beta_rescale_neg_one_one: bool = True,
     **kwargs
 ):
-    # the mean is exact and precision is an independent knob, so evolution can
-    # reach the sharp near-deterministic policies that balance tasks need
+    # unimodal beta, rescaled to (-1, 1) by default
 
-    to_env_space, to_env_space_inv = _unit_rescale(beta_rescale_neg_one_one)
-
-    return ActionFn(
-        Beta(**kwargs),
-        sample = sample,
-        temperature = temperature,
-        to_env_space = to_env_space,
-        to_env_space_inv = to_env_space_inv
-    )
-
-def make_alpha_beta_action(
-    *,
-    sample: bool = True,
-    temperature: float = 1.0,
-    beta_rescale_neg_one_one: bool = True
-):
-    to_env_space, to_env_space_inv = _unit_rescale(beta_rescale_neg_one_one)
+    bounds = default(bounds, (-1., 1.) if beta_rescale_neg_one_one else (0., 1.))
 
     return ActionFn(
-        AlphaBeta(),
+        Beta(bounds = bounds, **kwargs),
         sample = sample,
         temperature = temperature,
-        to_env_space = to_env_space,
-        to_env_space_inv = to_env_space_inv
     )
+
+make_mean_concentration_beta_action = make_beta_action
 
 # custom distributions - researchers register their own factories by name,
 # mirroring the mutation / selection / crossover registries. a registered name
@@ -355,19 +227,13 @@ ACTION_DIST_REGISTRY = dict()
 def register_action_dist(name: str, factory: callable):
     ACTION_DIST_REGISTRY[name] = factory
 
-_BUILTIN_ACTION_DISTS = None  # populated lazily, after the builtin factories are defined
-
 def _action_dist_factories():
-    global _BUILTIN_ACTION_DISTS
-
-    if _BUILTIN_ACTION_DISTS is None:
-        _BUILTIN_ACTION_DISTS = dict(
-            categorical = make_categorical_action,
-            squashed_gaussian = make_squashed_gaussian_action,
-            beta = make_beta_action,
-        )
-
-    return {**_BUILTIN_ACTION_DISTS, **ACTION_DIST_REGISTRY}
+    return {
+        'categorical': make_categorical_action,
+        'squashed_gaussian': make_squashed_gaussian_action,
+        'beta': make_beta_action,
+        **ACTION_DIST_REGISTRY,
+    }
 
 def make_action(
     distribution: str | ActionDist | ActionFn | callable,
@@ -389,6 +255,13 @@ def make_action(
     if isinstance(distribution, type) and issubclass(distribution, ActionDist):
         return ActionFn(distribution(), sample = sample, temperature = temperature)
 
+    if action_space_is_discrete(distribution):
+        return make_categorical_action(sample = sample, temperature = temperature, **kwargs)
+
+    if action_space_is_box(distribution):
+        bounds = default(kwargs.get('bounds'), action_space_bounds(distribution))
+        return make_beta_action(sample = sample, temperature = temperature, bounds = bounds, **kwargs)
+
     if callable(distribution):
         factory = distribution
     elif isinstance(distribution, str):
@@ -405,7 +278,8 @@ def make_action(
     except (TypeError, ValueError):
         return factory()
 
-    call_kwargs = {name: value for name, value in kwargs.items() if name in accepted}
+    has_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in accepted.values())
+    call_kwargs = {name: value for name, value in kwargs.items() if has_var_kwargs or name in accepted}
 
     if 'sample' in accepted:
         call_kwargs['sample'] = sample

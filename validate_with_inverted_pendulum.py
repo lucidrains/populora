@@ -44,12 +44,11 @@ def run_inverted_pendulum_experiment(
     max_generations: int = 100,
     horizon: int = 1000,
     epsilon: float = 0.15,
-    distribution: str = 'squashed_gaussian',  # 'squashed_gaussian' | 'beta'
+    distribution: str = 'beta',  # 'squashed_gaussian' | 'beta'
     temperature: float = 1.0,
     min_log_std: float = -5.0,
     max_log_std: float = 0.5,
     beta_rescale_neg_one_one: bool = True,
-    mean_concentration: bool = True,
     num_episodes: int = 1,
     dtype: str = 'float32',
     seed: int = 42,
@@ -66,7 +65,6 @@ def run_inverted_pendulum_experiment(
     assert distribution in ('squashed_gaussian', 'beta'), f'unknown continuous action distribution {distribution!r}'
 
     beta_rescale_neg_one_one = _flag(beta_rescale_neg_one_one)
-    mean_concentration = _flag(mean_concentration)
 
     env = gym.make_vec('Pendulum-v1', num_envs = num_envs)
     obs_dim = env.single_observation_space.shape[0]
@@ -93,7 +91,6 @@ def run_inverted_pendulum_experiment(
         min_log_std = min_log_std,
         max_log_std = max_log_std,
         beta_rescale_neg_one_one = beta_rescale_neg_one_one,
-        mean_concentration = mean_concentration,
     )
 
     _, history = interactor.evolve(
