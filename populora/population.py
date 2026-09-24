@@ -42,6 +42,34 @@ def linear_layer_paths(model: Module) -> list[str]:
         if isinstance(module, Linear)
     ]
 
+def resolve_lora_targets(model: Module, lora_targets: Sequence[str] | None = None) -> list[str]:
+    """resolve `lora_targets` to Linear module paths - each entry is an exact
+    dotted path or an fnmatch glob (e.g. 'layers.*.linear'), expanded over the
+    model's Linear modules in model order and deduped"""
+
+    linear_paths = linear_layer_paths(model)
+
+    if not exists(lora_targets):
+        return linear_paths
+
+    resolved = dict()
+
+    for target in lora_targets:
+        if target in linear_paths:
+            matches = (target,)
+        else:
+            matches = tuple(path for path in linear_paths if fnmatch(path, target))
+
+            if len(matches) == 0:
+                is_module = any(path == target for path, _ in model.named_modules())
+                assert not is_module, f'lora target {target!r} must point to a Linear module'
+                assert len(matches) > 0, f'lora target {target!r} matches no Linear module - available: {linear_paths}'
+
+        for path in matches:
+            resolved[path] = None
+
+    return list(resolved)
+
 def init_lora_weights(pop_size, dim, dim_inner, rank, device = None, dtype = None, std_down = None, std_up = None):
     # weights are drawn in float32 and cast down - quantization happens once at
     # the storage boundary instead of corrupting the init noise itself
@@ -299,7 +327,7 @@ class Population(_LoRAMixin):
         self.weight_down = ParameterDict()
         self.weight_up = ParameterDict()
 
-        lora_targets = default(lora_targets, linear_layer_paths(model))
+        lora_targets = resolve_lora_targets(model, lora_targets)
         assert len(lora_targets) > 0, 'model has no Linear layers to target - pass explicit lora_targets'
 
         self.lora_targets = tuple(lora_targets)
@@ -2018,6 +2046,10 @@ class LoRA(_LoRAMixin):
         super().__init__()
         self.model = model
         self.low_rank = low_rank
+
+        lora_targets = resolve_lora_targets(model, lora_targets)
+        assert len(lora_targets) > 0, 'model has no Linear layers to target - pass explicit lora_targets'
+
         self.lora_targets = tuple(lora_targets)
 
         self.weight_down = ParameterDict()

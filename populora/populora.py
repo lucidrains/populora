@@ -21,6 +21,7 @@ from populora.population import (
     evolve,
     init_lora_weights,
     linear_layer_paths,
+    resolve_lora_targets,
 )
 from populora.coevolve import Coevolve
 from populora.operators import (

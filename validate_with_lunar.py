@@ -5,7 +5,7 @@
 #   "tqdm",
 #   "fire",
 #   "torch-einops-utils",
-#   "x-mlps-pytorch",
+#   "x-mlps-pytorch>=0.6.2",
 #   "gymnasium[box2d]",
 #   "populora",
 #   "moviepy",
@@ -25,7 +25,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from tqdm import tqdm
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch import WeightOnlyMLP
 
 from populora import Population, interact_with_env, make_action
 
@@ -45,6 +45,7 @@ def make_record_env(distribution: str, video_folder: str, name_prefix: str):
 
     env = make_env(distribution, num_envs = 1, render_mode = 'rgb_array')
     return gym.wrappers.RecordVideo(env, video_folder = video_folder, name_prefix = name_prefix)
+
 def evaluate_individual(
     env: gym.Env,
     pop: Population,
@@ -121,11 +122,13 @@ def validate_with_lunar(
 
     output_dim = 2 * action_dim if continuous else action_dim
 
+    mlp = WeightOnlyMLP(state_dim, 64, 64, output_dim)
+
     pop = Population(
-        MLP(state_dim, 64, 64, output_dim),
+        mlp,
         pop_size = pop_size,
         low_rank = low_rank,
-        lora_targets = ['layers.0.0', 'layers.1.0', 'layers.2'],
+        lora_targets = ['layers.*.linear'],
         eval_seed = seed,
         adaptive_epsilon = adaptive_epsilon,
         epsilon_init = epsilon_init,

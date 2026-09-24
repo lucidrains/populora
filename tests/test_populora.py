@@ -11,6 +11,7 @@ from x_transformers import TransformerWrapper, Decoder
 from einops import einsum, rearrange, repeat
 import populora.operators
 from populora import Population, Populations, PopuLoRA, LoRA, Coevolve, HallOfFame, PerTarget, evolve, evaluate_population_distributed, register_mutation
+from populora import linear_layer_paths, resolve_lora_targets
 from populora.populora import exists
 
 # helper
@@ -57,6 +58,44 @@ def test_population():
 
     out_subset = pop(x, individuals = [0, 1])
     assert out_subset.shape == (2, 16, 1000)
+
+def test_lora_target_globs():
+    model = get_model()
+
+    pop = Population(
+        model,
+        pop_size = 2,
+        low_rank = 2,
+        lora_targets = ['attn_layers.layers.*.to_q', 'attn_layers.layers.*.to_k']
+    )
+
+    assert pop.lora_targets == ('attn_layers.layers.0.1.to_q', 'attn_layers.layers.0.1.to_k')
+
+    # `*` spans dots, so one glob can sweep up every Linear layer - resolution
+    # follows model order and overlaps dedupe
+
+    all_paths = tuple(linear_layer_paths(model))
+
+    pop_all = Population(model, pop_size = 2, low_rank = 2, lora_targets = ['*'])
+    assert pop_all.lora_targets == all_paths
+
+    lora = LoRA(model, low_rank = 2, lora_targets = ['*', 'attn_layers.layers.*.to_q'])
+    assert lora.lora_targets == all_paths
+
+    assert resolve_lora_targets(model, ['attn_layers.layers.*.to_q']) == ['attn_layers.layers.0.1.to_q']
+
+def test_lora_target_globs_errors():
+    model = get_model()
+
+    # an existing module that is not a Linear layer is rejected
+
+    with pytest.raises(AssertionError, match = 'must point to a Linear module'):
+        Population(model, pop_size = 2, low_rank = 2, lora_targets = ['attn_layers.layers.0.1'])
+
+    # a glob matching nothing reports what is available
+
+    with pytest.raises(AssertionError, match = 'matches no Linear module'):
+        Population(model, pop_size = 2, low_rank = 2, lora_targets = ['does.not.*.exist'])
 
 def test_per_sample_individual_routing():
     model = get_model()

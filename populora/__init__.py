@@ -8,6 +8,7 @@ from populora.populora import (
     PerTarget,
     linear_layer_paths,
     init_lora_weights,
+    resolve_lora_targets,
     register_mutation,
     register_selection,
     register_parent_selection,

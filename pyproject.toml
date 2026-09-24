@@ -1,6 +1,6 @@
 [project]
 name = "populora"
-version = "0.4.0"
+version = "0.4.1"
 description = "Implementation of PopuLoRA"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -42,7 +42,7 @@ examples = [
     "gymnasium[box2d]",
     "moviepy",
     "tqdm",
-    "x-mlps-pytorch",
+    "x-mlps-pytorch>=0.6.2",
 ]
 test = [
     "gymnasium",
@@ -55,7 +55,7 @@ mario = [
     "fire",
     "imageio",
     "imageio-ffmpeg",
-    "x-mlps-pytorch",
+    "x-mlps-pytorch>=0.6.2",
     "gym-super-mario-bros",
     "nes-py",
 ]
