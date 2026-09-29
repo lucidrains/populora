@@ -505,7 +505,7 @@ class Population(_LoRAMixin):
 
     @torch.no_grad()
     def save_individual(self, path: str | Path, individual = 0):
-        _, (weight_down, weight_up) = self.individual_weights(individual)
+        individual, (weight_down, weight_up) = self.individual_weights(individual)
 
         pkg = dict(
             low_rank = self.low_rank,
@@ -513,6 +513,12 @@ class Population(_LoRAMixin):
             weight_down = {key: weight.clone() for key, weight in weight_down.items()},
             weight_up = {key: weight.clone() for key, weight in weight_up.items()}
         )
+
+        if self.adaptive_epsilon:
+            pkg['sigma'] = dict(
+                down = {key: self._log_sigma_down[key][individual].clone() for key in self._log_sigma_down.keys()},
+                up = {key: self._log_sigma_up[key][individual].clone() for key in self._log_sigma_up.keys()},
+            )
 
         torch_save(pkg, path)
         return self
@@ -531,15 +537,36 @@ class Population(_LoRAMixin):
             weight_down[key].copy_(w_down.to(self.device))
             weight_up[key].copy_(pkg['weight_up'][key].to(self.device))
 
+        if self.adaptive_epsilon and 'sigma' in pkg:
+            sigma = pkg['sigma']
+            if isinstance(sigma, dict):
+                down, up = (sigma['down'], sigma['up']) if 'down' in sigma else (sigma, sigma)
+            else:
+                down = up = {key: sigma for key in self._log_sigma_down.keys()}
+
+            for key in self._log_sigma_down.keys():
+                if key in down:
+                    src_down = down[key].to(self.device)
+                    self._log_sigma_down[key].data[individual].copy_(src_down.broadcast_to(self._log_sigma_down[key][individual].shape))
+                if key in up:
+                    src_up = up[key].to(self.device)
+                    self._log_sigma_up[key].data[individual].copy_(src_up.broadcast_to(self._log_sigma_up[key][individual].shape))
+
         return self
 
     @torch.no_grad()
     def backup_individual(self, individual = 0):
         individual, (weight_down, weight_up) = self.individual_weights(individual)
-        return {
+        backup = {
             'down': {key: weight.clone() for key, weight in weight_down.items()},
             'up': {key: weight.clone() for key, weight in weight_up.items()}
         }
+
+        if self.adaptive_epsilon:
+            backup['sigma_down'] = {key: self._log_sigma_down[key][individual].clone() for key in self._log_sigma_down.keys()}
+            backup['sigma_up'] = {key: self._log_sigma_up[key][individual].clone() for key in self._log_sigma_up.keys()}
+
+        return backup
 
     @torch.no_grad()
     def restore_individual(self, individual, backup: dict):
@@ -548,6 +575,13 @@ class Population(_LoRAMixin):
             weight_down[key].copy_(w_down)
         for key, w_up in backup['up'].items():
             weight_up[key].copy_(w_up)
+
+        if self.adaptive_epsilon and 'sigma_down' in backup:
+            for key, s_down in backup['sigma_down'].items():
+                self._log_sigma_down[key].data[individual].copy_(s_down)
+            for key, s_up in backup['sigma_up'].items():
+                self._log_sigma_up[key].data[individual].copy_(s_up)
+
         return self
 
     def to_lora(self, individual = 0, requires_grad: bool = True):

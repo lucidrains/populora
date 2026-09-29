@@ -85,6 +85,24 @@ def _resolve_epsilon(epsilon, key):
         return epsilon[key]
     return epsilon, epsilon
 
+def _svd_sigma(eps_down, eps_up, rank):
+    # collapse a (down, up) step-size pair onto the singular-value axis the SVD
+    # mutation acts on - granularities finer than the rank average over their
+    # free axis, a scalar-per-individual map broadcasts over the rank, and the
+    # rotations take the rank-mean step size (as in bench_adaptive_mutation)
+
+    if not is_tensor(eps_down):
+        return eps_down, eps_down
+
+    assert eps_down.ndim == 3 and eps_up.ndim == 3, f'tensor epsilon must be 3d (batch, dim, rank), got down shape {eps_down.shape}, up shape {eps_up.shape}'
+
+    def to_rank(eps):
+        eps = eps.float()
+        return eps.mean(dim = 1) if eps.shape[-1] == rank else eps.reshape(eps.shape[0], 1)
+
+    sig = 0.5 * (to_rank(eps_down) + to_rank(eps_up))
+    return sig, sig.mean(dim = -1, keepdim = True).unsqueeze(1)
+
 # mutations
 
 MUTATION_REGISTRY = dict()
@@ -117,20 +135,14 @@ def mutation_svd_structured(
 
         eps_down, eps_up = _resolve_epsilon(epsilon, key)
 
-        # step sizes finer than the rank collapse onto the singular-value axis
-        # the mutation works in (mean over the free dim); rotations take the
-        # mean step size, like the SVD self-adaptation of bench_adaptive_mutation
-
-        sig = 0.5 * (eps_down.float() + eps_up.float()) if is_tensor(eps_down) else eps_down
-
-        if is_tensor(sig):
-            sig = sig.mean(dim = 1, keepdim = True)
-            rot_eps = sig.mean(dim = -1, keepdim = True)
-        else:
-            rot_eps = sig
-
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
         r = S.shape[-1]
+
+        # step sizes finer than the rank collapse onto the singular-value axis
+        # the mutation works in; rotations take the mean step size, like the
+        # SVD self-adaptation of bench_adaptive_mutation
+
+        sig, rot_eps = _svd_sigma(eps_down, eps_up, r)
 
         z = _normal_noise(S.shape, device)
         S_new = S * torch.exp(sig * z)
@@ -171,12 +183,21 @@ def mutation_layer_selective_gaussian(
     mutate_mask.scatter_(1, layer_choice, True)
 
     for i, key in enumerate(keys):
-        rows = idx[mutate_mask[:, i]]
+        mask = mutate_mask[:, i]
+        rows = idx[mask]
 
         if len(rows) == 0:
             continue
 
         eps_down, eps_up = _resolve_epsilon(epsilon, key)
+
+        # per-individual step sizes arrive aligned with `idx` - subset them by
+        # the same layer draw as the weights they shape
+
+        if is_tensor(eps_down):
+            assert eps_down.ndim == 3 and eps_up.ndim == 3, f'tensor epsilon must be 3d (batch, dim, rank), got down shape {eps_down.shape}, up shape {eps_up.shape}'
+            eps_down = eps_down[mask]
+            eps_up = eps_up[mask]
 
         w_down = population.weight_down[key]
         w_up = population.weight_up[key]

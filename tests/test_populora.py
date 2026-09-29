@@ -1326,6 +1326,72 @@ def test_save_individual_load_individual(tmp_path):
     assert allclose(pop.weight_up[key][0], pop2.weight_up[key][0])
     assert not allclose(pop2.weight_down[key][1], pop2.weight_down[key][0])
 
+@param('granularity', ['pop', 'lora', 'rank', 'weight'])
+def test_save_individual_load_individual_adaptive_epsilon(tmp_path, granularity):
+    key = 'attn_layers_layers_0_1_to_q'
+
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 3,
+        lora_targets = ['attn_layers.layers.0.1.to_q'],
+        adaptive_epsilon = True,
+        sigma_granularity = granularity,
+    )
+
+    # set unique custom sigma for individual 1
+    pop._log_sigma_down[key].data[1] = math.log(0.42)
+    pop._log_sigma_up[key].data[1] = math.log(0.42)
+
+    path = tmp_path / 'individual_adaptive.pt'
+    pop.save_individual(path, individual = 1)
+
+    pop2 = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 3,
+        lora_targets = ['attn_layers.layers.0.1.to_q'],
+        adaptive_epsilon = True,
+        sigma_granularity = granularity,
+    )
+
+    pop2.load_individual(path, individual = 2)
+
+    assert allclose(pop.weight_down[key][1], pop2.weight_down[key][2])
+    assert allclose(pop.weight_up[key][1], pop2.weight_up[key][2])
+    assert allclose(pop._log_sigma_down[key][1], pop2._log_sigma_down[key][2])
+    assert allclose(pop._log_sigma_up[key][1], pop2._log_sigma_up[key][2])
+    # check other slots were not affected
+    assert not allclose(pop2._log_sigma_down[key][0], pop2._log_sigma_down[key][2])
+
+@param('granularity', ['pop', 'lora', 'rank', 'weight'])
+def test_backup_restore_individual_adaptive_epsilon(granularity):
+    key = 'attn_layers_layers_0_1_to_q'
+
+    pop = Population(
+        get_model(),
+        pop_size = 4,
+        low_rank = 3,
+        lora_targets = ['attn_layers.layers.0.1.to_q'],
+        adaptive_epsilon = True,
+        sigma_granularity = granularity,
+    )
+
+    pop._log_sigma_down[key].data[0] = math.log(0.25)
+    pop._log_sigma_up[key].data[0] = math.log(0.25)
+
+    backup = pop.backup_individual(0)
+
+    # mutate individual 0 weights and perturb sigma
+    pop.mutate_('full_gaussian', individual = 0, epsilon = 0.5)
+    pop._log_sigma_down[key].data[0] = math.log(0.01)
+    pop._log_sigma_up[key].data[0] = math.log(0.01)
+
+    pop.restore_individual(0, backup)
+
+    assert allclose(pop._log_sigma_down[key][0], torch.tensor(math.log(0.25)))
+    assert allclose(pop._log_sigma_up[key][0], torch.tensor(math.log(0.25)))
+
 # coevolution
 
 def make_mlp(hidden_dim = 32, proposer = False):
@@ -2351,6 +2417,101 @@ def test_adaptive_epsilon_granularity_shapes():
 
     with pytest.raises(ValueError):
         Population(model, pop_size = 4, low_rank = 3, adaptive_epsilon = True, sigma_granularity = 'bogus')
+
+def _lora_deltas(pop):
+    return {
+        key: einsum(pop.weight_up[key].float(), pop.weight_down[key].float(), 'p e r, p d r -> p e d')
+        for key in pop.weight_down
+    }
+
+@param('granularity', ['pop', 'lora', 'rank', 'weight'])
+@param('mutation_type', ['svd_structured', 'layer_selective_gaussian'])
+def test_adaptive_epsilon_structured_mutations_consume_sigma(granularity, mutation_type):
+    # the per-individual log-sigma must reach the structured mutations: a sigma
+    # at the floor barely moves an individual's delta, a live one moves it, and
+    # both operators consume sigma aligned by individual
+
+    pop = Population(
+        nn.Sequential(nn.Linear(2, 5), nn.Tanh(), nn.Linear(5, 2)),
+        pop_size = 4,
+        low_rank = 3,
+        adaptive_epsilon = True,
+        sigma_granularity = granularity,
+    )
+
+    individuals = torch.arange(4)
+
+    for key in pop.weight_down.keys():
+        pop._log_sigma_down[key].data[0] = math.log(1e-4)
+        pop._log_sigma_up[key].data[0] = math.log(1e-4)
+
+    eps = pop._sigma_epsilon_(individuals)
+    before = _lora_deltas(pop)
+
+    torch.manual_seed(0)
+    pop.mutate_(mutation_type, individuals = individuals, epsilon = eps, f = 1.)
+
+    after = _lora_deltas(pop)
+
+    for key in pop.weight_down.keys():
+        assert allclose(after[key][0], before[key][0], atol = 1e-3), 'a floored individual must stay put'
+        assert not allclose(after[key][1:], before[key][1:], atol = 1e-4), 'the live individuals must move'
+
+def test_layer_selective_mutation_sigma_rows_follow_individuals():
+    # with a proper subset of layers mutated, a selected individual must
+    # receive its own sigma row - not the first row of the cohort
+
+    pop = Population(
+        nn.Sequential(nn.Linear(2, 5), nn.Tanh(), nn.Linear(5, 2)),
+        pop_size = 4,
+        low_rank = 3,
+        adaptive_epsilon = True,
+    )
+
+    individuals = torch.arange(4)
+
+    for key in pop.weight_down.keys():
+        pop._log_sigma_down[key].data[:] = math.log(1e-4)
+        pop._log_sigma_up[key].data[:] = math.log(1e-4)
+        pop._log_sigma_down[key].data[0] = math.log(0.5)
+        pop._log_sigma_up[key].data[0] = math.log(0.5)
+
+    eps = pop._sigma_epsilon_(individuals)
+    before = _lora_deltas(pop)
+
+    torch.manual_seed(1)
+    pop.mutate_('layer_selective_gaussian', individuals = individuals, epsilon = eps)
+
+    after = _lora_deltas(pop)
+
+    # only individual 0 carries a live sigma, so nobody else may move
+
+    for key in pop.weight_down.keys():
+        assert allclose(after[key][1:], before[key][1:], atol = 1e-3)
+
+@param('granularity', ['pop', 'lora', 'rank', 'weight'])
+@param('mutation_type', ['svd_structured', 'layer_selective_gaussian'])
+def test_adaptive_epsilon_structured_mutations_evolve(granularity, mutation_type):
+    # end to end: recombine + perturb + structured mutation through the full
+    # generation loop, for every sigma granularity
+
+    pop = Population(
+        nn.Sequential(nn.Linear(1, 8), nn.ReLU(), nn.Linear(8, 1)),
+        pop_size = 8,
+        low_rank = 3,
+        adaptive_epsilon = True,
+        sigma_granularity = granularity,
+    )
+
+    grid = torch.linspace(-1, 1, 9).reshape(1, -1)
+    grid_rep = repeat(grid, '1 n -> (s n) 1', s = 8)
+
+    for _ in range(3):
+        preds = pop(grid_rep, all_individuals = True).reshape(8, 9)
+        fitnesses = -((preds - torch.sin(torch.pi * grid)) ** 2).mean(dim = 1)
+        pop.evolve_(fitnesses, mutation_type = mutation_type)
+
+    assert any((log_sigma != math.log(0.1)).any() for log_sigma in _sigma_tensors(pop)), 'sigma must adapt'
 
 def test_adaptive_epsilon_per_lora_independent():
     # 'lora' granularity: each adapter adapts its own step size - setting one
