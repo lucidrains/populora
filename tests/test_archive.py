@@ -56,6 +56,34 @@ def test_replay_loads_archived_weights():
             assert torch.equal(wd[key], entry.weight_down[key])
             assert torch.equal(wu[key], entry.weight_up[key])
 
+def test_save_load_roundtrip(tmp_path):
+    pop = make_pop(4)
+    fitnesses = torch.arange(4, dtype = torch.float32)
+
+    hof = HallOfFame(capacity = 2)
+
+    for gen in range(4):
+        hof.add_champion(pop, fitnesses, generation = gen)
+
+    path = tmp_path / 'hof.pt'
+    hof.save(path)
+
+    loaded = HallOfFame().load(path)
+
+    assert loaded.capacity == hof.capacity
+    assert [entry.generation for entry in loaded.entries] == [2, 3]
+
+    for a, b in zip(loaded.entries, hof.entries):
+        assert a.weight_down.keys() == b.weight_down.keys()
+        assert all(torch.equal(a.weight_down[k], b.weight_down[k]) for k in a.weight_down)
+        assert all(torch.equal(a.weight_up[k], b.weight_up[k]) for k in a.weight_up)
+
+    # the loaded archive replays into a population
+
+    replay_pop = make_pop(2)
+
+    assert loaded.replay(replay_pop, [0, 1]).tolist() == [0, 1]
+
 def test_probe_returns_none_when_empty():
     pop = make_pop(4)
 

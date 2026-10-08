@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import Tensor, is_tensor, tensor
+from torch_einops_utils.shape import size
 
 from populora._utils import cast_tensor, default, exists
 
@@ -280,7 +281,7 @@ def evaluate_population_distributed(
             if len(assigned_indices) > 0:
                 res = eval_fn(population, assigned_indices)
                 res = cast_tensor(res, device = device).to(device = device, dtype = torch.float32)
-                assert res.shape[0] == len(assigned_indices), 'batch eval fn must return one fitness per assigned index'
+                assert size(res, '[p] ...') == len(assigned_indices), 'batch eval fn must return one fitness per assigned index'
                 fitnesses[assigned_indices] = res
         else:
             for idx in assigned_indices:

@@ -15,6 +15,7 @@ from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 from einx import get_at, set_at
 from einops import einsum, rearrange, repeat
 from torch_einops_utils import batched_index_select, temp_eval, tree_map_tensor, z_score
+from torch_einops_utils.shape import is_shape, shape, size
 
 from populora._utils import cast_tensor, default, divisible_by, exists, extract_dict, first, has_, maybe_cast_tuple, maybe_progress, resolve_dtype, torch_save
 from populora.distributed import distributed_device, evaluate_population_distributed, is_distributed
@@ -143,16 +144,18 @@ def _concat_chunked_outputs(outputs, batch_size):
     return outputs[-1]
 
 def _slice_batch(t, start, end, batch_size):
-    return t[start:end] if is_tensor(t) and t.ndim > 0 and t.shape[0] == batch_size else t
+    return t[start:end] if is_tensor(t) and is_shape(t, 'b ...', b = batch_size) else t
 
 def _expand_batch(t, p):
     # broadcast a singleton batch to each individual, otherwise check it is a
     # multiple - non-tensors (lengths, masks, ...) pass through untouched
 
     if is_tensor(t) and t.ndim > 0:
-        if t.shape[0] == 1:
+        if size(t, '[b] ...') == 1:
             t = repeat(t, '1 ... -> p ...', p = p)
-        assert divisible_by(t.shape[0], p), f'batch {t.shape[0]} must be a multiple of individuals {p}'
+
+        batch = size(t, '[b] ...')
+        assert divisible_by(batch, p), f'batch {batch} must be a multiple of individuals {p}'
 
     return t
 
@@ -392,7 +395,7 @@ class Population(_LoRAMixin):
             elif sigma_granularity == 'lora':
                 sigma_down = sigma_up = _sigma_param(torch.full((self.pop_size, 1, 1), math.log(epsilon_init), device = self.device))
             elif sigma_granularity == 'rank':
-                sigma_down = sigma_up = _sigma_param(torch.full((self.pop_size, 1, w_down.shape[-1]), math.log(epsilon_init), device = self.device))
+                sigma_down = sigma_up = _sigma_param(torch.full((self.pop_size, 1, size(w_down, '... [r]')), math.log(epsilon_init), device = self.device))
             elif sigma_granularity == 'weight':
                 sigma_down = _sigma_param(torch.full(w_down.shape, math.log(epsilon_init), device = self.device))
                 sigma_up = _sigma_param(torch.full(w_up.shape, math.log(epsilon_init), device = self.device))
@@ -604,7 +607,7 @@ class Population(_LoRAMixin):
 
     @property
     def low_rank(self):
-        return next(iter(self.weight_down.values())).shape[-1]
+        return size(next(iter(self.weight_down.values())), '... [r]')
 
     @property
     def eval_seed(self):
@@ -739,7 +742,7 @@ class Population(_LoRAMixin):
         aging_decay: float | None = None, # fitness discounted by decay ** age - https://doi.org/10.1145/1569901.1570012
         **kwargs
     ):
-        assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+        assert is_shape(fitnesses, 'p', p = self.pop_size)
         assert divisible_by(self.pop_size, num_groups)
 
         selection_registry = default(self.selection_registry, SELECTION_REGISTRY)
@@ -984,7 +987,7 @@ class Population(_LoRAMixin):
 
         if num_groups == 1:
             if exists(eligible_indices):
-                fitnesses = fitnesses[eligible_indices] if fitnesses.shape[-1] == self.pop_size else fitnesses
+                fitnesses = fitnesses[eligible_indices] if size(fitnesses, '... [p]') == self.pop_size else fitnesses
                 selected = select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **kwargs)
                 return eligible_indices[selected]
 
@@ -1170,7 +1173,7 @@ class Population(_LoRAMixin):
         assert exists(fitnesses) or exists(indices), 'either fitnesses or indices must be passed to select_and_merge_'
 
         if exists(fitnesses):
-            assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+            assert is_shape(fitnesses, 'p', p = self.pop_size)
 
             topk = default(topk, max(1, self.pop_size // 4))
 
@@ -1219,7 +1222,7 @@ class Population(_LoRAMixin):
         for path, key, w_down, w_up in _iter_adapters(self):
             linear = self.model.get_submodule(path)
             dim, dim_inner = linear.in_features, linear.out_features
-            low_rank = w_down.shape[-1]
+            low_rank = size(w_down, '... [r]')
 
             w_down, w_up = init_lora_weights(len(individuals), dim, dim_inner, low_rank, device = self.device, dtype = self._dtype, std_down = std_down, std_up = std_up)
 
@@ -1364,7 +1367,7 @@ class Population(_LoRAMixin):
 
         The gradient is normalized by the realized population noise scale,
         making the step size scale-free (only `lr` matters)."""
-        assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+        assert is_shape(fitnesses, 'p', p = self.pop_size)
 
         n = self.pop_size
         f = fitnesses.to(self.device).float()
@@ -1500,11 +1503,11 @@ class Population(_LoRAMixin):
             except TypeError:
                 res = fn(self)
 
-        if is_tensor(res) and res.shape[0] == self.pop_size and len(individuals) < self.pop_size:
+        if is_tensor(res) and size(res, '[b] ...') == self.pop_size and len(individuals) < self.pop_size:
             res = res[individuals]
 
         fits = cast_tensor(res, device = self.device, dtype = torch.float32)
-        assert fits.ndim == 1 and fits.shape[0] == len(individuals), \
+        assert is_shape(fits, 'p', p = len(individuals)), \
             f'brood_eval_fn must return 1 fitness per candidate individual ({len(individuals)}), got {tuple(fits.shape)}'
 
         return fits
@@ -1621,7 +1624,7 @@ class Population(_LoRAMixin):
         brood_eval_fn: Callable | None = None, # evaluation function for brood candidate selection
         **kwargs
     ):
-        assert fitnesses.ndim == 1 and fitnesses.shape[0] == self.pop_size
+        assert is_shape(fitnesses, 'p', p = self.pop_size)
         assert retire_refill in (None, 'crossover', 'reinit', 'es'), f'unknown retire_refill {retire_refill!r} - choose from "crossover", "reinit", "es"'
         assert not exists(retire_refill) or exists(max_age), 'retire_refill requires max_age to be set'
         assert brood_size >= 1, f'brood_size must be >= 1, got {brood_size}'
@@ -1833,7 +1836,7 @@ class Population(_LoRAMixin):
 
             last_mutated = getattr(self, '_tiered_last_mutated', None)
 
-            if not exists(last_mutated) or last_mutated.shape[0] != self.pop_size:
+            if not exists(last_mutated) or size(last_mutated, '[p]') != self.pop_size:
                 self._tiered_last_mutated = torch.full((self.pop_size,), -burn_in, dtype = torch.long, device = self.device)
                 last_mutated = self._tiered_last_mutated
 
@@ -1955,19 +1958,21 @@ class Population(_LoRAMixin):
             # per-sample routing when ids are vectorized (e.g. one individual per env)
 
             if individual is ... or (is_tensor(individual) and individual.ndim > 0):
-                p = weight_down_i.shape[0]
+                p = size(weight_down_i, '[p] ...')
 
                 # a 1-d activation is one unbatched feature vector, which cannot be
                 # split across routed individuals - anything else is a guess
 
                 assert x.ndim >= 2, f'routed forwards need batched inputs - got a {x.ndim}-d tensor of shape {tuple(x.shape)}. pass observations with their batch / feature axes'
 
-                assert divisible_by(x.shape[0], p), f'batch {x.shape[0]} must be a multiple of routed individuals {p}'
+                batch = size(x, '[b] ...')
+
+                assert divisible_by(batch, p), f'batch {batch} must be a multiple of routed individuals {p}'
 
                 wd_i = weight_down_i.to(x.dtype)
                 wu_i = weight_up_i.to(x.dtype)
 
-                if x.shape[0] == p and x.ndim == 2:
+                if is_shape(x, 'b d', b = p):
                     # one sample per individual - the delta is two chained
                     # matmuls on a leading batch axis, no reshaping at all
                     lora_out = (x.unsqueeze(1) @ wd_i @ wu_i.transpose(-1, -2)).squeeze(1)
@@ -2004,7 +2009,7 @@ class Population(_LoRAMixin):
                 # fast path - plain tensor args, no per-call structure walk
                 args = tuple(_expand_batch(a, p) for a in args)
                 kwargs = {k: _expand_batch(v, p) for k, v in kwargs.items()}
-                batch_size = next((t.shape[0] for t in (*args, *kwargs.values()) if is_tensor(t) and t.ndim > 0), 0)
+                batch_size = next((size(t, '[b] ...') for t in (*args, *kwargs.values()) if is_tensor(t) and t.ndim > 0), 0)
             else:
                 def maybe_repeat_batch(t):
                     # broadcast singleton batches to each individual, otherwise expect a
@@ -2015,7 +2020,7 @@ class Population(_LoRAMixin):
                     t = _expand_batch(t, p)
 
                     if is_tensor(t) and t.ndim > 0:
-                        batch_size = t.shape[0]
+                        batch_size = size(t, '[b] ...')
 
                     return t
 

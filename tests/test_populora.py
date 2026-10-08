@@ -812,7 +812,8 @@ def test_parent_select_tournament_small_pool():
     assert parents.shape == (4, 2)
     assert parents.max().item() < fitnesses.shape[-1]
 
-    # multi-group (island) case with one eligible parent per group
+    # multi-group (island) case with one eligible parent per group - the
+    # requested parent count is honored by repeating the lone contender
 
     fitnesses_grouped = torch.tensor([[1.0], [3.0]])
     parents_grouped = parent_select_tournament(
@@ -822,8 +823,18 @@ def test_parent_select_tournament_small_pool():
         tournament_size = 3
     )
 
-    assert parents_grouped.shape == (2, 1, 1)
+    assert parents_grouped.shape == (2, 1, 2)
     assert parents_grouped.max().item() < fitnesses_grouped.shape[-1]
+    assert (parents_grouped[..., 0] == parents_grouped[..., 1]).all()
+
+def test_evolve_islands_two_parent_crossover():
+    # regression - parent selection used to return a single parent for a
+    # one-survivor island, crashing two-parent crossover operators
+
+    pop = Population(get_model(), pop_size = 8, low_rank = 2, lora_targets = ['attn_layers.layers.0.1.to_q'])
+    fitnesses = torch.rand(8)
+
+    pop.evolve_(fitnesses, num_groups = 4, crossover_type = 'extrapolative')
 
 def test_parent_select_queen_bee():
     pop = Population(

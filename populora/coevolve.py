@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 from torch import Tensor, is_tensor
 from torch.nn import Module, ModuleDict
+from torch_einops_utils.shape import is_shape
 
 from populora._utils import default, exists, torch_save
 from populora.distributed import broadcast_object, distributed_rank, distributed_world_size, is_distributed, preserve_rng
@@ -304,7 +305,7 @@ class Coevolve(Module):
             assert name in fitnesses, f'fitnesses missing for population {name}'
 
             f = fitnesses[name]
-            assert f.ndim == 1 and f.shape[0] == pop.pop_size, f'fitnesses for {name} must be of shape ({pop.pop_size},)'
+            assert is_shape(f, 'p', p = pop.pop_size), f'fitnesses for {name} must be of shape ({pop.pop_size},)'
 
             pop.evolve_(f.to(pop.device), **merged.get(name, dict()))
 
@@ -337,7 +338,7 @@ class Coevolve(Module):
 
             f = self._inject(fn, name, outputs)
             assert is_tensor(f), f'fitness function for population "{name}" must return a tensor, got {type(f)}'
-            assert f.ndim == 1 and f.shape[0] == pop.pop_size, f'fitness for "{name}" must be of shape ({pop.pop_size},), got {tuple(f.shape)}'
+            assert is_shape(f, 'p', p = pop.pop_size), f'fitness for "{name}" must be of shape ({pop.pop_size},), got {tuple(f.shape)}'
 
             fitnesses[name] = f
 

@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, cat, is_tensor
 
 from einops import repeat
+from torch_einops_utils.shape import is_shape
 
 from populora._utils import cast_tensor, default, divisible_by, exists
 from populora.distributed import preserve_rng
@@ -36,7 +37,7 @@ def _slice_cache(cache, mask, batch_size):
     # tensors and the common cache containers (tuples, dicts, dataclasses)
 
     if is_tensor(cache):
-        return cache[mask] if cache.ndim > 0 and cache.shape[0] == batch_size else cache
+        return cache[mask] if is_shape(cache, 'b ...', b = batch_size) else cache
 
     if isinstance(cache, (tuple, list)):
         return type(cache)(_slice_cache(item, mask, batch_size) for item in cache)

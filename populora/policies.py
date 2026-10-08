@@ -9,6 +9,7 @@ from torch.nn import Module
 
 from env_ssl_wrapper import action_space_bounds, action_space_is_box, action_space_is_discrete
 from mean_conc_beta import Beta as MeanConcBeta
+from torch_einops_utils.shape import size
 
 from populora._utils import default, exists
 
@@ -106,7 +107,7 @@ class Beta(ActionDist):
         self.from_range = tuple(map(float, self.beta.bounds))
 
     def _format_params(self, params):
-        if params.ndim >= 3 and params.shape[-1] == 2:
+        if params.ndim >= 3 and size(params, '... [d]') == 2:
             return params
 
         raw_mean, raw_conc = params.chunk(2, dim = -1)
@@ -116,7 +117,7 @@ class Beta(ActionDist):
         if isinstance(params, Distribution):
             return self.beta.concentration(params)
 
-        if indexed or (params.ndim == 1 and params.shape[0] % 2 != 0):
+        if indexed or (params.ndim == 1 and size(params, '[d]') % 2 != 0):
             return self.beta.concentration(params, indexed = True)
 
         return self.beta.concentration(self._format_params(params))

@@ -6,6 +6,8 @@ from __future__ import annotations
 import torch
 from torch import atleast_1d, cat, nn
 
+from torch_einops_utils.shape import shape, size
+
 from populora._utils import cast_tensor, default, exists
 
 # helpers
@@ -18,10 +20,12 @@ def init_memory_tensor(init_memory, num, device = None):
     init = cast_tensor(init_memory, device = device)
     init = atleast_1d(init)
 
-    if init.shape[0] == 1:
-        return init.expand(num, *init.shape[1:]).clone()
+    batch = size(init, '[b] ...')
 
-    assert init.shape[0] == num, f'initial memory must be a scalar or a tensor whose first dim is 1 or {num}, got {tuple(init.shape)}'
+    if batch == 1:
+        return init.expand(num, *shape(init, 'b ...')['...']).clone()
+
+    assert batch == num, f'initial memory must be a scalar or a tensor whose first dim is 1 or {num}, got {tuple(init.shape)}'
 
     return init.clone()
 
@@ -102,7 +106,7 @@ def rollout(
     inputs = atleast_1d(inputs)
     assert inputs.ndim >= 2, 'inputs must be (batch, seq_len, ...)'
 
-    batch, seq_len = inputs.shape[0], inputs.shape[1]
+    batch, seq_len, *_ = shape(inputs, 'b s ...')
 
     init = default(memory, net.init_memory)
     mem = init_memory_tensor(init, batch, device = inputs.device)

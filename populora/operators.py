@@ -13,6 +13,7 @@ from torch.linalg import qr, svd
 
 from einops import einsum, rearrange, repeat
 from torch_einops_utils import pad_right_at_dim_to, z_score
+from torch_einops_utils.shape import shape, size
 
 from populora._utils import default, exists
 
@@ -29,7 +30,7 @@ def _efficient_svd_of_lora(weight_down, weight_up):
     weight_down = weight_down.float()
     weight_up = weight_up.float()
 
-    r = weight_down.shape[-1]
+    r = size(weight_down, '... [r]')
 
     Q_A, R_A = qr(weight_down)
     Q_B, R_B = qr(weight_up)
@@ -72,7 +73,7 @@ def _uniform_noise(shape, device, low, high):
 def _noise_like(w, epsilon, eps = 1e-6):
     # epsilon-scaled per-individual-std gaussian noise, in w's precision
     std = w.std(dim = (1, 2), keepdim = True) if w.ndim >= 3 else w.std()
-    default_std = 1.0 / math.sqrt(w.shape[-1])
+    default_std = 1.0 / math.sqrt(size(w, '... [d]'))
     std = torch.where(std > eps, std, torch.full_like(std, default_std))
     return epsilon * std * _normal_noise(w.shape, w.device)
 
@@ -98,7 +99,7 @@ def _svd_sigma(eps_down, eps_up, rank):
 
     def to_rank(eps):
         eps = eps.float()
-        return eps.mean(dim = 1) if eps.shape[-1] == rank else eps.reshape(eps.shape[0], 1)
+        return eps.mean(dim = 1) if size(eps, '... [r]') == rank else eps.reshape(-1, 1)
 
     sig = 0.5 * (to_rank(eps_down) + to_rank(eps_up))
     return sig, sig.mean(dim = -1, keepdim = True).unsqueeze(1)
@@ -136,7 +137,7 @@ def mutation_svd_structured(
         eps_down, eps_up = _resolve_epsilon(epsilon, key)
 
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
-        r = S.shape[-1]
+        *batch_shape, r = shape(S, '... r')
 
         # step sizes finer than the rank collapse onto the singular-value axis
         # the mutation works in; rotations take the mean step size, like the
@@ -147,10 +148,10 @@ def mutation_svd_structured(
         z = _normal_noise(S.shape, device)
         S_new = S * torch.exp(sig * z)
 
-        M_U = _normal_noise((*S.shape[:-1], r, r), device)
+        M_U = _normal_noise((*batch_shape, r, r), device)
         R_U = torch.eye(r, device = device) + rot_eps * skew_symmetrize(M_U)
 
-        M_V = _normal_noise((*S.shape[:-1], r, r), device)
+        M_V = _normal_noise((*batch_shape, r, r), device)
         R_V = torch.eye(r, device = device) + rot_eps * skew_symmetrize(M_V)
 
         U_new = einsum(U, R_U, '... d r, ... r s -> ... d s')
@@ -227,7 +228,7 @@ def mutation_component_masking(
         w_up = weight_up.data[idx].float()
 
         U, S, V = _efficient_svd_of_lora(w_down, w_up)
-        r = S.shape[-1]
+        *_, r = shape(S, '... r')
 
         num_drop = math.ceil(rho * r)
         drop_indices = torch.rand(len(idx), r, device = device).topk(num_drop, dim = -1, sorted = False).indices
@@ -277,7 +278,8 @@ def mutation_neftune_style(
         dtype = weight_down.dtype
         w_down = weight_down.data[idx].float()
 
-        bound = alpha / math.sqrt(w_down.shape[-2] * w_down.shape[-1])
+        *_, dim, rank = shape(w_down, '... d r')
+        bound = alpha / math.sqrt(dim * rank)
         w_down.add_(_uniform_noise(w_down.shape, w_down.device, -bound, bound))
 
         weight_down.data[idx] = w_down.to(dtype)
@@ -338,7 +340,7 @@ def with_elites(select_fn, elite_frac = 0.25):
 
     @wraps(select_fn)
     def inner(fitnesses, num_select, **kwargs):
-        pop_size = fitnesses.shape[-1]
+        pop_size = size(fitnesses, '... [p]')
         num_elites = max(1, int(pop_size * elite_frac))
 
         if num_elites >= num_select:
@@ -369,7 +371,7 @@ def select_probabilistic(fitnesses, num_select, temperature = 1., **kwargs):
 def select_fuss(fitnesses, num_select, eps = 1e-5, **kwargs):
     # fitness uniform selection scheme - Marcus Hutter https://arxiv.org/abs/cs/0103015
 
-    pop_size = fitnesses.shape[-1]
+    pop_size = size(fitnesses, '... [p]')
     sorted_fitness, sort_indices = fitnesses.sort(dim = -1)
 
     if pop_size == 1:
@@ -396,13 +398,11 @@ def register_parent_selection(name: str, fn: callable):
     PARENT_SELECTION_REGISTRY[name] = fn
 
 def parent_select_tournament(fitnesses, num_children, num_parents_per_child = 2, tournament_size = 3, **kwargs):
-    pop_size = fitnesses.shape[-1]
+    *batch_shape, pop_size = shape(fitnesses, '... p')
     device = fitnesses.device
 
     tournament_size = min(tournament_size, pop_size)
-    num_parents_per_child = min(num_parents_per_child, tournament_size)
 
-    batch_shape = fitnesses.shape[:-1]
     rand_shape = (*batch_shape, num_children, pop_size)
     contender_ids = torch.randn(rand_shape, device = device).topk(tournament_size, dim = -1, sorted = False).indices
 
@@ -416,15 +416,22 @@ def parent_select_tournament(fitnesses, num_children, num_parents_per_child = 2,
         winners = tournaments.argmax(dim = -1)
         return contender_ids.gather(-1, rearrange(winners, '... -> ... 1'))
 
+    # tournament smaller than the requested parent count (a lone island
+    # survivor) - repeat the strongest, so two-parent crossovers still work
+
+    if num_parents_per_child > tournament_size:
+        winners = tournaments.argmax(dim = -1, keepdim = True)
+        return contender_ids.gather(-1, winners.expand(*batch_shape, num_children, num_parents_per_child))
+
     top_winners = tournaments.topk(num_parents_per_child, dim = -1, largest = True, sorted = False).indices
     return contender_ids.gather(-1, top_winners)
 
 def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps = 1e-5, **kwargs):
     # fitness uniform selection scheme - Marcus Hutter https://arxiv.org/abs/cs/0103015
 
-    pop_size = fitnesses.shape[-1]
+    *batch_shape, pop_size = shape(fitnesses, '... p')
+
     sorted_fitness, sort_indices = fitnesses.sort(dim = -1)
-    batch_shape = fitnesses.shape[:-1]
 
     if pop_size == 1:
         return torch.randint(0, pop_size, (*batch_shape, num_children, num_parents_per_child), device = fitnesses.device)
@@ -442,17 +449,17 @@ def parent_select_fuss(fitnesses, num_children, num_parents_per_child = 2, eps =
     return expanded_sort_indices.gather(-1, selected)
 
 def parent_select_roulette(fitnesses, num_children, num_parents_per_child = 2, temperature = 1., **kwargs):
+    *batch_shape, pop_size = shape(fitnesses, '... p')
     num_samples = num_children * num_parents_per_child
-    batch_shape = fitnesses.shape[:-1]
 
     if math.isinf(temperature):
         # a uniform draw - softmax over +-inf fitnesses at infinite temperature
         # would come out all-nan
 
-        if fitnesses.shape[-1] <= 1:
+        if pop_size <= 1:
             selected = torch.zeros((*batch_shape, num_samples), dtype = torch.long, device = fitnesses.device)
         else:
-            selected = torch.randint(0, fitnesses.shape[-1], (*batch_shape, num_samples), device = fitnesses.device)
+            selected = torch.randint(0, pop_size, (*batch_shape, num_samples), device = fitnesses.device)
     else:
         probs = F.softmax(fitnesses / temperature, dim = -1)
         selected = torch.multinomial(probs, num_samples, replacement = True)
@@ -463,10 +470,10 @@ def parent_select_queen_bee(fitnesses, num_children, num_parents_per_child = 2, 
     # queen-bee mutant-bee evolution - Jung 2007 https://www.researchgate.net/publication/290131255
 
     device = fitnesses.device
-    batch_shape = fitnesses.shape[:-1]
+    *batch_shape, _ = shape(fitnesses, '... p')
 
     elites = fitnesses.topk(num_elites, dim = -1).indices
-    queen_indices = torch.randint(0, elites.shape[-1], (*batch_shape, num_children, 1), device = device)
+    queen_indices = torch.randint(0, num_elites, (*batch_shape, num_children, 1), device = device)
 
     if elites.ndim == 1:
         queens = elites[queen_indices]
@@ -508,7 +515,7 @@ def crossover_dare(population, parent_indices, child_indices, p = 0.7, fitnesses
 
 # X2
 def crossover_layer_wise(population, parent_indices, child_indices, fitnesses = None, **kwargs):
-    num_children, num_parents = parent_indices.shape
+    num_children, num_parents = shape(parent_indices, 'c p')
     device = population.device
     batch_indices = torch.arange(num_children, device = device)
 
@@ -519,7 +526,7 @@ def crossover_layer_wise(population, parent_indices, child_indices, fitnesses = 
 
 # X3
 def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses = None, **kwargs):
-    num_children, num_parents = parent_indices.shape
+    num_children, num_parents = shape(parent_indices, 'c p')
     assert num_parents == 2, 'svd subspace crossover requires exactly 2 parents'
 
     device = population.device
@@ -529,7 +536,7 @@ def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses 
         w_down_parents = w_down.data[parent_indices].float()
         w_up_parents = w_up.data[parent_indices].float()
 
-        r = w_down_parents.shape[-1]
+        r = size(w_down_parents, '... [r]')
 
         # batched svd over both parents of every child - `_efficient_svd_of_lora`
         # takes any leading dims, so the per-child loop folds into one call
@@ -560,7 +567,7 @@ def crossover_svd_subspace(population, parent_indices, child_indices, fitnesses 
 
 # X4
 def crossover_extrapolative(population, parent_indices, child_indices, eta_min = 1.0, eta_max = 1.5, fitnesses = None, **kwargs):
-    num_children, num_parents = parent_indices.shape
+    num_children, num_parents = shape(parent_indices, 'c p')
     assert num_parents == 2, 'extrapolative crossover requires exactly 2 parents'
     device = population.device
 
@@ -596,9 +603,9 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
     assert exists(fitnesses), 'XES crossover requires fitnesses'
 
     device = population.device
-    num_children, num_good_parents = parent_indices.shape
+    num_children, num_good_parents = shape(parent_indices, 'c p')
     num_bad_parents = default(num_bad_parents, num_good_parents)
-    pop_size = fitnesses.shape[-1]
+    pop_size = size(fitnesses, '... [p]')
 
     tournament_size = min(max(kwargs.get('tournament_size', 3), num_bad_parents), pop_size - num_good_parents)
 
@@ -619,7 +626,7 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
     # 2. compute z-scored weights
 
     selected_fitnesses = fitnesses[all_parent_indices]
-    weights = z_score(selected_fitnesses, dim = -1) / selected_fitnesses.shape[-1]
+    weights = z_score(selected_fitnesses, dim = -1) / size(selected_fitnesses, '... [p]')
 
     # 3. apply update - mean + eta * weighted direction
 
@@ -779,7 +786,7 @@ def migrate_fuss_roll(
     **kwargs
 ):
     device = fitnesses.device
-    pop_size = fitnesses.shape[-1]
+    pop_size = size(fitnesses, '... [p]')
     island_size = pop_size // num_islands
     num_elites = int(island_size * elite_frac)
     num_migrate = max(1, int(island_size * migrate_frac))

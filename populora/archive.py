@@ -8,6 +8,7 @@ import torch
 from torch import arange, no_grad
 
 from einops import repeat
+from torch_einops_utils.shape import shape
 
 from populora._utils import exists
 
@@ -23,6 +24,18 @@ class HallOfFame:
 
     def __len__(self):
         return len(self.entries)
+
+    def save(self, path):
+        # cpu tensors only - plain tuples round trip under weights_only
+
+        torch.save(dict(entries = [tuple(entry) for entry in self.entries], capacity = self.capacity), path)
+        return self
+
+    def load(self, path):
+        state = torch.load(path, map_location = 'cpu', weights_only = True)
+        self.entries = [Entry(*entry) for entry in state['entries']]
+        self.capacity = state['capacity']
+        return self
 
     @no_grad()
     def add(self, population, individual, generation = None):
@@ -99,7 +112,7 @@ class HallOfFame:
 
     @no_grad()
     def probe(self, population, x, num, mode = 'uniform', generator = None):
-        # route x through `num` sampled archived champions, returning (k, *x.shape[:-1], -1)
+        # route x through `num` sampled archived champions, returning (k, *leading, -1)
         # outputs - None when nothing has been archived yet. the replay population
         # shares the population's frozen base, so only the adapters are extra memory
 
@@ -131,4 +144,6 @@ class HallOfFame:
         repeated = repeat(x, '... -> k ...', k = k)
         outputs = self._replay(repeated, individuals = slots)
 
-        return outputs.reshape(k, *x.shape[:-1], -1)
+        *leading, _ = shape(x, '... d')
+
+        return outputs.reshape(k, *leading, -1)

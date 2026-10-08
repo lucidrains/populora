@@ -12,6 +12,7 @@ from env_ssl_wrapper import AutoBatchedWrapper, DoneTrackerWrapper, StandardizeW
 from env_ssl_wrapper.helpers import env_autoresets, first_existing, get_attr
 from env_ssl_wrapper.utils import parse_wrapper
 from torch_einops_utils import temp_eval
+from torch_einops_utils.shape import shape, size
 
 from populora._utils import cast_tensor, default, exists, rescale_from_range_to_range, torch_save
 from populora.distributed import (
@@ -508,7 +509,7 @@ class EnvInteractor:
 
                         num_env_slots = env.num_envs
                         e_actions = torch.zeros(
-                            (num_env_slots, *actions.shape[1:]),
+                            (num_env_slots, *shape(actions, 'b ...')['...']),
                             dtype = actions.dtype,
                             device = actions.device
                         )
@@ -664,7 +665,7 @@ class EnvInteractor:
                 if exists(res):
                     dd = dict(device = population.device, dtype = torch.float32)
                     res = cast_tensor(res, **dd)
-                    assert res.shape[0] == population.pop_size, f'all-at-once fitness must return one fitness per individual, got {tuple(res.shape)}'
+                    assert size(res, '[p] ...') == population.pop_size, f'all-at-once fitness must return one fitness per individual, got {tuple(res.shape)}'
 
             fitnesses = broadcast_object(res, src = 0)
 
