@@ -64,6 +64,13 @@ def rescale_from_range_to_range(val, from_range = (-1., 1.), to_range = (0., 1.)
     (from_min, from_max), (to_min, to_max) = from_range, to_range
 
     if is_tensor(val):
+        # scalar bounds take a plain fused affine path - the per-dim case falls
+        # back to the broadcast form below
+        if all(isinstance(t, (int, float)) for t in (from_min, from_max, to_min, to_max)):
+            scale = (to_max - to_min) / (from_max - from_min)
+            bias = to_min - from_min * scale
+            return val * scale + bias
+
         dd = dict(device = val.device, dtype = val.dtype)
         from_min, from_max, to_min, to_max = [torch.as_tensor(t, **dd) for t in (from_min, from_max, to_min, to_max)]
 

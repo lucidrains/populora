@@ -12,7 +12,6 @@ from torch import Tensor, atleast_1d, cat, is_tensor
 import torch.nn.functional as F
 from torch.nn import Linear, Module, ModuleDict, Parameter, ParameterDict, init
 
-from einx import get_at, set_at
 from einops import einsum, rearrange, repeat
 from torch_einops_utils import batched_index_select, temp_eval, tree_map_tensor, z_score
 from torch_einops_utils.shape import is_shape, shape, size
@@ -151,16 +150,16 @@ def _expand_batch(t, p):
     # multiple - non-tensors (lengths, masks, ...) pass through untouched
 
     if is_tensor(t) and t.ndim > 0:
-        if size(t, '[b] ...') == 1:
+        if t.shape[0] == 1:
             t = repeat(t, '1 ... -> p ...', p = p)
 
-        batch = size(t, '[b] ...')
+        batch = t.shape[0]
         assert divisible_by(batch, p), f'batch {batch} must be a multiple of individuals {p}'
 
     return t
 
 def _at(values, indices):
-    return get_at('[p], k -> k', values, indices) if len(indices) > 0 else values[:0]
+    return values[indices] if len(indices) > 0 else values[:0]
 
 # per-target operator params - mutation_type / epsilon / crossover_type (or any
 # kwarg via PerTarget) may be a dict keyed by lora target or glob; a 'default'
@@ -406,6 +405,12 @@ class Population(_LoRAMixin):
             self._log_sigma_up[key] = sigma_up
 
         self._twin_pairs = None
+
+        # per-rollout route cache - selected adapter rows are reused across
+        # timesteps while the route and weights stay fixed
+        self._route_cache = None
+        self._route_key = None
+        self._last_route_key = None
 
         if exists(device):
             self.to(device)
@@ -1120,6 +1125,63 @@ class Population(_LoRAMixin):
         return self
 
     @contextmanager
+    def routing_cache(self):
+        # cache adapter rows selected by the router for one rollout
+        previous = self._route_cache
+        self._route_cache = {}
+
+        try:
+            yield self
+        finally:
+            self._route_cache = previous
+            self._route_key = None
+            self._last_route_key = None
+
+    def clear_routing_cache(self):
+        if exists(self._route_cache):
+            self._route_cache.clear()
+            self._last_route_key = None
+
+        return self
+
+    def _adapter_rows(self, individual, key, w_down, w_up):
+        cache, route_key = self._route_cache, self._route_key
+
+        if not exists(cache) or not exists(route_key):
+            return w_down[individual], w_up[individual]
+
+        cache_key = (key, route_key)
+        entry = cache.get(cache_key)
+        valid = exists(entry) and (route_key[0] != 'tensor' or entry[0] is individual)
+
+        if valid:
+            return entry[1], entry[2]
+
+        w_down_i, w_up_i = w_down[individual], w_up[individual]
+        route_ref = individual if route_key[0] == 'tensor' else None
+        cache[cache_key] = (route_ref, w_down_i, w_up_i)
+
+        return w_down_i, w_up_i
+
+    def _route_cache_key(self, individual):
+        # tensor routes keyed by identity, so no host sync; the cache holds the
+        # tensor reference, keeping its id alive
+
+        if not exists(self._route_cache) or individual is ...:
+            return None
+
+        if is_tensor(individual):
+            key = ('tensor', id(individual))
+        else:
+            key = ('index', individual)
+
+        if exists(self._last_route_key) and key != self._last_route_key:
+            self._route_cache.clear()
+
+        self._last_route_key = key
+        return key
+
+    @contextmanager
     def _route(self, individual, individuals, all_individuals):
         assert sum((exists(individual), exists(individuals), all_individuals)) <= 1
 
@@ -1129,11 +1191,13 @@ class Population(_LoRAMixin):
             individual = cast_tensor(individuals, device = self.device)
 
         self._individual = individual
+        self._route_key = self._route_cache_key(individual)
 
         try:
             yield
         finally:
             self._individual = None
+            self._route_key = None
 
     def route(
         self,
@@ -1231,7 +1295,7 @@ class Population(_LoRAMixin):
 
         self._sigma_reset_(individuals)
 
-        self._ages.data.copy_(set_at('[p], k, k -> [p]', self._ages, individuals, torch.zeros_like(individuals)))
+        self._ages.data[individuals] = 0
 
         return self
 
@@ -1625,6 +1689,10 @@ class Population(_LoRAMixin):
         **kwargs
     ):
         assert is_shape(fitnesses, 'p', p = self.pop_size)
+
+        if is_tensor(fitnesses) and fitnesses.device != self.device:
+            fitnesses = fitnesses.to(self.device)
+
         assert retire_refill in (None, 'crossover', 'reinit', 'es'), f'unknown retire_refill {retire_refill!r} - choose from "crossover", "reinit", "es"'
         assert not exists(retire_refill) or exists(max_age), 'retire_refill requires max_age to be set'
         assert brood_size >= 1, f'brood_size must be >= 1, got {brood_size}'
@@ -1720,9 +1788,9 @@ class Population(_LoRAMixin):
 
         # survivors age a generation, the culled are reborn
 
-        ages = set_at('[p], k, k -> [p]', self._ages, result.culled, torch.zeros_like(result.culled))
-        ages = set_at('[p], k, k -> [p]', ages, result.survivors, _at(ages, result.survivors) + 1)
-        self._ages.data.copy_(ages)
+        ages = self._ages.data
+        ages[result.culled] = 0
+        ages[result.survivors] += 1
 
         parents = self.select_parents(
             parent_selection_type,
@@ -1849,7 +1917,7 @@ class Population(_LoRAMixin):
 
         if exists(elite_max_age):
             keep = tier_bins[0]
-            aged = get_at('[p], k -> k', self._ages, keep) >= elite_max_age
+            aged = self._ages[keep] >= elite_max_age
             tier_bins[0] = keep[~aged]
             tier_bins[1] = cat((tier_bins[1], keep[aged]))
 
@@ -1880,9 +1948,9 @@ class Population(_LoRAMixin):
                 self._tiered_last_mutated[indices] = gen
 
         surviving = cat(tier_bins[:-1])
-        ages = set_at('[p], k, k -> [p]', self._ages, tier_bins[-1], torch.zeros_like(tier_bins[-1]))
-        ages = set_at('[p], k, k -> [p]', ages, surviving, _at(ages, surviving) + 1)
-        self._ages.data.copy_(ages)
+        ages = self._ages.data
+        ages[tier_bins[-1]] = 0
+        ages[surviving] += 1
 
         return TieredResult(tier_bins)
     def evaluate_distributed(
@@ -1943,47 +2011,58 @@ class Population(_LoRAMixin):
 
     def _create_hook(self, lora_key: str):
         def hook(_, args, output):
-            if not exists(self._individual):
+            individual = self._individual
+            if not exists(individual):
                 return output
 
-            x = first(args)
+            x = args[0] if args else None
             if not exists(x):
                 return output
 
             weight_down, weight_up = self.weight_down[lora_key], self.weight_up[lora_key]
-            individual = self._individual
-
-            weight_down_i, weight_up_i = weight_down[individual], weight_up[individual]
+            weight_down_i, weight_up_i = self._adapter_rows(individual, lora_key, weight_down, weight_up)
 
             # per-sample routing when ids are vectorized (e.g. one individual per env)
 
             if individual is ... or (is_tensor(individual) and individual.ndim > 0):
-                p = size(weight_down_i, '[p] ...')
+                p = weight_down_i.shape[0]
 
                 # a 1-d activation is one unbatched feature vector, which cannot be
                 # split across routed individuals - anything else is a guess
 
-                assert x.ndim >= 2, f'routed forwards need batched inputs - got a {x.ndim}-d tensor of shape {tuple(x.shape)}. pass observations with their batch / feature axes'
+                if x.ndim < 2:
+                    raise AssertionError(f'routed forwards need batched inputs - got a {x.ndim}-d tensor of shape {tuple(x.shape)}. pass observations with their batch / feature axes')
 
-                batch = size(x, '[b] ...')
+                batch = x.shape[0]
 
-                assert divisible_by(batch, p), f'batch {batch} must be a multiple of routed individuals {p}'
+                if batch % p != 0:
+                    raise AssertionError(f'batch {batch} must be a multiple of routed individuals {p}')
 
-                wd_i = weight_down_i.to(x.dtype)
-                wu_i = weight_up_i.to(x.dtype)
+                if weight_down_i.dtype != x.dtype:
+                    weight_down_i = weight_down_i.to(x.dtype)
+                if weight_up_i.dtype != x.dtype:
+                    weight_up_i = weight_up_i.to(x.dtype)
 
-                if is_shape(x, 'b d', b = p):
+                if x.ndim == 2 and batch == p:
                     # one sample per individual - the delta is two chained
-                    # matmuls on a leading batch axis, no reshaping at all
-                    lora_out = (x.unsqueeze(1) @ wd_i @ wu_i.transpose(-1, -2)).squeeze(1)
+                    # batched matmuls on a leading batch axis, no reshaping at all
+                    lora_out = torch.bmm(torch.bmm(x.unsqueeze(1), weight_down_i), weight_up_i.transpose(1, 2)).squeeze(1)
                 else:
                     x = rearrange(x, '(p b) ... -> p b ...', p = p)
-                    lora_out = einsum(x, wd_i, wu_i, 'p b ... d, p d r, p e r -> p b ... e')
+                    lora_out = einsum(x, weight_down_i, weight_up_i, 'p b ... d, p d r, p e r -> p b ... e')
                     lora_out = rearrange(lora_out, 'p b ... -> (p b) ...')
             else:
-                lora_out = x @ weight_down_i.to(x.dtype) @ weight_up_i.to(x.dtype).transpose(-1, -2)
+                if weight_down_i.dtype != x.dtype:
+                    weight_down_i = weight_down_i.to(x.dtype)
+                if weight_up_i.dtype != x.dtype:
+                    weight_up_i = weight_up_i.to(x.dtype)
 
-            return output + lora_out.to(output.dtype)
+                lora_out = x @ weight_down_i @ weight_up_i.transpose(-1, -2)
+
+            if lora_out.dtype != output.dtype:
+                lora_out = lora_out.to(output.dtype)
+
+            return output + lora_out
 
         return hook
 
@@ -2009,7 +2088,7 @@ class Population(_LoRAMixin):
                 # fast path - plain tensor args, no per-call structure walk
                 args = tuple(_expand_batch(a, p) for a in args)
                 kwargs = {k: _expand_batch(v, p) for k, v in kwargs.items()}
-                batch_size = next((size(t, '[b] ...') for t in (*args, *kwargs.values()) if is_tensor(t) and t.ndim > 0), 0)
+                batch_size = next((t.shape[0] for t in (*args, *kwargs.values()) if is_tensor(t) and t.ndim > 0), 0)
             else:
                 def maybe_repeat_batch(t):
                     # broadcast singleton batches to each individual, otherwise expect a
@@ -2066,6 +2145,30 @@ class Population(_LoRAMixin):
                             outputs.append(self.model(*chunk_args, **chunk_kwargs))
 
                 return _concat_chunked_outputs(outputs, batch_size)
+
+        # steady-state fast path - routing + no_grad are already in effect, so
+        # skip the context managers and their per-step setup cost
+
+        if eval_and_no_grad and not self.model.training and not torch.is_grad_enabled():
+            if all_individuals:
+                routed = ...
+            elif exists(individuals):
+                routed = individuals if is_tensor(individuals) else cast_tensor(individuals, device = self.device)
+            else:
+                routed = individual
+
+            if not exists(routed):
+                return self.model(*args, **kwargs)
+
+            previous = self._individual
+            self._individual = routed
+            self._route_key = self._route_cache_key(routed)
+
+            try:
+                return self.model(*args, **kwargs)
+            finally:
+                self._individual = previous
+                self._route_key = None
 
         with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
             return self.model(*args, **kwargs)

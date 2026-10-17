@@ -44,6 +44,7 @@ from populora.interact import (
     evolve_with_env,
     interact_with_env,
 )
+from populora.clonal import ClonalState, clonal_adapt_sigma_, clonal_reproduce_, clonal_reset_, evolve_clonal
 from env_ssl_wrapper import MultiprocessingVecEnv
 from populora.memory import Memory, rollout
 from populora.generate import generate

@@ -107,8 +107,8 @@ def _has_wrapper(env, cls):
 
     return False
 
-def _compose_env(env, wrappers):
-    if not _has_wrapper(env, StandardizeWrapper):
+def _compose_env(env, wrappers, standardize = True):
+    if standardize and not _has_wrapper(env, StandardizeWrapper):
         env = StandardizeWrapper(env)
 
     parsed = [parse_wrapper(spec) for spec in wrappers]
@@ -134,12 +134,24 @@ def _compose_env(env, wrappers):
     return env
 
 def _try_seed(env, seed):
-    # some envs have no seedable rng - evaluate them with their own stream
+    # some envs have no seedable rng - evaluate them with their own stream.
+    # returns the reset output when seeding went through reset(seed = ...), so
+    # the caller does not reset a second time and lose the seeded initial state
 
+    seed_fn = getattr(env, 'seed', None)
+
+    if callable(seed_fn):
+        try:
+            seed_fn(seed)
+            return None
+        except (ValueError, TypeError):
+            pass
+
+    # gymnasium 1.x vector envs seed through reset(seed = ...) instead
     try:
-        env.seed(seed)
-    except ValueError:
-        pass
+        return env.reset(seed = seed)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 def _fitness_mode(fn):
     # infer a custom fitness function's mode: (pop, individuals/indices) -> batch;
@@ -178,12 +190,14 @@ class EnvInteractor:
 
         seed: int = 0,
         to_range = None,
-        from_range = (-1., 1.)
+        from_range = (-1., 1.),
+        standardize: bool = True
     ):
         self.seed = seed
         self.device = torch.device(default(device, distributed_device()))
         self.to_range = to_range
         self.from_range = from_range
+        self.standardize = standardize
 
         envs = self._maybe_vectorize(envs, num_envs)
         envs = self._normalize_envs(envs)
@@ -194,11 +208,15 @@ class EnvInteractor:
         wrappers = default(wrappers, ('auto_batch', 'flatten_obs', ('tensor', dict(device = self.device))))
 
         self.envs = [
-            _compose_env(env, wrappers)
+            _compose_env(env, wrappers, standardize = self.standardize)
             for env in envs
         ]
 
         self.num_envs = sum(env.num_envs for env in self.envs)
+
+        # autoreset detection walks the whole wrapper chain - cache it, it is
+        # consulted every step of every rollout
+        self._autoreset_cache = {}
 
         self.obs_dim, self.action_dim, self.action_space = self._probe()
 
@@ -253,6 +271,17 @@ class EnvInteractor:
 
         action_space = first_existing(env, 'single_action_space', 'action_space')
         return obs_dim, action_dim_of(env), action_space
+
+    def _autoresets(self, env) -> bool:
+        # cached per env instance - the wrapper chain does not change during a
+        # rollout, and re-walking it on every step is pure overhead
+
+        key = id(env)
+
+        if key not in self._autoreset_cache:
+            self._autoreset_cache[key] = _env_autoresets(env)
+
+        return self._autoreset_cache[key]
 
     def _rescale_actions(self, actions, action = None):
         if not exists(self.to_range):
@@ -386,8 +415,8 @@ class EnvInteractor:
         last_obs = []
 
         for j, env in enumerate(envs):
-            _try_seed(env, _mix_seed(base_seed, j, 0))
-            obs, _ = env.reset()
+            seeded = _try_seed(env, _mix_seed(base_seed, j, 0))
+            obs, _ = seeded if exists(seeded) else env.reset()
             last_obs.append(obs)
 
         num_slots = sum(env.num_envs for env in envs)
@@ -423,6 +452,13 @@ class EnvInteractor:
         route_ids = torch.tensor([tour[0] for tour in tours], device = device)
 
         single_env = len(envs) == 1
+        autoresets = [self._autoresets(env) for env in envs]
+
+        # action rescaling params are constant across the rollout - resolve once
+
+        action_from_range = default(get_attr(action, 'from_range'), self.from_range)
+        to_range = self.to_range
+        rescale_actions = exists(to_range)
 
         budgets = [horizon * num_episodes * len(tour) for tour in tours]
         cursor = [0] * num_slots
@@ -435,7 +471,7 @@ class EnvInteractor:
         episode_counts = torch.zeros(num_individuals, dtype = torch.long, device = device)
         env_reset_count = [0] * len(envs)
 
-        with temp_eval(population):
+        with temp_eval(population), population.routing_cache():
             while True:
                 active_slots = [
                     k for k in range(num_slots)
@@ -453,7 +489,10 @@ class EnvInteractor:
 
                 if single_env and all_live:
                     obs_batch = last_obs[0]
-                    obs_batch = obs_batch.to(device) if is_tensor(obs_batch) else torch.as_tensor(obs_batch).to(device)
+                    if not is_tensor(obs_batch):
+                        obs_batch = torch.as_tensor(obs_batch, device = device)
+                    elif obs_batch.device != device:
+                        obs_batch = obs_batch.to(device)
                     individuals_batch = route_ids
                 else:
                     positions = {k: i for i, k in enumerate(active_slots)}
@@ -488,7 +527,9 @@ class EnvInteractor:
                 actions = action(policy_out) if exists(action) else policy_out
                 actions = actions if is_tensor(actions) else torch.as_tensor(actions)
                 actions = atleast_1d(actions)
-                actions = self._rescale_actions(actions, action)
+
+                if rescale_actions:
+                    actions = rescale_from_range_to_range(actions, from_range = action_from_range, to_range = to_range)
 
                 # step every environment with active slots; inactive sub-envs of a
                 # vector env still have to step along, so they get zero actions
@@ -554,17 +595,18 @@ class EnvInteractor:
 
                                 if cursor[k] < len(tours[k]):
                                     route_ids[k] = tours[k][cursor[k]]
+                                    population.clear_routing_cache()
 
                             # single envs advance to the next episode with a fresh seed;
                             # vector envs autoreset on their own
 
                             if num_env_slots == 1 and cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]:
-                                _try_seed(env, _mix_seed(base_seed, k, episode_counter[k]))
-                                last_obs[e], _ = env.reset()
+                                seeded = _try_seed(env, _mix_seed(base_seed, k, episode_counter[k]))
+                                last_obs[e], _ = seeded if exists(seeded) else env.reset()
 
                     # non-autoresetting vector envs reset on full completion;
                     # autoresetting envs advance slots independently and are left untouched
-                    if num_env_slots > 1 and not _env_autoresets(env) and env.needs_reset and any(
+                    if num_env_slots > 1 and not autoresets[e] and env.needs_reset and any(
                         cursor[k] < len(tours[k]) and steps_used[k] < budgets[k]
                         for k in e_slots
                     ):
@@ -575,9 +617,9 @@ class EnvInteractor:
                                 if memory_wrapped:
                                     memories[k] = init_memories[k]
 
-                        _try_seed(env, _mix_seed(base_seed, e, env_reset_count[e]))
+                        seeded = _try_seed(env, _mix_seed(base_seed, e, env_reset_count[e]))
                         env_reset_count[e] += 1
-                        last_obs[e], _ = env.reset()
+                        last_obs[e], _ = seeded if exists(seeded) else env.reset()
 
         # mean return over completed episodes, falling back to the partial
         # return of an in-progress episode when the budget ran out
@@ -890,8 +932,8 @@ class EnvInteractor:
                 num_env_slots = env.num_envs
 
                 for episode in range(num_episodes):
-                    _try_seed(env, _mix_seed(seed, j, episode))
-                    obs, _ = env.reset()
+                    seeded = _try_seed(env, _mix_seed(seed, j, episode))
+                    obs, _ = seeded if exists(seeded) else env.reset()
 
                     if memory_wrapped:
                         init_memories = init_memory_tensor(policy.init_memory, num_env_slots, device = device)
@@ -950,7 +992,8 @@ def interact_with_env(
     wrappers: Sequence | None = None,
     seed: int = 0,
     to_range = None,
-    from_range = (-1., 1.)
+    from_range = (-1., 1.),
+    standardize: bool = True
 ):
     return EnvInteractor(
         envs,
@@ -959,7 +1002,8 @@ def interact_with_env(
         wrappers = wrappers,
         seed = seed,
         to_range = to_range,
-        from_range = from_range
+        from_range = from_range,
+        standardize = standardize
     )
 
 # convenience - evolve a model against an environment (or environments) in one
@@ -997,7 +1041,8 @@ def evolve_with_env(
     resume: bool = False,
     exact_resume: bool = False,
     to_range = None,
-    from_range = (-1., 1.)
+    from_range = (-1., 1.),
+    standardize: bool = True
 ):
     interactor = interact_with_env(
         envs,
@@ -1006,7 +1051,8 @@ def evolve_with_env(
         wrappers = wrappers,
         seed = seed,
         to_range = to_range,
-        from_range = from_range
+        from_range = from_range,
+        standardize = standardize
     )
 
     population = interactor.population(

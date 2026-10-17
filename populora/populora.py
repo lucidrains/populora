@@ -24,6 +24,7 @@ from populora.population import (
     resolve_lora_targets,
 )
 from populora.coevolve import Coevolve
+from populora.clonal import ClonalState, clonal_adapt_sigma_, clonal_reproduce_, clonal_reset_, evolve_clonal
 from populora.operators import (
     ISLAND_REINIT_REGISTRY,
     CROSSOVER_REGISTRY,

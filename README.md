@@ -131,6 +131,8 @@ policy, history = evolve_with_env(
 
 Continuous policies emit actions on `(-1, 1)` — pass `to_range = (-2., 2.)` (or any env action range) to `evolve_with_env` / `interact_with_env` and the actions are rescaled before stepping the env. An action fn built with `make_action` carries its own range, e.g. a beta with `beta_rescale_neg_one_one = False` emits on `(0, 1)` instead — the interactor rescales from that automatically. `interact_with_env(from_range = ...)` is the fallback for custom action functions, and `rescale_from_range_to_range` is exported too.
 
+`standardize = False` skips the running observation normalizer — useful when observations are already bounded (e.g. classic-control) or when the curriculum should see raw states.
+
 For a custom loop, `interact_with_env` exposes the underlying `EnvInteractor` — one routed forward over the active slots per timestep, distributed across ranks under `torchrun`:
 
 ```python
@@ -156,6 +158,12 @@ policy = population.merge_(fitnesses.argmax())
 ```
 
 Custom fitness functions may take `(population, individuals)` (batched), `(population, idx)` (per index), or `(population)` (all at once) — detected automatically.
+
+## Clonal selection (AIS)
+
+`evolve_clonal` borrows from clonal selection in artificial immune systems (de Castro & Von Zuben, 2002). The stagnation-triggered hypermutation burst is the same move as CHC's cataclysmic mutation (Eshelman, 1991). The champion is cloned each generation, its children are hypermutated in LoRA weight space, and the burst restores lost variation before returning to local refinement. The champion is never discarded.
+
+On CartPole with four policies, `bench_cartpole_convergence.py` solves 10/10 seeds in a median of 24 generations, versus 6/10 and a median of 44 for the standard tournament + extrapolative GA.
 
 ## Coevolution
 
@@ -335,5 +343,30 @@ Samples can be routed to explicit individuals (`individual = 3` or `individuals 
     year      = {1994},
     organization = {IEEE},
     doi       = {10.1109/ICEC.1994.350030}
+}
+```
+
+```bibtex
+@article{decastro2002learning,
+    title   = {Learning and Optimization Using the Clonal Selection Principle},
+    author  = {de Castro, Leandro N. and Von Zuben, Fernando J.},
+    journal = {IEEE Transactions on Evolutionary Computation},
+    volume  = {6},
+    number  = {3},
+    pages   = {239--251},
+    year    = {2002}
+}
+```
+
+```bibtex
+@incollection{eshelman1991chc,
+    title     = {The CHC Adaptive Search Algorithm: How to Have Safe Search When Engaging in Nontraditional Genetic Recombination},
+    author    = {Eshelman, Larry J.},
+    booktitle = {Foundations of Genetic Algorithms},
+    editor    = {Rawlins, Gregory J. E.},
+    volume    = {1},
+    pages     = {265--283},
+    year      = {1991},
+    publisher = {Morgan Kaufmann}
 }
 ```
