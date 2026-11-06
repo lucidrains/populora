@@ -434,3 +434,18 @@ def test_aging_helps_on_shifting_target():
         final_best = max(best for best, _ in hist)
         none_best = max(best for best, _ in hist_none)
         assert final_best > none_best - 0.1
+
+def test_aging_decay_negative_fitnesses():
+    # negative fitnesses (e.g. LunarLander early generations or negative MSE)
+    # must still discount older individuals rather than inverting their rank
+    fitnesses = torch.tensor([-4.3, -4.4, -4.5, -4.6, -5., -6., -7., -8.])
+
+    pop = make_pop(8)
+    res = pop.evolve_(fitnesses, aging_decay = 0.5, elite_frac = 0.)
+    assert set(res.survivors.tolist()) == {0, 1, 2, 3}
+
+    res = pop.evolve_(fitnesses, aging_decay = 0.5, elite_frac = 0.)
+    assert set(res.survivors.tolist()) == {4, 5, 6, 7}
+
+    res = pop.evolve_(fitnesses, aging_decay = 0.5, elite_frac = 0.)
+    assert set(res.survivors.tolist()) == {0, 1, 2, 3}

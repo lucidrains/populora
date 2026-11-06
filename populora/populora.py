@@ -85,3 +85,12 @@ from populora.rl_finetune import (
     rl_finetune_elites,
     rl_finetune_elites_,
 )
+from populora.baldwin import (
+    Baldwin,
+    LatentPredictor,
+    PREDICTOR_LOSS_REGISTRY,
+    register_predictor_loss,
+    cosine_similarity_loss,
+    normalized_mse_loss,
+    smooth_l1_latent_loss,
+)

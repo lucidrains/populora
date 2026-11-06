@@ -12,6 +12,7 @@ from torch import Tensor, nn
 
 from populora._utils import default, exists, maybe_progress
 from populora.interact import EnvInteractor
+from populora.operators import _project_lora_weighted_sum
 from populora.population import Population
 
 @dataclass
@@ -38,21 +39,87 @@ def clonal_reset_(population: Population, sigma: float = 1.0):
     return population
 
 @torch.no_grad()
-def clonal_reproduce_(population: Population, champion: int, sigma: float):
-    # slot 0 is an exact champion copy, slots 1.. are its hypermutated clones
+def clonal_reproduce_(
+    population: Population,
+    champion: int,
+    sigma: float,
+    *,
+    fitnesses: Tensor | None = None,
+    elite_frac: float = 0.25,
+    max_eff_sigma: float = 2.0,
+):
+    # slot 0 is an exact champion copy; when `fitnesses` is provided, slot 1 is
+    # the Eckart-Young rank-r subspace centroid of the top-mu elites (CMA-ES
+    # log-rank weights) and slots 2.. are antithetic hypermutated clones around
+    # the subspace centroid
 
     p = population.pop_size
     assert p > 1, 'clonal reproduction needs at least two slots'
+    device = population.device
+
+    use_centroid = exists(fitnesses) and sigma > 0. and p >= 4
+    if use_centroid:
+        num_elites = max(2, min(p // 2, int(round(p * elite_frac))))
+        elite_idx = fitnesses.topk(num_elites).indices
+        ranks = torch.arange(1, num_elites + 1, device = device, dtype = torch.float32)
+        raw_w = math.log(num_elites + 0.5) - torch.log(ranks)
+        weights = raw_w / raw_w.sum()
+        champion = int(elite_idx[0].item())
+
+    eff_sigma = min(sigma, max_eff_sigma) if exists(fitnesses) else sigma
 
     for key, w_down in population.weight_down.items():
         w_up = population.weight_up[key]
+        dtype = w_down.dtype
         d, r = w_down.shape[1:]
+        e = w_up.shape[1]
 
-        w_down.data[0] = w_down[champion]
-        w_up.data[0] = w_up[champion]
+        d_champ = w_down.data[champion].clone()
+        u_champ = w_up.data[champion].clone()
 
-        w_down.data[1:] = w_down[champion] + sigma * d ** -0.5 * torch.randn_like(w_down[1:])
-        w_up.data[1:] = w_up[champion] + sigma * r ** -0.5 * torch.randn_like(w_up[1:])
+        w_down.data[0] = d_champ
+        w_up.data[0] = u_champ
+
+        if eff_sigma == 0.:
+            w_down.data[1:] = d_champ
+            w_up.data[1:] = u_champ
+            continue
+
+        if use_centroid:
+            d_elites = w_down.data[elite_idx].unsqueeze(0)
+            u_elites = w_up.data[elite_idx].unsqueeze(0)
+            d_center, u_center = _project_lora_weighted_sum(d_elites, u_elites, weights.unsqueeze(0))
+            d_center = d_center.squeeze(0).to(dtype)
+            u_center = u_center.squeeze(0).to(dtype)
+
+            w_down.data[1] = d_center
+            w_up.data[1] = u_center
+            start_slot = 2
+            anchor_d, anchor_u = d_center.float(), u_center.float()
+        else:
+            start_slot = 1
+            anchor_d, anchor_u = d_champ.float(), u_champ.float()
+
+        num_clones = p - start_slot
+        if num_clones > 0:
+            if use_centroid and num_clones >= 2:
+                half = (num_clones + 1) // 2
+                noise_d = eff_sigma * (d ** -0.5) * torch.randn((half, d, r), device = device, dtype = torch.float32)
+                noise_u = eff_sigma * (r ** -0.5) * torch.randn((half, e, r), device = device, dtype = torch.float32)
+
+                d_plus = anchor_d.unsqueeze(0) + noise_d
+                u_plus = anchor_u.unsqueeze(0) + noise_u
+                d_minus = anchor_d.unsqueeze(0) - noise_d
+                u_minus = anchor_u.unsqueeze(0) - noise_u
+
+                d_pairs = torch.stack([d_plus, d_minus], dim = 1).reshape(-1, d, r)[:num_clones]
+                u_pairs = torch.stack([u_plus, u_minus], dim = 1).reshape(-1, e, r)[:num_clones]
+
+                w_down.data[start_slot:] = d_pairs.to(dtype)
+                w_up.data[start_slot:] = u_pairs.to(dtype)
+            else:
+                w_down.data[start_slot:] = (anchor_d + eff_sigma * d ** -0.5 * torch.randn_like(w_down[start_slot:].float())).to(dtype)
+                w_up.data[start_slot:] = (anchor_u + eff_sigma * r ** -0.5 * torch.randn_like(w_up[start_slot:].float())).to(dtype)
 
     population._ages.data[0] = population._ages.data[champion] + 1
     population._ages.data[1:] = 0
@@ -89,19 +156,22 @@ def evolve_clonal(
     patience: int = 1,
     seed: int | None = None,
     sigma: float = 1.0,
-    sigma_min: float = 0.02,
-    sigma_max: float = 16.0,
-    gamma: float = 0.5,
+    sigma_min: float = 0.05,
+    sigma_max: float = 2.0,
+    gamma: float = 0.35,
     target_success: float = 0.2,
-    stall_patience: int = 3,
-    burst: float = 4.0,
+    stall_patience: int = 4,
+    burst: float = 1.6,
+    elite_frac: float = 0.25,
     progress: bool = False,
     return_history: bool = False,
     init_state: ClonalState | None = None,
 ):
-    """evolve by clonal selection with stagnation-triggered hypermutation.
-    the champion is cloned each generation, its children are hypermutated in
-    LoRA weight space, and the step size follows the 1/5 rule."""
+    """evolve by clonal selection with Eckart-Young subspace recombination and
+    stagnation-triggered hypermutation. slot 0 preserves the champion, slot 1
+    holds the rank-r subspace centroid of the top-mu elites, and slots 2.. are
+    antithetic hypermutated clones around the centroid; step size follows the
+    1/5 rule against the same-seed parent in slot 0."""
 
     if not exists(population):
         assert exists(model) and exists(pop_size) and exists(low_rank), 'pass a population, or model + pop_size + low_rank'
@@ -122,14 +192,19 @@ def evolve_clonal(
     history = []
     target_streak = 0
     fitnesses = interactor.evaluate(population, action = action, horizon = horizon, num_episodes = num_episodes, seed = population.eval_seed)
-    parent_fitness = float(fitnesses.max())
 
     for gen in maybe_progress(range(num_generations), progress, 'clonal'):
         gen_best, gen_mean = float(fitnesses.max()), float(fitnesses.mean())
         history.append(dict(best_fitness = gen_best, mean_fitness = gen_mean))
 
+        # slot 0 is the exact parent evaluated on the current generation's CRN
+        # seed, giving a zero-variance same-seed baseline for the 1/5 rule
+        same_seed_parent = float(fitnesses[0]) if gen > 0 else gen_best
+
         if gen_best > state.best:
             state.best, state.stall = gen_best, 0
+        elif gen > 0 and gen_best > same_seed_parent:
+            state.stall = 0
         else:
             state.stall += 1
 
@@ -143,13 +218,13 @@ def evolve_clonal(
             break
 
         champion = int(fitnesses.argmax())
-        champion_fitness = float(fitnesses[champion])
 
-        clonal_adapt_sigma_(state, fitnesses, parent_fitness)
-        clonal_reproduce_(population, champion, state.sigma)
+        if gen > 0:
+            clonal_adapt_sigma_(state, fitnesses, same_seed_parent)
+
+        clonal_reproduce_(population, champion, state.sigma, fitnesses = fitnesses, elite_frac = elite_frac)
 
         fitnesses = interactor.evaluate(population, action = action, horizon = horizon, num_episodes = num_episodes, seed = population.eval_seed)
-        parent_fitness = champion_fitness
 
     policy = population.merge_(int(fitnesses.argmax()))
 

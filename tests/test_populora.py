@@ -2706,3 +2706,53 @@ def test_brood_selection_high_level_evolve():
         crossover_type = 'extrapolative'
     )
     assert policy is not None
+
+def test_fitness_sharing_negative_fitnesses_and_champion_retention():
+    torch.manual_seed(0)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 6,
+        low_rank = 2,
+    )
+
+    # make individuals 0..4 identical clones in a crowded basin, and individual 5 distinct
+    for key in pop.weight_down:
+        pop.weight_down[key].data[1:5] = pop.weight_down[key].data[0:1].expand(4, -1, -1).clone()
+        pop.weight_up[key].data[1:5] = pop.weight_up[key].data[0:1].expand(4, -1, -1).clone()
+        pop.weight_down[key].data[5] = pop.weight_down[key].data[0] + 10.0
+
+    # negative fitnesses: crowded clones have -2.0 (except slot 0 is raw champion -1.5), isolated slot 5 has -2.0
+    fitnesses = torch.tensor([-1.5, -2.0, -2.0, -2.0, -2.0, -2.0])
+    shared = pop.shared_fitnesses(fitnesses, quantile = 0.5)
+
+    # isolated individual 5 should have strictly higher shared fitness than crowded clone 1
+    assert shared[5] > shared[1]
+
+    res = pop.evolve_(fitnesses, survive_frac = 0.5, sharing_quantile = 0.5)
+    assert 0 in res.survivors.tolist()
+    assert 5 in res.survivors.tolist()
+
+    with pytest.raises(AssertionError, match = 'not supported with tiered'):
+        pop.evolve_(fitnesses, tiered = True, sharing_quantile = 0.5)
+
+def test_mirror_antithetic_and_evolve_es():
+    torch.manual_seed(0)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+    pop.repopulate_(std_up = 0.1)
+    pop.mirror_antithetic_()
+
+    for key in pop.weight_down:
+        wd = pop.weight_down[key]
+        wu = pop.weight_up[key]
+        delta_even = torch.einsum('p e r, p d r -> p e d', wu[0::2], wd[0::2])
+        delta_odd = torch.einsum('p e r, p d r -> p e d', wu[1::2], wd[1::2])
+        assert allclose(delta_even, -delta_odd, atol = 1e-6)
+
+    w0_before = pop.model[0].weight.data.clone()
+    fitnesses = torch.arange(8, dtype = torch.float32)
+    pop.evolve_es_(fitnesses, mirrored = True, lr = 0.05)
+    assert not allclose(w0_before, pop.model[0].weight.data)

@@ -47,6 +47,15 @@ from populora.interact import (
 from populora.clonal import ClonalState, clonal_adapt_sigma_, clonal_reproduce_, clonal_reset_, evolve_clonal
 from env_ssl_wrapper import MultiprocessingVecEnv
 from populora.memory import Memory, rollout
+from populora.baldwin import (
+    Baldwin,
+    LatentPredictor,
+    PREDICTOR_LOSS_REGISTRY,
+    register_predictor_loss,
+    cosine_similarity_loss,
+    normalized_mse_loss,
+    smooth_l1_latent_loss,
+)
 from populora.generate import generate
 from populora.archive import HallOfFame
 from populora.policies import (

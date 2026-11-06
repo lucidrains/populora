@@ -47,6 +47,43 @@ def _efficient_svd_of_lora(weight_down, weight_up):
 
     return U, S, V
 
+def _project_lora_weighted_sum(
+    w_down_parents: Tensor,
+    w_up_parents: Tensor,
+    weights: Tensor,
+) -> tuple[Tensor, Tensor]:
+    # Eckart-Young rank-r projection of a weighted sum of LoRA deltas
+    # sum_m w_m U_m D_m^T via O((d + e) (P r)^2) QR-SVD of concatenated factors,
+    # preserving Frobenius energy and the top parent's ||U|| / ||D|| norm ratio
+
+    w = weights.unsqueeze(-1).unsqueeze(-1).float() if weights.ndim == w_down_parents.ndim - 2 else weights.float()
+    w_down_f = w_down_parents.float()
+    w_up_f = w_up_parents.float()
+    r = size(w_down_f, '... [r]')
+
+    sqrt_abs_w = w.abs().sqrt()
+    d_scaled = w_down_f * (w.sign() * sqrt_abs_w)
+    u_scaled = w_up_f * sqrt_abs_w
+
+    d_cat = rearrange(d_scaled, '... p d r -> ... d (p r)')
+    u_cat = rearrange(u_scaled, '... p e r -> ... e (p r)')
+
+    U, S, V = _efficient_svd_of_lora(d_cat, u_cat)
+    U_r = U[..., :r]
+    S_r = S[..., :r].clamp(min = 0.)
+    V_r = V[..., :r]
+
+    trunc_norm = S_r.norm(dim = -1, keepdim = True).clamp(min = 1e-8)
+    full_norm = S.norm(dim = -1, keepdim = True).clamp(min = 1e-8)
+    S_r = S_r * (full_norm / trunc_norm)
+
+    d_norm = w_down_f[..., 0, :, :].norm(dim = (-2, -1), keepdim = True).clamp(min = 1e-6)
+    u_norm = w_up_f[..., 0, :, :].norm(dim = (-2, -1), keepdim = True).clamp(min = 1e-6)
+    ratio = (u_norm / d_norm).sqrt()
+
+    S_sqrt = S_r.sqrt().unsqueeze(-2)
+    return (U_r * S_sqrt) / ratio, (V_r * S_sqrt) * ratio
+
 def skew_symmetrize(t):
     return (t - rearrange(t, '... i j -> ... j i')) / 2
 

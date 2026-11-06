@@ -70,6 +70,18 @@ pop.evolve_(
 
 Any other operator kwarg can vary per target too via the explicit `PerTarget` wrapper: `alpha = PerTarget({'*.proj_in': 5., 'default': 10.})`. Targets sharing the same resolved parameters are dispatched together in one call, so per-target specs cost nothing when they collapse to a single group.
 
+### Fitness sharing
+
+`sharing_quantile` enables Goldberg & Richardson fitness sharing over LoRA genome distance. Each individual's fitness is divided by its niche count — the number of nearby genomes within a radius set by that quantile of all pairwise distances — so a crowded basin cannot crowd out a rare but promising one. It applies to both survivor selection and parent choice, while the raw champion is always retained. The default `0.` leaves selection untouched; `0.25`–`0.5` is the useful range, and `sharing_kernel_power` sharpens the discount (`1.` is the triangular kernel).
+
+```python
+pop.evolve_(fitnesses, sharing_quantile = 0.25)
+# or, through the environment loop
+evolve_with_env(env, model, sharing_quantile = 0.25)
+```
+
+`pop.shared_fitnesses(fitnesses, quantile = 0.25)` exposes the discounted scores directly, e.g. for logging.
+
 ## Distributed evolution
 
 Each rank evaluates its share of the population and the fitnesses are gathered, so every rank evolves in lockstep. The population is moved to the local device on construction.
@@ -131,6 +143,8 @@ policy, history = evolve_with_env(
 
 Continuous policies emit actions on `(-1, 1)` — pass `to_range = (-2., 2.)` (or any env action range) to `evolve_with_env` / `interact_with_env` and the actions are rescaled before stepping the env. An action fn built with `make_action` carries its own range, e.g. a beta with `beta_rescale_neg_one_one = False` emits on `(0, 1)` instead — the interactor rescales from that automatically. `interact_with_env(from_range = ...)` is the fallback for custom action functions, and `rescale_from_range_to_range` is exported too.
 
+Rollouts use common random numbers by default: every vector slot is reset with the same per-episode seed sequence (through env-ssl-wrapper's `reset_env` / `reset_env_at`), so fitness differences come from the policies rather than which slot drew an easier initial state.
+
 `standardize = False` skips the running observation normalizer — useful when observations are already bounded (e.g. classic-control) or when the curriculum should see raw states.
 
 For a custom loop, `interact_with_env` exposes the underlying `EnvInteractor` — one routed forward over the active slots per timestep, distributed across ranks under `torchrun`:
@@ -158,6 +172,53 @@ policy = population.merge_(fitnesses.argmax())
 ```
 
 Custom fitness functions may take `(population, individuals)` (batched), `(population, idx)` (per index), or `(population)` (all at once) — detected automatically.
+
+## Baldwinian selection (test-time training)
+
+`Baldwin` wraps a policy network (or a `Population`) to pair evolutionary selection with live self-predictive test-time training (SPR; Schwarzer et al., 2020) and fast-weight anchor decay (Hinton & Plaut, 1987). Designate which layer emits the latent representation (`latent_layer`) and which layer's LoRA weights act as plastic fast-weight memory (`lora_memory`) — by submodule reference, layer index, or dotted path.
+
+During rollouts, each environment slot carries its own plastic LoRA tensors `(num_envs, d, r)` and `(num_envs, e, r)` on `lora_memory`, while a lightweight `LatentPredictor` learns online to predict the next latent representation from `(z_t, a_t)` and backpropagates into the per-environment LoRAs.
+
+```python
+import gymnasium as gym
+from torch import nn
+from populora import Baldwin, interact_with_env
+
+net = nn.Sequential(
+    nn.Linear(8, 64),
+    nn.SiLU(),
+    nn.Linear(64, 64),
+    nn.SiLU(),
+    nn.Linear(64, 2),
+    nn.Tanh()
+)
+
+model = Baldwin(
+    net,
+    latent_layer = net[2],          # submodule, int index, or dotted path
+    lora_memory = net[2],           # weight matrix (or matrices) with per-env plastic LoRAs
+    carry_across_episodes = True,   # or False to reset plastic LoRAs each episode
+    lora_lr = 1.2e-3,
+    predictor_lr = 4e-3,
+    update_every = 4,
+    trust_region = 0.20,
+    anchor_decay = 0.03,
+)
+
+interactor = interact_with_env(
+    gym.make_vec('LunarLanderContinuous-v3', num_envs = 16, enable_wind = True)
+)
+
+policy = interactor.evolve(
+    model,
+    pop_size = 32,
+    low_rank = 4,
+    num_generations = 20,
+    num_episodes = 2,
+)
+```
+
+Run `uv run train_baldwinian.py` to reproduce the windy LunarLander benchmark and comparison plots across `baseline`, `carry_across_episodes = False`, and `carry_across_episodes = True`.
 
 ## Clonal selection (AIS)
 
@@ -368,5 +429,38 @@ Samples can be routed to explicit individuals (`individual = 3` or `individuals 
     pages     = {265--283},
     year      = {1991},
     publisher = {Morgan Kaufmann}
+}
+```
+
+```bibtex
+@inproceedings{schwarzer2020spr,
+    title     = {Data-Efficient Reinforcement Learning with Self-Predictive Representations},
+    author    = {Max Schwarzer and Ankesh Anand and Rishab Goel and R. Devon Hjelm and Aaron Courville and Philip Bachman},
+    booktitle = {International Conference on Learning Representations},
+    year      = {2021},
+    url       = {https://arxiv.org/abs/2007.05929}
+}
+```
+
+```bibtex
+@misc{teoh2025nextlatentpredictiontransformerslearn,
+    title         = {Next-Latent Prediction Transformers Learn Compact World Models},
+    author        = {Jayden Teoh and Manan Tomar and Kwangjun Ahn and Edward S. Hu and Tim Pearce and Pratyusha Sharma and Akshay Krishnamurthy and Riashat Islam and Alex Lamb and John Langford},
+    year          = {2025},
+    eprint        = {2511.05963},
+    archivePrefix = {arXiv},
+    primaryClass  = {cs.LG},
+    url           = {https://arxiv.org/abs/2511.05963}
+}
+```
+
+```bibtex
+@inproceedings{hinton1987learning,
+    title     = {How Learning Can Guide Evolution},
+    author    = {Geoffrey E. Hinton and Steven J. Nowlan},
+    booktitle = {Complex Systems},
+    volume    = {1},
+    pages     = {495--502},
+    year      = {1987}
 }
 ```

@@ -161,6 +161,32 @@ def _expand_batch(t, p):
 def _at(values, indices):
     return values[indices] if len(indices) > 0 else values[:0]
 
+def _positive_fitnesses(fitnesses: Tensor) -> Tensor:
+    # goldberg-richardson niche sharing requires strictly positive fitnesses so
+    # dividing by niche_count > 1 discounts crowded basins; clamp extreme lower-tail
+    # crash outliers to the lower-quartile floor
+
+    f = fitnesses.float()
+    if f.numel() == 0:
+        return f
+
+    f_max, f_min, q50 = f.max(), f.min(), f.median()
+    top_span = f_max - q50
+    f_floor = torch.maximum(f_min, q50 - 0.5 * top_span) if top_span > 1e-6 else f_min
+
+    if f_floor <= 0. or f_min < f_floor:
+        span = (f_max - f_floor).clamp(min = 1.0)
+        f = (f - f_floor).clamp(min = 0.) + 1e-3 * span
+
+    return f
+
+def _age_discount(fitnesses: Tensor, ages: Tensor, aging_decay: float) -> Tensor:
+    # positive fitnesses decay toward 0 (f * decay^age); negative fitnesses grow
+    # more negative (f / decay^age) so aging always penalizes older scores
+
+    factor = (aging_decay ** ages.float()).clamp(min = 1e-8)
+    return torch.where(fitnesses >= 0., fitnesses * factor, fitnesses / factor)
+
 # per-target operator params - mutation_type / epsilon / crossover_type (or any
 # kwarg via PerTarget) may be a dict keyed by lora target or glob; a 'default'
 # or '*' entry catches the rest, and every explicit key must match a target
@@ -315,6 +341,14 @@ class Population(_LoRAMixin):
         sigma_granularity: str = 'pop'
     ):
         super().__init__()
+        baldwin_wrapper = None
+        if hasattr(model, '_bind_population') and getattr(model, 'population', None) is None:
+            baldwin_wrapper = model
+            model = model.net
+        elif hasattr(model, 'net') and hasattr(model.net, '_bind_population') and getattr(model.net, 'population', None) is None:
+            baldwin_wrapper = model.net
+            model.net = baldwin_wrapper.net
+
         self.model = model
         self.pop_size = pop_size
         self.selection_registry = selection_registry
@@ -412,8 +446,17 @@ class Population(_LoRAMixin):
         self._route_key = None
         self._last_route_key = None
 
+        # per-environment plastic lora buffers - populated during baldwinian /
+        # test-time training rollouts with leading env axis (num_envs, d, r)
+        self._env_weight_down = dict()
+        self._env_weight_up = dict()
+        self._env_indices = None
+
         if exists(device):
             self.to(device)
+
+        if exists(baldwin_wrapper):
+            baldwin_wrapper._bind_population(self)
 
     # save and load
 
@@ -847,7 +890,7 @@ class Population(_LoRAMixin):
         ages = self._ages
         device = fitnesses.device
 
-        scores = fitnesses * aging_decay ** ages.float() if exists(aging_decay) else fitnesses
+        scores = _age_discount(fitnesses, ages, aging_decay) if exists(aging_decay) else fitnesses
 
         survivor_lists, culled_lists, elite_lists = [], [], []
 
@@ -1144,7 +1187,101 @@ class Population(_LoRAMixin):
 
         return self
 
+    # per-environment plastic lora buffers for baldwinian test-time training
+
+    def init_env_loras_(
+        self,
+        individuals: int | Sequence[int] | Tensor,
+        *,
+        targets: str | Sequence[str] | None = None,
+        requires_grad: bool = True,
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        inds = atleast_1d(cast_tensor(individuals, device = self.device, dtype = torch.long))
+        resolved = resolve_lora_targets(self.model, maybe_cast_tuple(targets)) if exists(targets) else self.lora_targets
+
+        self._env_weight_down.clear()
+        self._env_weight_up.clear()
+        self._env_indices = None
+
+        for path in resolved:
+            key = _adapter_key(path)
+            assert key in self.weight_down, f'plastic target {path!r} is not in population lora_targets {self.lora_targets}'
+
+            self._env_weight_down[key] = self.weight_down[key].data[inds].detach().clone().float().requires_grad_(requires_grad)
+            self._env_weight_up[key] = self.weight_up[key].data[inds].detach().clone().float().requires_grad_(requires_grad)
+
+        self.clear_routing_cache()
+        return self._env_weight_down, self._env_weight_up
+
+    init_env_loras = init_env_loras_
+
+    @torch.no_grad()
+    def reset_env_loras_(
+        self,
+        env_indices: int | Sequence[int] | Tensor,
+        individuals: int | Sequence[int] | Tensor,
+    ):
+        if not self._env_weight_down:
+            return self
+
+        env_idx = atleast_1d(cast_tensor(env_indices, device = self.device, dtype = torch.long))
+        ind_idx = atleast_1d(cast_tensor(individuals, device = self.device, dtype = torch.long))
+
+        for key in self._env_weight_down:
+            self._env_weight_down[key].data[env_idx] = self.weight_down[key].data[ind_idx].float()
+            self._env_weight_up[key].data[env_idx] = self.weight_up[key].data[ind_idx].float()
+
+        return self
+
+    reset_env_loras = reset_env_loras_
+
+    @torch.no_grad()
+    def assimilate_env_loras_(
+        self,
+        env_indices: int | Sequence[int] | Tensor,
+        individuals: int | Sequence[int] | Tensor,
+        *,
+        tau: float = 1.0,
+    ):
+        if not self._env_weight_down or tau <= 0.:
+            return self
+
+        env_idx = atleast_1d(cast_tensor(env_indices, device = self.device, dtype = torch.long))
+        ind_idx = atleast_1d(cast_tensor(individuals, device = self.device, dtype = torch.long))
+
+        for key in self._env_weight_down:
+            wd_geno = self.weight_down[key].data
+            wu_geno = self.weight_up[key].data
+            wd_env = self._env_weight_down[key].data[env_idx].to(wd_geno.dtype)
+            wu_env = self._env_weight_up[key].data[env_idx].to(wu_geno.dtype)
+
+            wd_geno[ind_idx] = torch.lerp(wd_geno[ind_idx], wd_env, tau)
+            wu_geno[ind_idx] = torch.lerp(wu_geno[ind_idx], wu_env, tau)
+
+        self.clear_routing_cache()
+        return self
+
+    assimilate_env_loras = assimilate_env_loras_
+
+    def clear_env_loras_(self):
+        self._env_weight_down.clear()
+        self._env_weight_up.clear()
+        self._env_indices = None
+        self.clear_routing_cache()
+        return self
+
+    clear_env_loras = clear_env_loras_
+
+    def env_lora_parameters(self) -> list[Tensor]:
+        return [*self._env_weight_down.values(), *self._env_weight_up.values()]
+
     def _adapter_rows(self, individual, key, w_down, w_up):
+        if key in self._env_weight_down:
+            env_down, env_up = self._env_weight_down[key], self._env_weight_up[key]
+            if exists(self._env_indices):
+                return env_down[self._env_indices], env_up[self._env_indices]
+            return env_down, env_up
+
         cache, route_key = self._route_cache, self._route_key
 
         if not exists(cache) or not exists(route_key):
@@ -1182,7 +1319,7 @@ class Population(_LoRAMixin):
         return key
 
     @contextmanager
-    def _route(self, individual, individuals, all_individuals):
+    def _route(self, individual, individuals, all_individuals, env_indices = None):
         assert sum((exists(individual), exists(individuals), all_individuals)) <= 1
 
         if all_individuals:
@@ -1190,22 +1327,29 @@ class Population(_LoRAMixin):
         elif exists(individuals):
             individual = cast_tensor(individuals, device = self.device)
 
+        if exists(env_indices) and not is_tensor(env_indices):
+            env_indices = cast_tensor(env_indices, device = self.device, dtype = torch.long)
+
+        prev_ind, prev_key, prev_env = self._individual, self._route_key, self._env_indices
         self._individual = individual
         self._route_key = self._route_cache_key(individual)
+        self._env_indices = env_indices
 
         try:
             yield
         finally:
-            self._individual = None
-            self._route_key = None
+            self._individual = prev_ind
+            self._route_key = prev_key
+            self._env_indices = prev_env
 
     def route(
         self,
         individual = None,
         individuals = None,
-        all_individuals = False
+        all_individuals = False,
+        env_indices = None,
     ):
-        return self._route(individual, individuals, all_individuals)
+        return self._route(individual, individuals, all_individuals, env_indices = env_indices)
 
     @torch.no_grad()
     def merge_(self, individual = 0):
@@ -1312,6 +1456,7 @@ class Population(_LoRAMixin):
 
         if save_champion:
             for key in self.weight_up:
+                self.weight_down[key].data[0].zero_()
                 self.weight_up[key].data[0].zero_()
 
         return self
@@ -1340,7 +1485,90 @@ class Population(_LoRAMixin):
     merge_champion = merge_champion_
 
     @torch.no_grad()
-    def _shared_fitnesses_(
+    def consolidate_elites_(
+        self,
+        fitnesses: Tensor,
+        *,
+        alpha: float = 0.35,
+        topk: int | float | None = 6,
+        temperature: float = 0.35,
+        use_z_score: bool = True,
+        target_scale_ratio: float = 0.65,
+        trigger_ratio: float = 2.5,
+    ):
+        """Trust-Region ReLoRA Homotopy (Progressive Elite Consolidation):
+        Once the adapter Frobenius norm expands past `trigger_ratio * sqrt(d_out)`
+        (allowing low-gain random initializations to reach control authority),
+        partially folds `alpha` of the fitness-weighted top-k elite delta into
+        the base Linear weights in full rank and contracts each individual's
+        LoRA factors by `sqrt(1 - alpha)` into a bounded residual trust region.
+        Grounded in Lialin et al. (2023, ReLoRA) and Hansen & Ostermeier (2001,
+        CMA-ES rank-mu mean shift)."""
+        assert is_shape(fitnesses, 'p', p = self.pop_size)
+        if alpha <= 0. or self.pop_size < 2:
+            return self
+
+        first_key = next(iter(self.weight_down))
+        wd0 = self.weight_down[first_key].float()
+        wu0 = self.weight_up[first_key].float()
+        init_dw_norm = math.sqrt(wu0.shape[1])
+        cur_dw_norm = einsum(wu0, wd0, 'p e r, p d r -> p e d').norm(dim = (1, 2)).mean().item()
+        w_base_norm = self.model.get_submodule(self.lora_targets[0]).weight.float().norm().item()
+
+        if cur_dw_norm < trigger_ratio * init_dw_norm and w_base_norm < 2.0 * init_dw_norm:
+            return self
+
+        f = fitnesses.to(self.device).float()
+        k = default(topk, min(6, max(1, self.pop_size // 4)))
+        if isinstance(k, float):
+            k = max(1, int(self.pop_size * k))
+        k = min(int(k), self.pop_size)
+
+        topk_indices = f.topk(k, dim = -1).indices
+        topk_fits = f[topk_indices]
+        if use_z_score and k > 1 and topk_fits.std() > 1e-6:
+            topk_fits = z_score(topk_fits)
+        else:
+            topk_fits = torch.zeros_like(topk_fits)
+        weights = F.softmax(topk_fits / temperature, dim = -1)
+
+        eff_alpha = alpha if cur_dw_norm > init_dw_norm else alpha * 0.5
+        keep = math.sqrt(max(0.0, 1.0 - eff_alpha))
+
+        for path, key, w_down, w_up in _iter_adapters(self):
+            linear = self.model.get_submodule(path)
+            if not exists(getattr(linear, 'weight', None)):
+                continue
+
+            w_down_topk = w_down[topk_indices].float()
+            w_up_topk = w_up[topk_indices].float()
+
+            delta = einsum(weights, w_up_topk, w_down_topk, 'k, k e r, k d r -> e d')
+            linear.weight.data.add_((eff_alpha * delta).to(linear.weight.dtype))
+
+            r_dim = w_down.shape[2]
+            e_dim = w_up.shape[1]
+            d_floor = target_scale_ratio * math.sqrt(r_dim)
+            u_floor = target_scale_ratio * math.sqrt(e_dim)
+
+            d_norms = w_down.float().norm(dim = (1, 2), keepdim = True).clamp(min = 1e-6)
+            u_norms = w_up.float().norm(dim = (1, 2), keepdim = True).clamp(min = 1e-6)
+
+            d_ceil = d_floor * 1.5 if cur_dw_norm <= 1.5 * init_dw_norm else float('inf')
+            u_ceil = u_floor * 1.5 if cur_dw_norm <= 1.5 * init_dw_norm else float('inf')
+
+            d_target = torch.clamp(d_norms * keep, min = d_floor, max = d_ceil)
+            u_target = torch.clamp(u_norms * keep, min = u_floor, max = u_ceil)
+
+            w_down.data.mul_((d_target / d_norms).to(w_down.dtype))
+            w_up.data.mul_((u_target / u_norms).to(w_up.dtype))
+
+        return self
+
+    consolidate_elites = consolidate_elites_
+
+    @torch.no_grad()
+    def shared_fitnesses(
         self,
         fitnesses: Tensor,
         quantile: float = 0.5,
@@ -1357,9 +1585,10 @@ class Population(_LoRAMixin):
         quantile of all pairwise genome distances, so it adapts to the scale of
         the population without manual tuning."""
         assert 0.0 < quantile <= 1.0, 'sharing quantile must be in (0, 1]'
+        assert kernel_power > 0., 'sharing kernel power must be positive'
 
         n = self.pop_size
-        device, dtype = self.device, self._dtype
+        device = self.device
 
         # squared LoRA genome distance matrix, summed over all targets
 
@@ -1387,8 +1616,12 @@ class Population(_LoRAMixin):
         overlap = (1.0 - (dist / radius).clamp(max = 1.0)) ** kernel_power
         niche_count = overlap.sum(dim = -1).clamp(min = 1e-6)
 
-        shared = fitnesses.to(device).float() / niche_count
+        f = _positive_fitnesses(fitnesses.to(device))
+
+        shared = f / niche_count
         return shared
+
+    _shared_fitnesses_ = shared_fitnesses
 
     @torch.no_grad()
     def mirror_antithetic_(self):
@@ -1671,6 +1904,7 @@ class Population(_LoRAMixin):
         mutation_type = 'full_gaussian',
         num_groups = 1,
         sharing_quantile: float = 0.0, # > 0: Goldberg-Richardson fitness sharing over LoRA genome distance
+        sharing_kernel_power: float = 1.0, # triangular (1.) to steeper niche discounts
         epsilon = 0.1,
         weight_decay = 0.0,
         soft_threshold = 0.0,
@@ -1686,6 +1920,7 @@ class Population(_LoRAMixin):
         retire_refill: str | None = None, # refill retired slots: 'crossover' (default), 'reinit', 'es'
         brood_size: int = 1, # Tackett (1994) / Altenberg (1994) brood selection
         brood_eval_fn: Callable | None = None, # evaluation function for brood candidate selection
+        consolidate_alpha: float = 0.35, # ReLoRA homotopy elite consolidation rate (0 disables)
         **kwargs
     ):
         assert is_shape(fitnesses, 'p', p = self.pop_size)
@@ -1693,6 +1928,7 @@ class Population(_LoRAMixin):
         if is_tensor(fitnesses) and fitnesses.device != self.device:
             fitnesses = fitnesses.to(self.device)
 
+        assert 0. <= sharing_quantile <= 1., 'sharing_quantile must be in [0, 1]'
         assert retire_refill in (None, 'crossover', 'reinit', 'es'), f'unknown retire_refill {retire_refill!r} - choose from "crossover", "reinit", "es"'
         assert not exists(retire_refill) or exists(max_age), 'retire_refill requires max_age to be set'
         assert brood_size >= 1, f'brood_size must be >= 1, got {brood_size}'
@@ -1720,6 +1956,8 @@ class Population(_LoRAMixin):
         tiered = tiered or exists(tiers)
 
         if tiered:
+            assert sharing_quantile <= 0., 'sharing_quantile is not supported with tiered selection'
+
             res = self._evolve_tiered_(
                 fitnesses,
                 tiers = tiers,
@@ -1747,7 +1985,11 @@ class Population(_LoRAMixin):
         # out underrepresented ones. The raw champion is always retained.
 
         if sharing_quantile > 0.:
-            shared_fitnesses = self._shared_fitnesses_(fitnesses, quantile = sharing_quantile)
+            shared_fitnesses = self.shared_fitnesses(
+                fitnesses,
+                quantile = sharing_quantile,
+                kernel_power = sharing_kernel_power
+            )
         else:
             shared_fitnesses = fitnesses
 
@@ -1794,7 +2036,7 @@ class Population(_LoRAMixin):
 
         parents = self.select_parents(
             parent_selection_type,
-            fitnesses,
+            shared_fitnesses,
             num_children = len(result.culled),
             culled = result.culled,
             num_groups = num_groups,
@@ -1824,6 +2066,9 @@ class Population(_LoRAMixin):
                 self.reinit_individuals_(retired)
             elif retire_refill == 'es':
                 self._retire_refill_es_(retired, fitnesses, num_groups = num_groups)
+
+        if consolidate_alpha > 0. and num_groups == 1:
+            self.consolidate_elites_(raw_fitnesses, alpha = consolidate_alpha)
 
         self._generation.add_(1)
         return result
@@ -1893,7 +2138,7 @@ class Population(_LoRAMixin):
 
         if exists(aging_decay) and strata == 'fitness':
             assert 0. < aging_decay <= 1., 'aging_decay must be in (0, 1]'
-            axis = axis * aging_decay ** self._ages.float()
+            axis = _age_discount(axis, self._ages, aging_decay)
 
         tier_bins = self._tier_bins(axis, tiers, num_groups)
         rules = [TIER_RULE_REGISTRY[rule] for _, rule in tiers]
@@ -2022,9 +2267,12 @@ class Population(_LoRAMixin):
             weight_down, weight_up = self.weight_down[lora_key], self.weight_up[lora_key]
             weight_down_i, weight_up_i = self._adapter_rows(individual, lora_key, weight_down, weight_up)
 
+            if x.ndim == 1 and weight_down_i.ndim == 3 and weight_down_i.shape[0] == 1:
+                weight_down_i, weight_up_i = weight_down_i[0], weight_up_i[0]
+
             # per-sample routing when ids are vectorized (e.g. one individual per env)
 
-            if individual is ... or (is_tensor(individual) and individual.ndim > 0):
+            if individual is ... or (is_tensor(individual) and individual.ndim > 0) or weight_down_i.ndim == 3:
                 p = weight_down_i.shape[0]
 
                 # a 1-d activation is one unbatched feature vector, which cannot be
@@ -2047,6 +2295,8 @@ class Population(_LoRAMixin):
                     # one sample per individual - the delta is two chained
                     # batched matmuls on a leading batch axis, no reshaping at all
                     lora_out = torch.bmm(torch.bmm(x.unsqueeze(1), weight_down_i), weight_up_i.transpose(1, 2)).squeeze(1)
+                elif x.ndim == 3 and batch == p:
+                    lora_out = torch.bmm(torch.bmm(x, weight_down_i), weight_up_i.transpose(1, 2))
                 else:
                     x = rearrange(x, '(p b) ... -> p b ...', p = p)
                     lora_out = einsum(x, weight_down_i, weight_up_i, 'p b ... d, p d r, p e r -> p b ... e')
@@ -2072,6 +2322,7 @@ class Population(_LoRAMixin):
         individual: int | None = None,
         individuals: Sequence[int] | None = None,
         all_individuals: bool = False,
+        env_indices: Sequence[int] | Tensor | None = None,
         ignore_args_kwargs: Sequence[int | str] = tuple(),
         eval_and_no_grad: bool = False,
         micro_batch: int | None = None,
@@ -2160,17 +2411,22 @@ class Population(_LoRAMixin):
             if not exists(routed):
                 return self.model(*args, **kwargs)
 
-            previous = self._individual
+            if exists(env_indices) and not is_tensor(env_indices):
+                env_indices = cast_tensor(env_indices, device = self.device, dtype = torch.long)
+
+            previous, prev_env = self._individual, self._env_indices
             self._individual = routed
             self._route_key = self._route_cache_key(routed)
+            self._env_indices = env_indices
 
             try:
                 return self.model(*args, **kwargs)
             finally:
                 self._individual = previous
                 self._route_key = None
+                self._env_indices = prev_env
 
-        with self._route(individual, individuals, all_individuals), self._eval_and_no_grad(eval_and_no_grad):
+        with self._route(individual, individuals, all_individuals, env_indices = env_indices), self._eval_and_no_grad(eval_and_no_grad):
             return self.model(*args, **kwargs)
 
 class LoRA(_LoRAMixin):

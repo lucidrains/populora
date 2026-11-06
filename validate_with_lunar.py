@@ -28,6 +28,7 @@ from tqdm import tqdm
 from x_mlps_pytorch import WeightOnlyMLP
 
 from populora import Population, interact_with_env, make_action
+from populora.interact import _mix_seed
 
 # helpers
 
@@ -51,8 +52,9 @@ def evaluate_individual(
     pop: Population,
     individual_idx: int,
     action_fn,
+    seed: int | None = None,
 ) -> float:
-    state, _ = env.reset()
+    state, _ = env.reset(seed = seed)
     done = False
     total_reward = 0.0
 
@@ -75,12 +77,12 @@ def validate_with_lunar(
     max_generations: int = 300,
     seed: int = 42,
     distribution: str = 'beta',  # 'categorical' | 'squashed_gaussian' | 'beta' (beta uses the mean-concentration reparam by default)
-    sample_actions: bool = True,
+    sample_actions: bool = False,
     temperature: float = 1.0,
     min_log_std: float = -5.0,
     max_log_std: float = 0.5,
     num_episodes: int = 2,
-    es_every_generations: int = 25,
+    es_every_generations: int = 0,
     es_topk: float | None = None,
     es_temperature: float = 1.0,
     queen_bee_mating: bool = False,
@@ -94,6 +96,8 @@ def validate_with_lunar(
     epsilon: float = 0.15,
     survive_frac: float = 0.5,
     elite_frac: float = 0.25,
+    sharing_quantile: float = 0.0,
+    sharing_kernel_power: float = 1.0,
     crossover_type: str = 'extrapolative',
     mutation_type: str = 'full_gaussian',
     horizon: int = 1000,
@@ -142,7 +146,7 @@ def validate_with_lunar(
     print(f'[PopuLoRA Lunar] pop_size: {pop_size} | low_rank: {low_rank} | generations: {max_generations} | episodes: {num_episodes} | distribution: {distribution} | horizon: {horizon}')
     print(f'  num_envs: {num_envs} | brood_size: {brood_size} | brood_horizon: {brood_horizon or horizon}')
     print(f'  mutation: {mut_eps} | adaptive_epsilon: {adaptive_epsilon} | sigma_granularity: {sigma_granularity} | epsilon_init: {epsilon_init} | epsilon_tau: {tau}')
-    print(f'  crossover: {crossover_type} | mutation_type: {mutation_type} | survive_frac: {survive_frac} | elite_frac: {elite_frac} | sample_actions: {sample_actions} | temperature: {temperature}')
+    print(f'  crossover: {crossover_type} | mutation_type: {mutation_type} | survive_frac: {survive_frac} | elite_frac: {elite_frac} | sharing_quantile: {sharing_quantile} (power {sharing_kernel_power}) | sample_actions: {sample_actions} | temperature: {temperature}')
 
     recent_rewards = deque(maxlen = avg_generations)
     pbar = tqdm(range(max_generations), desc = 'validating lunar lander')
@@ -160,12 +164,13 @@ def validate_with_lunar(
     for gen in pbar:
         # each individual scored on its mean return over `num_episodes` seeded episodes
 
+        gen_eval_seed = pop.eval_seed
         fitnesses = interactor.evaluate(
             pop,
             action = action_fn,
             horizon = horizon,
             num_episodes = num_episodes,
-            seed = pop.eval_seed
+            seed = gen_eval_seed
         )
 
         best_reward = fitnesses.max().item()
@@ -176,15 +181,18 @@ def validate_with_lunar(
         pbar.write(f'gen {gen:03d} | best_reward: {best_reward:6.1f} | mean_reward: {mean_reward:6.1f} | avg_last_{avg_generations}_generations: {avg_recent:6.1f}')
 
         best_idx = fitnesses.argmax().item()
-        if record_video and (gen % record_every == 0 or gen == max_generations - 1):
+        passed = len(recent_rewards) >= avg_generations and avg_recent > target_avg_reward
+
+        if record_video and (gen % record_every == 0 or gen == max_generations - 1 or passed):
             try:
                 record_env = make_record_env(distribution, video_folder = 'videos', name_prefix = f'gen_{gen:03d}')
-                evaluate_individual(record_env, pop, best_idx, action_fn = action_fn)
+                rec_ret = evaluate_individual(record_env, pop, best_idx, action_fn = action_fn, seed = int(_mix_seed(gen_eval_seed, 0, 0)))
                 record_env.close()
+                pbar.write(f'  [video] gen_{gen:03d} recorded (return: {rec_ret:6.1f})')
             except Exception as e:
                 pbar.write(f'video recording error: {e}')
 
-        if len(recent_rewards) >= avg_generations and avg_recent > target_avg_reward:
+        if passed:
             print(f'\n✓ PopuLoRA LunarLander Validation Passed! Last {avg_generations} generations avg reward: {avg_recent:.2f} > {target_avg_reward}')
             env.close()
             return
@@ -192,7 +200,7 @@ def validate_with_lunar(
         if es_every_generations > 0 and divisible_by(gen + 1, es_every_generations):
             pbar.write(f'[ES] generation {gen:03d} | select_and_merge + repopulate')
             pop.select_and_merge(fitnesses = fitnesses, topk = es_topk, temperature = es_temperature, use_z_score = True)
-            pop.repopulate()
+            pop.repopulate(save_champion = True)
         else:
             def brood_eval_fn(p, inds):
                 fits = interactor.evaluate(
@@ -213,6 +221,8 @@ def validate_with_lunar(
                 parent_selection_type = parent_selection_type,
                 crossover_type = crossover_type,
                 mutation_type = mutation_type,
+                sharing_quantile = sharing_quantile,
+                sharing_kernel_power = sharing_kernel_power,
                 epsilon = epsilon,
                 weight_decay = weight_decay,
                 soft_threshold = soft_threshold,
