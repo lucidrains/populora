@@ -495,9 +495,12 @@ class EnvInteractor:
         cursor = [0] * num_slots
         episodes_done = [0] * num_slots
         steps_used = [0] * num_slots
+        ep_steps = [0] * num_slots
 
         returns = torch.zeros(num_individuals, device = device)
         current_return = torch.zeros(num_individuals, device = device)
+        learned_returns = torch.zeros(num_individuals, device = device)
+        current_learned = torch.zeros(num_individuals, device = device)
         episode_counts = torch.zeros(num_individuals, dtype = torch.long, device = device)
         env_reset_count = [0] * len(envs)
 
@@ -615,6 +618,7 @@ class EnvInteractor:
 
                         for k in e_slots:
                             steps_used[k] += 1
+                            ep_steps[k] += 1
 
                         if done_arr.any():
                             for k in e_slots:
@@ -630,6 +634,15 @@ class EnvInteractor:
 
                                 returns[idx] = torch.maximum(returns[idx], current_return[idx]) if agg == 'max' else returns[idx] + current_return[idx]
                                 current_return[idx] = 0.
+
+                                if exists(baldwin_learner):
+                                    ep_learned = current_learned[idx]
+                                    if baldwin_learner.horizon_projection and 0 < ep_steps[k] < horizon:
+                                        ep_learned = ep_learned * (float(horizon) / float(ep_steps[k]))
+                                    learned_returns[idx] = torch.maximum(learned_returns[idx], ep_learned) if agg == 'max' else learned_returns[idx] + ep_learned
+                                    current_learned[idx] = 0.
+
+                                ep_steps[k] = 0
                                 episode_counts[idx] += 1
                                 episodes_done[k] += 1
 
@@ -680,6 +693,8 @@ class EnvInteractor:
                             for k in e_slots:
                                 if cursor[k] < len(tours[k]):
                                     current_return[route_ids[k]] = 0.
+                                    current_learned[route_ids[k]] = 0.
+                                    ep_steps[k] = 0
 
                                     if memory_wrapped:
                                         memories[k] = init_memories[k]
@@ -718,6 +733,10 @@ class EnvInteractor:
                             memory = active_mem_prev,
                         )
 
+                        if exists(baldwin_learner.last_step_learned):
+                            active_routes = route_ids if (single_env and all_live) else route_ids[active_slots]
+                            current_learned.index_add_(0, active_routes, baldwin_learner.last_step_learned)
+
                         if ep_reset_slots:
                             baldwin_learner.reset_slots(
                                 ep_reset_slots,
@@ -749,17 +768,19 @@ class EnvInteractor:
         # return of an in-progress episode when the budget ran out
 
         completed = episode_counts > 0
-        fitness = torch.zeros(num_individuals, device = device)
 
-        # 'mean' averages episodes; 'max' keeps the best episode (optimistic)
-        if agg == 'max':
-            fitness[completed] = returns[completed]
-            fitness[~completed] = torch.maximum(returns[~completed], current_return[~completed])
-        else:
-            fitness[completed] = returns[completed] / episode_counts[completed]
-            fitness[~completed] = current_return[~completed]
+        def _agg_returns(total, current):
+            if agg == 'max':
+                return torch.where(completed, total, torch.maximum(total, current))
+            return torch.where(completed, total / episode_counts.clamp(min = 1), current)
 
-        return fitness
+        extrinsic_fitness = _agg_returns(returns, current_return)
+
+        if not exists(baldwin_learner):
+            return extrinsic_fitness
+
+        learned_fitness = _agg_returns(learned_returns, current_learned)
+        return baldwin_learner.combine_fitness(extrinsic_fitness, learned_fitness)
 
     # built-in rollout evaluator, distributed-friendly: (pop, individuals)
     # evaluates exactly those - what evaluate_population_distributed partitions

@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import copy
+import math
 from contextlib import contextmanager
 from typing import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor, atleast_1d, cat, is_tensor, nn
+from torch import Tensor, atleast_1d, cat, einsum, is_tensor, nn
 from torch.nn import Linear, LayerNorm, Module, Sequential, SiLU
 
 from populora._utils import cast_tensor, default, exists
@@ -332,6 +333,12 @@ class Baldwin(Module):
         lamarckian: bool = False,
         assimilate_tau: float = 0.0,
         carry_predictor: bool = True,
+        reward_weight: float = 1.0,
+        predictor_learning_weight: float = 0.0,
+        alternate_every: int | bool | None = None,
+        novelty_bandwidth: float = 0.05,
+        horizon_projection: bool = True,
+        slot_predictor_lr: float = 0.15,
     ):
         super().__init__()
         assert k_steps >= 1, 'k_steps must be >= 1'
@@ -357,6 +364,12 @@ class Baldwin(Module):
         self.carry_across_episodes = carry_across_episodes
         self.assimilate_tau = 1.0 if (lamarckian and assimilate_tau <= 0.) else assimilate_tau
         self.carry_predictor = carry_predictor
+        self.reward_weight = float(reward_weight)
+        self.predictor_learning_weight = float(predictor_learning_weight)
+        self.alternate_every = 3 if alternate_every is True else (alternate_every if isinstance(alternate_every, int) and alternate_every > 1 else None)
+        self.novelty_bandwidth = float(novelty_bandwidth)
+        self.horizon_projection = bool(horizon_projection)
+        self.slot_predictor_lr = float(slot_predictor_lr)
         self.discrete_actions = discrete_actions
         self.loss_fn = _resolve_loss_fn(loss_fn)
 
@@ -373,12 +386,23 @@ class Baldwin(Module):
         self._done_window = []
 
         self.step_count = 0
+        self.eval_count = 0
         self.loss_history: list[float] = []
         self.last_loss: float | None = None
+        self.learned_history: list[float] = []
+        self.slot_learned: Tensor | None = None
+        self.last_step_learned: Tensor | None = None
+        self.last_extrinsic_fitness: Tensor | None = None
+        self.last_learned_fitness: Tensor | None = None
+
+        self._slot_proj: Tensor | None = None
+        self._slot_w: Tensor | None = None
+        self._slot_history: list[list[Tensor]] = []
 
         self._lora_opt = None
         self._predictor_opt = None
         self._tap = None
+        self._frozen_params = None
         self._saved_requires_grad = None
         self._initial_predictor_state = None
 
@@ -435,8 +459,13 @@ class Baldwin(Module):
                 discrete_actions = self.discrete_actions,
             )).to(population.device)
 
+            in_dim = self.latent_dim + self.action_dim
+            hid_dim = default(self.predictor_hidden_dim, max(32, self.latent_dim))
+            self._slot_proj = torch.randn(in_dim + 1, hid_dim, device = population.device) / math.sqrt(in_dim)
+
         self.__dict__['predictor'] = pred
         self._initial_predictor_state = copy.deepcopy(pred.state_dict())
+        self._frozen_params = [(p, p.data.detach().clone()) for p in population.model.parameters()]
         self._predictor_opt = self._make_predictor_opt()
         return self
 
@@ -445,6 +474,10 @@ class Baldwin(Module):
         pred = self.__dict__.get('predictor', None)
         if exists(pred):
             pred._apply(fn)
+        if exists(self._slot_proj):
+            self._slot_proj = fn(self._slot_proj)
+        if exists(self._frozen_params):
+            self._frozen_params = [(p, fn(f)) for p, f in self._frozen_params]
         return self
 
     def forward(self, *args, **kwargs):
@@ -468,6 +501,25 @@ class Baldwin(Module):
         self._predictor_opt = self._make_predictor_opt()
         return self
 
+    def _init_slot_predictors_(self, num_slots: int):
+        device = self.population.device
+        hid_dim = self._slot_proj.shape[-1]
+        self._slot_w = torch.zeros(num_slots, hid_dim + 1, self.latent_dim, device = device)
+        self._slot_history = [[] for _ in range(num_slots)]
+        self.slot_learned = torch.zeros(num_slots, device = device)
+        self.last_step_learned = torch.zeros(num_slots, device = device)
+        self.slot_learned_trace: list[Tensor] = []
+
+    def _reset_slot_predictors_(self, env_idx: Tensor, *, reset_accumulated: bool = False):
+        if not exists(self._slot_w):
+            return
+        self._slot_w[env_idx] = 0.
+        for k in env_idx.tolist():
+            if 0 <= k < len(self._slot_history):
+                self._slot_history[k].clear()
+        if reset_accumulated and exists(self.slot_learned):
+            self.slot_learned[env_idx] = 0.
+
     def start_rollout(self, individuals: Sequence[int] | Tensor):
         pop = self.population
         assert exists(pop), 'bind Baldwin to a Population before calling start_rollout'
@@ -485,6 +537,8 @@ class Baldwin(Module):
             p.requires_grad_(False)
 
         env_down, env_up = pop.init_env_loras_(individuals, targets = self.plastic_targets, requires_grad = True)
+        num_slots = next(iter(env_down.values())).shape[0]
+        self._init_slot_predictors_(num_slots)
 
         self._anchor_down = {k: v.detach().clone() for k, v in env_down.items()}
         self._anchor_up = {k: v.detach().clone() for k, v in env_up.items()}
@@ -561,6 +615,7 @@ class Baldwin(Module):
             pop.assimilate_env_loras_(env_idx, completed_individuals, tau = self.assimilate_tau)
 
         pop.reset_env_loras_(env_idx, next_ind)
+        self._reset_slot_predictors_(env_idx, reset_accumulated = not episode_boundary_only)
 
         for key in self.plastic_keys:
             self._anchor_down[key].data[env_idx] = pop._env_weight_down[key].data[env_idx]
@@ -575,6 +630,113 @@ class Baldwin(Module):
 
         self._clear_window_()
         return self
+
+    @torch.no_grad()
+    def encode_base(
+        self,
+        obs: Tensor,
+        *,
+        memory: Tensor | None = None,
+    ) -> Tensor:
+        pop = self.population
+        assert exists(self._tap), 'call start_rollout before encode_base'
+
+        prev_ind = pop._individual
+        pop._individual = None
+        saved_data = None
+        if exists(self._frozen_params):
+            saved_data = [p.data for p, _ in self._frozen_params]
+            for p, f in self._frozen_params:
+                p.data = f
+        self._tap.short_circuit = True
+        try:
+            if isinstance(pop.model, Memory):
+                mem = default(memory, pop.model.init_memory.expand(obs.shape[0], -1))
+                pop.model(mem, obs)
+            else:
+                pop.model(obs)
+            z = self._tap.last_latent
+        except _StopForward as stop:
+            z = stop.latent
+        finally:
+            self._tap.short_circuit = False
+            pop._individual = prev_ind
+            if exists(saved_data):
+                for (p, _), d in zip(self._frozen_params, saved_data):
+                    p.data = d
+
+        return F.layer_norm(z.float(), (z.shape[-1],))
+
+    @torch.no_grad()
+    def _update_slot_predictor_learning_(
+        self,
+        obs: Tensor,
+        action: Tensor,
+        next_obs: Tensor,
+        valid: Tensor,
+        *,
+        env_indices: Tensor | None = None,
+        memory: Tensor | None = None,
+    ) -> Tensor:
+        b, device = obs.shape[0], obs.device
+        slot_idx = default(env_indices, torch.arange(b, device = device, dtype = torch.long))
+
+        z_t = self.encode_base(obs, memory = memory)
+        z_next = self.encode_base(next_obs, memory = memory)
+        dz = z_next - z_t
+
+        a_enc = self.predictor._encode_action(action, b, device)
+        scale = math.sqrt(self.latent_dim / max(1, self.action_dim))
+        x_in = F.pad(cat((z_t, a_enc * scale), dim = -1), (0, 1), value = 1.)
+        h = F.pad(F.silu(x_in @ self._slot_proj.to(device)), (0, 1), value = 1.)
+
+        nov = torch.zeros(b, device = device)
+        sigma = max(1e-6, self.novelty_bandwidth)
+
+        for i, (k, is_valid) in enumerate(zip(slot_idx.tolist(), valid.tolist())):
+            if not is_valid:
+                continue
+            hist = self._slot_history[k]
+            if not hist or self.update_every > 1:
+                hist.append(z_t[i : i + 1])
+            d_min = torch.cdist(z_next[i : i + 1], cat(hist, dim = 0)).min()
+            d_step = dz[i].norm()
+            if d_step > 1e-6:
+                nov[i] = (d_min / (d_step + 1e-6)).clamp(0., 1.) * (d_min / sigma).clamp(0., 1.)
+            hist.append(z_next[i : i + 1])
+
+        w = self._slot_w[slot_idx]
+        err = einsum('b h, b h d -> b d', h, w) - dz
+        l_pre, l_id = err.pow(2).mean(dim = -1), dz.pow(2).mean(dim = -1)
+
+        vmask = valid.float()
+        step = (0.5 / (h.pow(2).sum(dim = -1, keepdim = True) + 1e-6)).clamp(max = self.slot_predictor_lr) * vmask.unsqueeze(-1)
+        w = w - einsum('b h, b d -> b h d', h * step, err)
+        self._slot_w[slot_idx] = w
+
+        l_post = (einsum('b h, b h d -> b d', h, w) - dz).pow(2).mean(dim = -1)
+        step_gain = (torch.minimum(l_pre, l_id) - l_post).clamp(min = 0.) * nov * vmask * float(self.update_every)
+
+        self.last_step_learned = step_gain
+        self.slot_learned[slot_idx] += step_gain
+        self.slot_learned_trace.append(self.slot_learned.detach().clone())
+        return step_gain
+
+    def combine_fitness(self, extrinsic_fitness: Tensor, learned_fitness: Tensor) -> Tensor:
+        self.last_extrinsic_fitness = extrinsic_fitness.detach().clone()
+        self.last_learned_fitness = learned_fitness.detach().clone()
+        self.learned_history.append(float(learned_fitness.mean().item()))
+
+        gen = self.eval_count
+        self.eval_count += 1
+
+        rw, pw = self.reward_weight, self.predictor_learning_weight
+
+        if exists(self.alternate_every):
+            is_reward_gen = ((gen + 1) % self.alternate_every) == 0
+            return (rw * extrinsic_fitness) if is_reward_gen else (pw * learned_fitness)
+
+        return extrinsic_fitness if (rw == 1. and pw == 0.) else (rw * extrinsic_fitness + pw * learned_fitness)
 
     def encode(
         self,
@@ -675,6 +837,8 @@ class Baldwin(Module):
         if exists(env_indices) and not is_tensor(env_indices):
             env_indices = cast_tensor(env_indices, device = device, dtype = torch.long)
 
+        self.last_step_learned = torch.zeros(b, device = device)
+
         if self.k_steps > 1 and not exists(env_indices):
             self._obs_window.append(obs.detach())
             self._act_window.append(action.detach())
@@ -685,10 +849,14 @@ class Baldwin(Module):
                 self._done_window.pop(0)
 
         if self.step_count % self.update_every != 0:
+            if exists(self.slot_learned):
+                self.slot_learned_trace.append(self.slot_learned.detach().clone())
             return None
 
         valid = ~dones
         if not valid.any():
+            if exists(self.slot_learned):
+                self.slot_learned_trace.append(self.slot_learned.detach().clone())
             return None
 
         with torch.enable_grad():
@@ -761,6 +929,15 @@ class Baldwin(Module):
 
             if self.step_count > self.lora_warmup_steps:
                 self._project_trust_region_and_ema_(env_indices = env_indices)
+
+            self._update_slot_predictor_learning_(
+                obs,
+                action,
+                next_obs,
+                valid,
+                env_indices = env_indices,
+                memory = memory,
+            )
 
             mean_loss = float(total_loss.item() / n_valid)
             self.last_loss = mean_loss

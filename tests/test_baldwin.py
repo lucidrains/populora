@@ -295,3 +295,86 @@ def test_baldwin_custom_loss_and_string_or_container_targets():
         loss = pop.baldwin.step(torch.randn(4, 6), torch.randn(4, 2), torch.randn(4, 6), individuals = [0, 1, 2, 3])
         assert loss is not None
 
+
+def test_baldwin_predictive_coding_learning_and_mixture_selection():
+    torch.manual_seed(21)
+    net = _make_mlp(8, 16, 2)
+    baldwin = Baldwin(
+        net,
+        latent_layer = net[2],
+        lora_memory = net[2],
+        reward_weight = 0.5,
+        predictor_learning_weight = 10.0,
+    )
+    pop = Population(baldwin, pop_size = 4, low_rank = 4)
+
+    with baldwin.session([0, 1, 2, 3]):
+        # slot 0: static/frozen transition (obs == next_obs) -> 0 learned credit
+        # slot 1: 2-state oscillation -> small credit
+        # slot 2 & 3: diverse trajectory -> largest credit
+        base_obs = torch.randn(4, 8)
+        for t in range(12):
+            obs = base_obs.clone()
+            next_obs = base_obs.clone()
+            act = torch.zeros(4, 2)
+
+            # slot 1 oscillates back and forth between two points
+            sign = 1.0 if (t % 2 == 0) else -1.0
+            obs[1] = base_obs[1] + sign * 0.1
+            next_obs[1] = base_obs[1] - sign * 0.1
+            act[1, 0] = sign
+
+            # slots 2 and 3 explore new states at every step
+            obs[2:] = torch.randn(2, 8) + t * 0.25
+            next_obs[2:] = torch.randn(2, 8) + (t + 1) * 0.25
+            act[2:] = torch.randn(2, 2)
+
+            baldwin.step(obs, act, next_obs, individuals = [0, 1, 2, 3])
+
+        learned = baldwin.slot_learned.detach().clone()
+        assert learned[0].item() == 0.0
+        assert learned[2].item() > learned[1].item()
+        assert learned[3].item() > learned[1].item()
+
+    interactor = interact_with_env(gym.make_vec('CartPole-v1', num_envs = 2), seed = 0)
+    try:
+        net_mix = nn.Sequential(nn.Linear(4, 16), nn.SiLU(), nn.Linear(16, 16), nn.SiLU(), nn.Linear(16, 2))
+        model_mix = Baldwin(
+            net_mix,
+            latent_layer = net_mix[2],
+            lora_memory = net_mix[2],
+            reward_weight = 1.0,
+            predictor_learning_weight = 5.0,
+        )
+        pop_mix = interactor.population(model_mix, pop_size = 4, low_rank = 4, seed = 0)
+        mix_fit = interactor.evaluate(pop_mix, horizon = 20, num_episodes = 1)
+        ext_fit = pop_mix.baldwin.last_extrinsic_fitness
+        lrn_fit = pop_mix.baldwin.last_learned_fitness
+
+        assert ext_fit is not None and lrn_fit is not None
+        assert (lrn_fit >= 0).all()
+        assert torch.allclose(mix_fit, 1.0 * ext_fit + 5.0 * lrn_fit, atol = 1e-5)
+
+        # verify alternating exploration / reward schedule (`alternate_every = 2`)
+        net_alt = nn.Sequential(nn.Linear(4, 16), nn.SiLU(), nn.Linear(16, 16), nn.SiLU(), nn.Linear(16, 2))
+        model_alt = Baldwin(
+            net_alt,
+            latent_layer = net_alt[2],
+            lora_memory = net_alt[2],
+            reward_weight = 2.0,
+            predictor_learning_weight = 5.0,
+            alternate_every = 2,
+        )
+        pop_alt = interactor.population(model_alt, pop_size = 4, low_rank = 4, seed = 0)
+
+        # gen 0 (explore): selects on predictor_learning_weight * learned_fitness
+        fit_g0 = interactor.evaluate(pop_alt, horizon = 20, num_episodes = 1)
+        assert torch.allclose(fit_g0, 5.0 * pop_alt.baldwin.last_learned_fitness, atol = 1e-5)
+
+        # gen 1 (exploit): selects on reward_weight * extrinsic_fitness
+        fit_g1 = interactor.evaluate(pop_alt, horizon = 20, num_episodes = 1)
+        assert torch.allclose(fit_g1, 2.0 * pop_alt.baldwin.last_extrinsic_fitness, atol = 1e-5)
+    finally:
+        interactor.close()
+
+
