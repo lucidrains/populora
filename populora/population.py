@@ -25,6 +25,7 @@ from populora.operators import (
     MUTATION_REGISTRY,
     PARENT_SELECTION_REGISTRY,
     SELECTION_REGISTRY,
+    SWARM_REGISTRY,
     TIER_RULE_REGISTRY,
     TieredResult,
     SelectionResult,
@@ -333,6 +334,7 @@ class Population(_LoRAMixin):
         mutation_registry: dict | None = None,
         migration_registry: dict | None = None,
         island_reinit_registry: dict | None = None,
+        swarm_registry: dict | None = None,
         adaptive_epsilon: bool = False,
         epsilon_init: float = 0.1,
         epsilon_tau: float | None = None,
@@ -357,6 +359,7 @@ class Population(_LoRAMixin):
         self.mutation_registry = mutation_registry
         self.migration_registry = migration_registry
         self.island_reinit_registry = island_reinit_registry
+        self.swarm_registry = swarm_registry
 
         self._dtype = resolve_dtype(dtype) if exists(dtype) else torch.get_default_dtype()
 
@@ -1098,6 +1101,124 @@ class Population(_LoRAMixin):
             crossover_fn(_TargetView(self, keys), parent_indices, child_indices, **params)
 
         return self
+
+    def _resolve_target_keys(self, targets: Sequence[str] | str | None) -> list[str] | None:
+        if not exists(targets):
+            return None
+
+        patterns = maybe_cast_tuple(targets)
+        assert len(patterns) > 0, 'targets cannot be empty'
+
+        dotted = {_adapter_key(path): path for path in self.lora_targets}
+        spec = {pattern: True for pattern in patterns}
+
+        if not any(k in spec for k in _DEFAULT_SPEC_KEYS):
+            spec['default'] = False
+
+        assignments = _target_spec_assignments(spec, dotted, 'targets')
+        return [key for key, matched in assignments.items() if matched]
+
+    @torch.no_grad()
+    def swarm_(
+        self,
+        swarm_type: str | callable | dict = 'firefly',
+        fitnesses: Tensor | None = None,
+        *,
+        bottom_frac: float = 0.5,
+        elite_frac: float = 0.25,
+        individuals: Sequence[int] | Tensor | None = None,
+        elites: Sequence[int] | Tensor | None = None,
+        targets: Sequence[str] | str | None = None,
+        num_groups: int = 1,
+        **kwargs
+    ):
+        # shift a bottom cohort (or explicit `individuals`) toward top `elites`
+        # along designated lora `targets` using a registered or custom swarm rule
+
+        if is_tensor(swarm_type) and not exists(fitnesses):
+            swarm_type, fitnesses = 'firefly', swarm_type
+
+        assert exists(fitnesses), 'fitnesses must be provided to swarm_'
+        assert is_shape(fitnesses, 'p', p = self.pop_size)
+        assert divisible_by(self.pop_size, num_groups)
+        assert 0. < bottom_frac <= 1., 'bottom_frac must be in (0, 1]'
+        assert 0. < elite_frac <= 1., 'elite_frac must be in (0, 1]'
+
+        fitnesses = fitnesses.to(self.device)
+        swarm_registry = default(self.swarm_registry, SWARM_REGISTRY)
+
+        for sched_key in ('beta0', 'alpha'):
+            val = kwargs.get(sched_key)
+            if callable(val):
+                try:
+                    kwargs[sched_key] = float(val(self.generation))
+                except TypeError:
+                    kwargs[sched_key] = float(val())
+
+        # resolve (follower, elite) cohorts per island / group
+
+        group_size = self.pop_size // num_groups
+        cohorts = []
+
+        for g in range(num_groups):
+            offset = g * group_size
+            g_idx = torch.arange(group_size, device = self.device) + offset
+            order = fitnesses[g_idx].argsort(descending = False)
+
+            if exists(individuals):
+                ind_t = atleast_1d(cast_tensor(individuals, device = self.device, dtype = torch.long))
+                f_idx = ind_t[torch.isin(ind_t, g_idx)]
+            else:
+                num_bottom = max(1, int(round(group_size * bottom_frac)))
+                f_idx = g_idx[order[:num_bottom]]
+
+            if exists(elites):
+                eli_t = atleast_1d(cast_tensor(elites, device = self.device, dtype = torch.long))
+                e_idx = eli_t[torch.isin(eli_t, g_idx)]
+            else:
+                num_elites = max(1, int(round(group_size * elite_frac)))
+                e_idx = g_idx[order.flip(0)[:num_elites]]
+
+            if len(f_idx) > 0 and len(e_idx) > 0:
+                cohorts.append((f_idx, e_idx))
+
+        if len(cohorts) == 0:
+            return self
+
+        target_keys = self._resolve_target_keys(targets)
+
+        groups = self._target_groups(
+            dict(
+                swarm_type = swarm_type,
+                beta0 = kwargs.get('beta0'),
+                gamma = kwargs.get('gamma'),
+                alpha = kwargs.get('alpha')
+            ),
+            kwargs
+        )
+
+        def run_view(view, fn, params):
+            for f_idx, e_idx in cohorts:
+                fn(view, f_idx, e_idx, fitnesses, **params)
+
+        if groups is None:
+            view = _TargetView(self, target_keys) if exists(target_keys) else self
+            fn = _resolve_fn(swarm_type, swarm_registry, 'swarm')
+            run_view(view, fn, kwargs)
+        else:
+            allowed = set(target_keys) if exists(target_keys) else None
+            for keys, params in groups:
+                if exists(allowed):
+                    keys = [k for k in keys if k in allowed]
+                if len(keys) == 0:
+                    continue
+                fn = _resolve_fn(params.pop('swarm_type', swarm_type), swarm_registry, 'swarm')
+                run_view(_TargetView(self, keys), fn, params)
+
+        self.clear_routing_cache()
+        return self
+
+    swarm = swarm_
 
     @torch.no_grad()
     def migrate_(
@@ -1921,6 +2042,11 @@ class Population(_LoRAMixin):
         brood_size: int = 1, # Tackett (1994) / Altenberg (1994) brood selection
         brood_eval_fn: Callable | None = None, # evaluation function for brood candidate selection
         consolidate_alpha: float = 0.35, # ReLoRA homotopy elite consolidation rate (0 disables)
+        swarm_type: str | callable | dict | None = None, # optional swarm attraction operator (e.g. 'firefly' or custom callable)
+        swarm_targets: Sequence[str] | str | None = None, # designated lora targets shifted by swarm_
+        swarm_bottom_frac: float | None = None, # fraction of non-elite survivors shifted toward elites
+        swarm_elite_frac: float | None = None, # fraction of top elites acting as swarm attractors
+        swarm_kwargs: dict | None = None, # extra kwargs forwarded to swarm_
         **kwargs
     ):
         assert is_shape(fitnesses, 'p', p = self.pop_size)
@@ -1975,6 +2101,9 @@ class Population(_LoRAMixin):
                 aging_decay = aging_decay,
                 brood_size = brood_size,
                 brood_eval_fn = brood_eval_fn,
+                swarm_type = swarm_type,
+                swarm_targets = swarm_targets,
+                swarm_kwargs = swarm_kwargs,
                 **kwargs
             )
             self._generation.add_(1)
@@ -2066,6 +2195,31 @@ class Population(_LoRAMixin):
                 self.reinit_individuals_(retired)
             elif retire_refill == 'es':
                 self._retire_refill_es_(retired, fitnesses, num_groups = num_groups)
+
+        if exists(swarm_type):
+            non_elite_survivors = result.survivors[~torch.isin(result.survivors, result.elites)]
+
+            if exists(swarm_bottom_frac) and len(non_elite_survivors) > 0:
+                assert 0. < swarm_bottom_frac <= 1., 'swarm_bottom_frac must be in (0, 1]'
+                order = raw_fitnesses[non_elite_survivors].argsort(descending = False)
+                num_followers = max(1, int(round(len(non_elite_survivors) * swarm_bottom_frac)))
+                followers = non_elite_survivors[order[:num_followers]]
+            else:
+                followers = non_elite_survivors
+
+            swarm_elites = None if exists(swarm_elite_frac) else (result.elites if len(result.elites) > 0 else result.survivors[:1])
+
+            if len(followers) > 0:
+                self.swarm_(
+                    swarm_type,
+                    raw_fitnesses,
+                    individuals = followers,
+                    elites = swarm_elites,
+                    elite_frac = default(swarm_elite_frac, max(elite_frac, 1. / self.pop_size)),
+                    targets = swarm_targets,
+                    num_groups = num_groups,
+                    **(default(swarm_kwargs, dict()))
+                )
 
         if consolidate_alpha > 0. and num_groups == 1:
             self.consolidate_elites_(raw_fitnesses, alpha = consolidate_alpha)

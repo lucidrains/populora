@@ -800,12 +800,156 @@ def tier_rule_archive(population, indices, sources = None, top = None, fitnesses
 
     population._sigma_reset_(indices)
 
+def tier_rule_swarm(
+    population,
+    indices,
+    sources = None,
+    top = None,
+    fitnesses = None,
+    *,
+    swarm_type = 'firefly',
+    swarm_targets = None,
+    swarm_kwargs = None,
+    **kwargs
+):
+    # shift the tier toward the top-tier elites along designated lora targets
+
+    if len(indices) == 0 or not exists(top) or len(top) == 0:
+        return
+
+    s_kwargs = dict(kwargs)
+    if exists(swarm_kwargs):
+        s_kwargs.update(swarm_kwargs)
+
+    population.swarm_(
+        default(swarm_type, 'firefly'),
+        fitnesses,
+        individuals = indices,
+        elites = top,
+        targets = swarm_targets,
+        **s_kwargs
+    )
+
 register_tier_rule('keep', tier_rule_keep)
 register_tier_rule('mutate', tier_rule_mutate)
 register_tier_rule('replace', tier_rule_replace)
 register_tier_rule('crossover', tier_rule_crossover)
 register_tier_rule('reinit', tier_rule_reinit)
 register_tier_rule('archive', tier_rule_archive)
+register_tier_rule('swarm', tier_rule_swarm)
+
+# swarm optimization
+
+SWARM_REGISTRY = dict()
+
+def register_swarm(name: str, fn: callable):
+    SWARM_REGISTRY[name] = fn
+
+def swarm_firefly(
+    population: Population,
+    follower_indices: Tensor,
+    elite_indices: Tensor,
+    fitnesses: Tensor,
+    *,
+    beta0: float = 0.3,
+    gamma: float = 1.0,
+    alpha: float = 0.08,
+    align_lora_sign: bool = True,
+    preserve_norm: bool = True,
+    normalize_weights: bool = True,
+    scale_invariant_distance: bool = True,
+    **kwargs
+):
+    # firefly swarm attraction in lora factor space - followers move toward
+    # brighter elites with distance-decayed attraction beta0 * exp(-gamma * d^2),
+    # rank-column sign alignment, and geodesic column-norm preservation
+
+    if len(follower_indices) == 0 or len(elite_indices) == 0 or len(population.weight_down) == 0:
+        return
+
+    device = population.device
+    f_followers = fitnesses[follower_indices].float()
+    f_elites = fitnesses[elite_indices].float()
+
+    move_mask = rearrange(f_elites, 'e -> 1 e') > rearrange(f_followers, 'f -> f 1')
+
+    if not move_mask.any():
+        return
+
+    signs_by_key = dict()
+    sq_dist = torch.zeros((len(follower_indices), len(elite_indices)), device = device, dtype = torch.float32)
+
+    for key, w_down in population.weight_down.items():
+        w_up = population.weight_up[key]
+        wd_f, wu_f = w_down.data[follower_indices].float(), w_up.data[follower_indices].float()
+        wd_e, wu_e = w_down.data[elite_indices].float(), w_up.data[elite_indices].float()
+
+        dot = einsum(wd_f, wd_e, 'f d r, e d r -> f e r') + einsum(wu_f, wu_e, 'f o r, e o r -> f e r')
+
+        if align_lora_sign:
+            signs_by_key[key] = torch.where(dot >= 0., 1., -1.)
+            cross = dot.abs().sum(dim = -1)
+        else:
+            cross = dot.sum(dim = -1)
+
+        norm_f = wd_f.square().sum(dim = (1, 2)) + wu_f.square().sum(dim = (1, 2))
+        norm_e = wd_e.square().sum(dim = (1, 2)) + wu_e.square().sum(dim = (1, 2))
+
+        sq_dist = sq_dist + rearrange(norm_f, 'f -> f 1') + rearrange(norm_e, 'e -> 1 e') - 2. * cross
+
+    sq_dist = sq_dist.clamp(min = 0.)
+
+    if scale_invariant_distance:
+        scale = sq_dist[move_mask].median().clamp(min = 1e-8)
+        sq_dist = sq_dist / scale
+
+    weights = move_mask.float() * (-gamma * sq_dist).exp()
+
+    if normalize_weights:
+        denom = weights.sum(dim = -1, keepdim = True)
+        betas = beta0 * (weights / denom.clamp(min = 1e-12)) * (denom > 1e-12).float()
+    else:
+        betas = beta0 * weights
+
+    total_beta = rearrange(betas.sum(dim = -1), 'f -> f 1 1')
+    moved_mask = (total_beta > 0.).float()
+
+    for key, w_down in population.weight_down.items():
+        w_up = population.weight_up[key]
+        dtype = w_down.dtype
+
+        wd_f, wu_f = w_down.data[follower_indices].float(), w_up.data[follower_indices].float()
+        wd_e, wu_e = w_down.data[elite_indices].float(), w_up.data[elite_indices].float()
+
+        if align_lora_sign:
+            signs = signs_by_key[key]
+            wd_pull = einsum(betas, signs, wd_e, 'f e, f e r, e d r -> f d r')
+            wu_pull = einsum(betas, signs, wu_e, 'f e, f e r, e o r -> f o r')
+        else:
+            wd_pull = einsum(betas, wd_e, 'f e, e d r -> f d r')
+            wu_pull = einsum(betas, wu_e, 'f e, e o r -> f o r')
+
+        wd_new = (1. - total_beta) * wd_f + wd_pull
+        wu_new = (1. - total_beta) * wu_f + wu_pull
+
+        if preserve_norm:
+            d_norm_f, u_norm_f = wd_f.norm(dim = 1, keepdim = True), wu_f.norm(dim = 1, keepdim = True)
+            d_norm_e, u_norm_e = wd_e.norm(dim = 1, keepdim = True), wu_e.norm(dim = 1, keepdim = True)
+
+            target_d_norm = (1. - total_beta) * d_norm_f + einsum(betas, d_norm_e, 'f e, e one r -> f one r')
+            target_u_norm = (1. - total_beta) * u_norm_f + einsum(betas, u_norm_e, 'f e, e one r -> f one r')
+
+            wd_new = wd_new * (target_d_norm / wd_new.norm(dim = 1, keepdim = True).clamp(min = 1e-8))
+            wu_new = wu_new * (target_u_norm / wu_new.norm(dim = 1, keepdim = True).clamp(min = 1e-8))
+
+        if alpha > 0.:
+            wd_new = wd_new + moved_mask * _noise_like(wd_new, alpha)
+            wu_new = wu_new + moved_mask * _noise_like(wu_new, alpha)
+
+        w_down.data[follower_indices] = wd_new.to(dtype)
+        w_up.data[follower_indices] = wu_new.to(dtype)
+
+register_swarm('firefly', swarm_firefly)
 
 # migration
 

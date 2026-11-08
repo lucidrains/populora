@@ -2756,3 +2756,175 @@ def test_mirror_antithetic_and_evolve_es():
     fitnesses = torch.arange(8, dtype = torch.float32)
     pop.evolve_es_(fitnesses, mirrored = True, lr = 0.05)
     assert not allclose(w0_before, pop.model[0].weight.data)
+
+def test_swarm_firefly_bottom_follows_elites():
+    torch.manual_seed(0)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+
+    # fitnesses ascending: 0..3 are bottom 50%, 4..5 are middle 25%, 6..7 are top 25% elites
+    fitnesses = torch.arange(8, dtype = torch.float32)
+    before_down = {k: v.data.clone() for k, v in pop.weight_down.items()}
+    before_up = {k: v.data.clone() for k, v in pop.weight_up.items()}
+
+    pop.swarm_(fitnesses, bottom_frac = 0.5, elite_frac = 0.25, beta0 = 0.4, alpha = 0.0)
+
+    for k in pop.weight_down:
+        # top elites (6, 7) and middle cohort (4, 5) are untouched
+        assert allclose(pop.weight_down[k].data[4:], before_down[k][4:])
+        assert allclose(pop.weight_up[k].data[4:], before_up[k][4:])
+        # bottom 50% (0..3) have shifted
+        assert not allclose(pop.weight_down[k].data[:4], before_down[k][:4])
+        assert not allclose(pop.weight_up[k].data[:4], before_up[k][:4])
+
+def test_swarm_designated_targets_and_globs():
+    torch.manual_seed(0)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+    fitnesses = torch.arange(8, dtype = torch.float32)
+    before = {k: v.data.clone() for k, v in pop.weight_down.items()}
+
+    # shift only layer '0'
+    pop.swarm_('firefly', fitnesses, bottom_frac = 0.5, elite_frac = 0.25, targets = '0', alpha = 0.0)
+
+    assert not allclose(pop.weight_down['0'].data[:4], before['0'][:4])
+    assert allclose(pop.weight_down['2'].data, before['2'])
+    assert allclose(pop.weight_down['4'].data, before['4'])
+
+    # per-target beta0 via PerTarget
+    before2 = {k: v.data.clone() for k, v in pop.weight_down.items()}
+    pop.swarm_(
+        'firefly',
+        fitnesses,
+        bottom_frac = 0.5,
+        elite_frac = 0.25,
+        beta0 = PerTarget({'2': 0.5, 'default': 0.0}),
+        alpha = 0.0
+    )
+    assert allclose(pop.weight_down['0'].data, before2['0'])
+    assert not allclose(pop.weight_down['2'].data[:4], before2['2'][:4])
+    assert allclose(pop.weight_down['4'].data, before2['4'])
+
+    with pytest.raises(AssertionError, match = 'match none'):
+        pop.swarm_('firefly', fitnesses, targets = 'nonexistent_layer')
+
+def test_swarm_lora_sign_invariance_and_norm_preservation():
+    torch.manual_seed(7)
+    pop_a = Population(nn.Sequential(nn.Linear(6, 6)), pop_size = 2, low_rank = 2)
+    pop_b = Population(nn.Sequential(nn.Linear(6, 6)), pop_size = 2, low_rank = 2)
+
+    # normalize columns to unit norm so we can verify norm preservation
+    for key in pop_a.weight_down:
+        wd = pop_a.weight_down[key].data
+        wu = pop_a.weight_up[key].data
+        wd = wd / wd.norm(dim = 1, keepdim = True)
+        wu = wu / wu.norm(dim = 1, keepdim = True)
+        pop_a.weight_down[key].data.copy_(wd)
+        pop_a.weight_up[key].data.copy_(wu)
+        pop_b.weight_down[key].data.copy_(wd)
+        pop_b.weight_up[key].data.copy_(wu)
+
+        # flip rank-0 sign on elite (index 1) in pop_b: identical ΔW = U D^T
+        pop_b.weight_down[key].data[1, :, 0].mul_(-1.)
+        pop_b.weight_up[key].data[1, :, 0].mul_(-1.)
+
+    fitnesses = torch.tensor([0.0, 10.0])
+    pop_a.swarm_('firefly', fitnesses, bottom_frac = 0.5, elite_frac = 0.5, beta0 = 0.4, alpha = 0.0, align_lora_sign = True, preserve_norm = True)
+    pop_b.swarm_('firefly', fitnesses, bottom_frac = 0.5, elite_frac = 0.5, beta0 = 0.4, alpha = 0.0, align_lora_sign = True, preserve_norm = True)
+
+    for key in pop_a.weight_down:
+        dw_a = torch.einsum('o r, d r -> o d', pop_a.weight_up[key].data[0], pop_a.weight_down[key].data[0])
+        dw_b = torch.einsum('o r, d r -> o d', pop_b.weight_up[key].data[0], pop_b.weight_down[key].data[0])
+        assert allclose(dw_a, dw_b, atol = 1e-5), 'sign-gauge alignment must produce identical ΔW regardless of elite column sign'
+
+        # column norms of follower 0 remain 1.0
+        assert allclose(pop_a.weight_down[key].data[0].norm(dim = 0), torch.ones(2), atol = 1e-5)
+        assert allclose(pop_a.weight_up[key].data[0].norm(dim = 0), torch.ones(2), atol = 1e-5)
+
+def test_swarm_custom_algorithm_and_registry():
+    from populora import SWARM_REGISTRY, register_swarm
+
+    calls = []
+
+    def custom_swarm(population, follower_indices, elite_indices, fitnesses, *, step = 0.5, **kwargs):
+        calls.append((follower_indices.tolist(), elite_indices.tolist(), step))
+        best_elite = elite_indices[fitnesses[elite_indices].argmax()]
+        for key, wd in population.weight_down.items():
+            wu = population.weight_up[key]
+            wd.data[follower_indices] = torch.lerp(wd.data[follower_indices], wd.data[best_elite].unsqueeze(0), step)
+            wu.data[follower_indices] = torch.lerp(wu.data[follower_indices], wu.data[best_elite].unsqueeze(0), step)
+
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+    fitnesses = torch.arange(8, dtype = torch.float32)
+
+    # 1. direct callable passed to swarm_
+    pop.swarm_(custom_swarm, fitnesses, bottom_frac = 0.25, elite_frac = 0.25, targets = '0', step = 0.25)
+    assert len(calls) == 1
+    assert calls[-1][2] == 0.25
+
+    # 2. registered in SWARM_REGISTRY and invoked through evolve_
+    register_swarm('test_custom_swarm', custom_swarm)
+    try:
+        pop.evolve_(
+            fitnesses,
+            survive_frac = 0.5,
+            elite_frac = 0.25,
+            swarm_type = 'test_custom_swarm',
+            swarm_targets = '2',
+            swarm_bottom_frac = 0.5,
+            swarm_kwargs = dict(step = 0.75),
+            consolidate_alpha = 0.0,
+        )
+        assert len(calls) == 2
+        assert calls[-1][2] == 0.75
+    finally:
+        SWARM_REGISTRY.pop('test_custom_swarm', None)
+
+def test_swarm_multi_group_and_tier_rule():
+    torch.manual_seed(0)
+    pop = Population(
+        nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2)),
+        pop_size = 8,
+        low_rank = 2,
+    )
+
+    # island 0 (0..3) has weights = 0, except elite 3 has weights = 1
+    # island 1 (4..7) has weights = 100
+    for key in pop.weight_down:
+        pop.weight_down[key].data[:3].zero_()
+        pop.weight_up[key].data[:3].zero_()
+        pop.weight_down[key].data[3].fill_(1.0)
+        pop.weight_up[key].data[3].fill_(1.0)
+        pop.weight_down[key].data[4:].fill_(100.0)
+        pop.weight_up[key].data[4:].fill_(100.0)
+
+    fitnesses = torch.tensor([0., 1., 2., 10., 0., 1., 2., 1000.])
+    pop.swarm_('firefly', fitnesses, bottom_frac = 0.5, elite_frac = 0.25, num_groups = 2, alpha = 0.0, preserve_norm = False)
+
+    # island 0 followers (0, 1) must only move toward island 0 elite (3, value 1.0), never island 1 (value 100.0)
+    for key in pop.weight_down:
+        assert (pop.weight_down[key].data[:2] <= 1.0 + 1e-5).all()
+        assert (pop.weight_down[key].data[:2] > 0.0).all()
+
+    # tiered evolve with 'swarm' tier rule
+    before_tier = {k: v.data.clone() for k, v in pop.weight_down.items()}
+    res = pop.evolve_(
+        fitnesses,
+        tiers = ((0.25, 'keep'), (0.25, 'swarm'), (0.5, 'crossover')),
+        swarm_targets = '0',
+        swarm_kwargs = dict(beta0 = 0.5, alpha = 0.0),
+    )
+    assert len(res.tiers) == 3
+    swarm_tier = res.tiers[1]
+    assert not allclose(pop.weight_down['0'].data[swarm_tier], before_tier['0'][swarm_tier])
+    assert allclose(pop.weight_down['2'].data[swarm_tier], before_tier['2'][swarm_tier])
