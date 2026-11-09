@@ -855,14 +855,17 @@ def swarm_firefly(
     gamma: float = 1.0,
     alpha: float = 0.08,
     align_lora_sign: bool = True,
+    align_lora_procrustes: bool = False,
     preserve_norm: bool = True,
     normalize_weights: bool = True,
+    preserve_distance_decay: bool = False,
+    fitness_weighted: bool = False,
     scale_invariant_distance: bool = True,
     **kwargs
 ):
     # firefly swarm attraction in lora factor space - followers move toward
     # brighter elites with distance-decayed attraction beta0 * exp(-gamma * d^2),
-    # rank-column sign alignment, and geodesic column-norm preservation
+    # rank-column sign or orthogonal Procrustes O(r) alignment, and column-norm preservation
 
     if len(follower_indices) == 0 or len(elite_indices) == 0 or len(population.weight_down) == 0:
         return
@@ -871,12 +874,14 @@ def swarm_firefly(
     f_followers = fitnesses[follower_indices].float()
     f_elites = fitnesses[elite_indices].float()
 
-    move_mask = rearrange(f_elites, 'e -> 1 e') > rearrange(f_followers, 'f -> f 1')
+    f_diff = rearrange(f_elites, 'e -> 1 e') - rearrange(f_followers, 'f -> f 1')
+    move_mask = f_diff > 0.
 
     if not move_mask.any():
         return
 
     signs_by_key = dict()
+    rot_by_key = dict()
     sq_dist = torch.zeros((len(follower_indices), len(elite_indices)), device = device, dtype = torch.float32)
 
     for key, w_down in population.weight_down.items():
@@ -884,18 +889,26 @@ def swarm_firefly(
         wd_f, wu_f = w_down.data[follower_indices].float(), w_up.data[follower_indices].float()
         wd_e, wu_e = w_down.data[elite_indices].float(), w_up.data[elite_indices].float()
 
-        dot = einsum(wd_f, wd_e, 'f d r, e d r -> f e r') + einsum(wu_f, wu_e, 'f o r, e o r -> f e r')
-
-        if align_lora_sign:
-            signs_by_key[key] = torch.where(dot >= 0., 1., -1.)
-            cross = dot.abs().sum(dim = -1)
+        if align_lora_procrustes:
+            gram = einsum(wd_f, wd_e, 'f d r1, e d r2 -> f e r1 r2') + einsum(wu_f, wu_e, 'f o r1, e o r2 -> f e r1 r2')
+            u_svd, s_svd, vh_svd = torch.linalg.svd(gram, full_matrices = False)
+            rot_by_key[key] = einsum(u_svd, vh_svd, 'f e r1 k, f e k r2 -> f e r1 r2')
+            cross = s_svd.sum(dim = -1)
         else:
-            cross = dot.sum(dim = -1)
+            dot = einsum(wd_f, wd_e, 'f d r, e d r -> f e r') + einsum(wu_f, wu_e, 'f o r, e o r -> f e r')
+
+            if align_lora_sign:
+                signs_by_key[key] = torch.where(dot >= 0., 1., -1.)
+                cross = dot.abs().sum(dim = -1)
+            else:
+                cross = dot.sum(dim = -1)
 
         norm_f = wd_f.square().sum(dim = (1, 2)) + wu_f.square().sum(dim = (1, 2))
         norm_e = wd_e.square().sum(dim = (1, 2)) + wu_e.square().sum(dim = (1, 2))
 
-        sq_dist = sq_dist + rearrange(norm_f, 'f -> f 1') + rearrange(norm_e, 'e -> 1 e') - 2. * cross
+        layer_dist = (rearrange(norm_f, 'f -> f 1') + rearrange(norm_e, 'e -> 1 e') - 2. * cross).clamp(min = 0.)
+        layer_scale = layer_dist[move_mask].median().clamp(min = 1e-8) if (align_lora_procrustes and scale_invariant_distance) else 1.
+        sq_dist = sq_dist + layer_dist / layer_scale
 
     sq_dist = sq_dist.clamp(min = 0.)
 
@@ -903,11 +916,21 @@ def swarm_firefly(
         scale = sq_dist[move_mask].median().clamp(min = 1e-8)
         sq_dist = sq_dist / scale
 
-    weights = move_mask.float() * (-gamma * sq_dist).exp()
+    decay = (-gamma * sq_dist).exp()
+    f_adv = (f_diff.clamp(min = 0.) / f_diff[move_mask].median().clamp(min = 1e-8)) if fitness_weighted else 1.
+    weights = move_mask.float() * f_adv * decay
 
     if normalize_weights:
         denom = weights.sum(dim = -1, keepdim = True)
-        betas = beta0 * (weights / denom.clamp(min = 1e-12)) * (denom > 1e-12).float()
+        has_move = denom > 1e-12
+        rel_weights = (weights / denom.clamp(min = 1e-12)) * has_move.float()
+
+        if preserve_distance_decay:
+            eff_decay = (rel_weights * decay).sum(dim = -1, keepdim = True)
+            med_decay = eff_decay[has_move.squeeze(-1)].median().clamp(min = 1e-8)
+            rel_weights = rel_weights * (eff_decay / med_decay).clamp(min = 0.25, max = 1.5)
+
+        betas = beta0 * rel_weights
     else:
         betas = beta0 * weights
 
@@ -921,7 +944,11 @@ def swarm_firefly(
         wd_f, wu_f = w_down.data[follower_indices].float(), w_up.data[follower_indices].float()
         wd_e, wu_e = w_down.data[elite_indices].float(), w_up.data[elite_indices].float()
 
-        if align_lora_sign:
+        if align_lora_procrustes:
+            rot = rot_by_key[key]
+            wd_pull = einsum(betas, rot, wd_e, 'f e, f e r1 r2, e d r2 -> f d r1')
+            wu_pull = einsum(betas, rot, wu_e, 'f e, f e r1 r2, e o r2 -> f o r1')
+        elif align_lora_sign:
             signs = signs_by_key[key]
             wd_pull = einsum(betas, signs, wd_e, 'f e, f e r, e d r -> f d r')
             wu_pull = einsum(betas, signs, wu_e, 'f e, f e r, e o r -> f o r')

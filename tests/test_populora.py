@@ -2928,3 +2928,37 @@ def test_swarm_multi_group_and_tier_rule():
     swarm_tier = res.tiers[1]
     assert not allclose(pop.weight_down['0'].data[swarm_tier], before_tier['0'][swarm_tier])
     assert allclose(pop.weight_down['2'].data[swarm_tier], before_tier['2'][swarm_tier])
+
+def test_swarm_firefly_procrustes_and_function_space_invariance():
+    torch.manual_seed(11)
+    pop_a = Population(nn.Sequential(nn.Linear(6, 6)), pop_size = 2, low_rank = 3)
+    pop_b = Population(nn.Sequential(nn.Linear(6, 6)), pop_size = 2, low_rank = 3)
+
+    # construct a random orthogonal matrix R in O(3)
+    q, _ = torch.linalg.qr(torch.randn(3, 3))
+    for key in pop_a.weight_down:
+        wd = pop_a.weight_down[key].data
+        wu = pop_a.weight_up[key].data
+        pop_b.weight_down[key].data.copy_(wd)
+        pop_b.weight_up[key].data.copy_(wu)
+        # rotate elite (index 1) rank basis by q in O(3): (U @ q)(D @ q)^T = U D^T
+        pop_b.weight_down[key].data[1] = wd[1] @ q
+        pop_b.weight_up[key].data[1] = wu[1] @ q
+
+    fitnesses = torch.tensor([0.0, 10.0])
+    pop_a.swarm_(
+        'firefly', fitnesses, bottom_frac = 0.5, elite_frac = 0.5,
+        beta0 = 0.4, alpha = 0.0, align_lora_procrustes = True,
+        preserve_norm = False, preserve_distance_decay = True, fitness_weighted = True,
+    )
+    pop_b.swarm_(
+        'firefly', fitnesses, bottom_frac = 0.5, elite_frac = 0.5,
+        beta0 = 0.4, alpha = 0.0, align_lora_procrustes = True,
+        preserve_norm = False, preserve_distance_decay = True, fitness_weighted = True,
+    )
+
+    for key in pop_a.weight_down:
+        dw_a = torch.einsum('o r, d r -> o d', pop_a.weight_up[key].data[0], pop_a.weight_down[key].data[0])
+        dw_b = torch.einsum('o r, d r -> o d', pop_b.weight_up[key].data[0], pop_b.weight_down[key].data[0])
+        assert allclose(dw_a, dw_b, atol = 1e-4), 'Procrustes O(r) alignment must produce identical ΔW under arbitrary orthogonal basis rotations'
+
