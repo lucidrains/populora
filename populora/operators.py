@@ -521,10 +521,104 @@ def parent_select_queen_bee(fitnesses, num_children, num_parents_per_child = 2, 
 
     return cat((queens, drones), dim = -1)
 
+def parent_select_assortative(
+    fitnesses,
+    num_children,
+    num_parents_per_child = 2,
+    *,
+    descriptors = None,
+    distances = None,
+    raw_fitnesses = None,
+    tournament_size = 3,
+    niche_k = 6,
+    normalize_descriptors = True,
+    **kwargs
+):
+    # niche-local (assortative) parent pairing: parent 1 is chosen by tournament
+    # on `fitnesses` (e.g. DNS / competition fitness), and remaining parents are
+    # chosen from parent 1's `niche_k` nearest neighbors in descriptor/distance
+    # space to avoid destructive cross-niche recombination
+
+    *batch_shape, pop_size = shape(fitnesses, '... p')
+    device = fitnesses.device
+
+    p1 = parent_select_tournament(
+        fitnesses,
+        num_children,
+        num_parents_per_child = 1,
+        tournament_size = tournament_size,
+        **kwargs
+    )
+
+    if num_parents_per_child <= 1:
+        return p1
+
+    if (not exists(distances) and not exists(descriptors)) or pop_size <= 2:
+        rest = parent_select_tournament(
+            fitnesses,
+            num_children,
+            num_parents_per_child = num_parents_per_child - 1,
+            tournament_size = tournament_size,
+            **kwargs
+        )
+        return cat((p1, rest), dim = -1)
+
+    mate_scores = default(raw_fitnesses, fitnesses).to(device).float()
+    num_extra = num_parents_per_child - 1
+    m = max(1, min(int(niche_k), pop_size - 1))
+
+    def _select_mates_1d(p1_1d, scores_1d, dist_2d):
+        # p1_1d: (c, 1), scores_1d: (p,), dist_2d: (p, p)
+        c = p1_1d.shape[0]
+        p1_flat = p1_1d.squeeze(-1) # (c,)
+        d_rows = dist_2d[p1_flat].clone() # (c, p)
+        d_rows.scatter_(1, p1_1d, float('inf'))
+
+        _, nn_idx = torch.topk(d_rows, k = m, dim = -1, largest = False) # (c, m)
+        nn_scores = scores_1d[nn_idx] # (c, m)
+
+        if m <= num_extra:
+            best_local = nn_scores.argmax(dim = -1, keepdim = True)
+            chosen = nn_idx.gather(-1, best_local).expand(c, num_extra)
+            return cat((p1_1d, chosen), dim = -1)
+
+        # tournament within the local neighborhood
+        t_sz = min(max(2, tournament_size), m)
+        rand_local_order = torch.randn((c, num_extra, m), device = device).topk(t_sz, dim = -1, sorted = False).indices
+        cand_idx = nn_idx.unsqueeze(1).expand(c, num_extra, m).gather(-1, rand_local_order)
+        cand_scores = nn_scores.unsqueeze(1).expand(c, num_extra, m).gather(-1, rand_local_order)
+        win = cand_scores.argmax(dim = -1, keepdim = True)
+        mates = cand_idx.gather(-1, win).squeeze(-1) # (c, num_extra)
+        return cat((p1_1d, mates), dim = -1)
+
+    if fitnesses.ndim == 1:
+        if exists(distances):
+            dist_mat = distances.to(device).float()
+        else:
+            from populora.novelty import pairwise_distances
+            dist_mat = pairwise_distances(descriptors.to(device), normalize = normalize_descriptors)
+        return _select_mates_1d(p1, mate_scores, dist_mat)
+
+    # batched / island case: (g, p)
+    num_groups = fitnesses.shape[0]
+    out_groups = []
+    for g in range(num_groups):
+        if exists(distances):
+            d_g = distances[g].to(device).float() if distances.ndim == 3 else distances.to(device).float()
+        else:
+            from populora.novelty import pairwise_distances
+            desc_g = descriptors[g] if descriptors.ndim >= 3 else descriptors
+            d_g = pairwise_distances(desc_g.to(device), normalize = normalize_descriptors)
+        s_g = mate_scores[g] if mate_scores.ndim == 2 else mate_scores
+        out_groups.append(_select_mates_1d(p1[g], s_g, d_g))
+
+    return torch.stack(out_groups, dim = 0)
+
 register_parent_selection('tournament', parent_select_tournament)
 register_parent_selection('fuss', parent_select_fuss)
 register_parent_selection('roulette', parent_select_roulette)
 register_parent_selection('queen_bee', parent_select_queen_bee)
+register_parent_selection('assortative', parent_select_assortative)
 
 # crossover
 

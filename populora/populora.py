@@ -49,6 +49,7 @@ from populora.operators import (
     mutation_layer_selective_gaussian,
     mutation_neftune_style,
     mutation_svd_structured,
+    parent_select_assortative,
     parent_select_fuss,
     parent_select_queen_bee,
     parent_select_roulette,
@@ -97,4 +98,20 @@ from populora.baldwin import (
     cosine_similarity_loss,
     normalized_mse_loss,
     smooth_l1_latent_loss,
+)
+from populora.novelty import (
+    Aurora,
+    AuroraAutoEncoder,
+    FITNESS_TRANSFORM_REGISTRY,
+    behavioral_spread,
+    dominated_novelty,
+    fitness_sharing,
+    grid_coverage,
+    novelty_scores,
+    pairwise_distances,
+    quality_dominated_novelty,
+    quality_gated_fitness,
+    register_fitness_transform,
+    sketch_trajectories,
+    vendi_score,
 )

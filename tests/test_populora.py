@@ -2962,3 +2962,196 @@ def test_swarm_firefly_procrustes_and_function_space_invariance():
         dw_b = torch.einsum('o r, d r -> o d', pop_b.weight_up[key].data[0], pop_b.weight_down[key].data[0])
         assert allclose(dw_a, dw_b, atol = 1e-4), 'Procrustes O(r) alignment must produce identical ΔW under arbitrary orthogonal basis rotations'
 
+
+def test_pairwise_and_genome_distances():
+    from populora import pairwise_distances
+
+    desc = torch.tensor([[0.0, 0.0], [3.0, 4.0], [0.0, 0.0]])
+    d_raw = pairwise_distances(desc, normalize = False)
+    assert d_raw.shape == (3, 3)
+    assert allclose(d_raw[0, 1], torch.tensor(5.0))
+    assert allclose(d_raw[0, 2], torch.tensor(0.0))
+    assert allclose(torch.diag(d_raw), torch.zeros(3))
+
+    d_norm = pairwise_distances(desc, normalize = True)
+    assert d_norm.shape == (3, 3)
+    assert d_norm[0, 1] > 0.0
+    assert allclose(d_norm[0, 2], torch.tensor(0.0), atol = 1e-6)
+
+    torch.manual_seed(7)
+    pop = Population(nn.Sequential(nn.Linear(5, 4)), pop_size = 4, low_rank = 2)
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = 0.2)
+
+    d_factor = pop.genome_distances(space = 'factor')
+    d_delta = pop.genome_distances(space = 'delta')
+    assert d_factor.shape == (4, 4)
+    assert d_delta.shape == (4, 4)
+    assert allclose(torch.diag(d_factor), torch.zeros(4))
+    assert allclose(torch.diag(d_delta), torch.zeros(4))
+
+    # delta-space distance must be invariant to orthogonal rotation of an individual's rank basis
+    q, _ = torch.linalg.qr(torch.randn(2, 2))
+    for key in pop.weight_down:
+        pop.weight_down[key].data[1] = pop.weight_down[key].data[1] @ q
+        pop.weight_up[key].data[1] = pop.weight_up[key].data[1] @ q
+    d_delta_rot = pop.genome_distances(space = 'delta')
+    assert allclose(d_delta, d_delta_rot, atol = 1e-5)
+
+
+def test_dominated_novelty_and_quality_gating():
+    from populora import (
+        dominated_novelty,
+        fitness_sharing,
+        novelty_scores,
+        quality_dominated_novelty,
+        quality_gated_fitness,
+    )
+
+    # Individuals 0..3 are crowded at (0, 0) with fitnesses 10.0, 9.5, 9.4, 9.3
+    # Individual 4 is a distinct stepping-stone niche at (5, 5) with fitness 8.0
+    # Individual 5 is a wild crasher at (-20, 20) with fitness -100.0
+    descriptors = torch.tensor([
+        [0.00, 0.00],
+        [0.01, -0.01],
+        [-0.01, 0.01],
+        [0.02, 0.02],
+        [5.00, 5.00],
+        [-20.0, 20.0],
+    ])
+    fitnesses = torch.tensor([10.0, 9.5, 9.4, 9.3, 8.0, -100.0])
+
+    dns = dominated_novelty(fitnesses, descriptors, k = 2, normalize = False)
+    assert dns.shape == (6,)
+    # Global champion (idx 0) must rank strictly #1
+    assert int(dns.argmax().item()) == 0
+    # Distinct viable niche (idx 4) must outrank crowded redundant followers (idx 1, 2, 3) in DNS
+    assert dns[4] > dns[1] and dns[4] > dns[2] and dns[4] > dns[3]
+
+    # Quality-gated fitness must still rank idx 0 #1, keep stepping stone idx 4 above crowded followers,
+    # and penalize the -100.0 crasher (idx 5) below all viable individuals
+    gated = quality_gated_fitness(fitnesses, dns, weight = 0.8, quantile = 0.4, sharpness = 3.0)
+    assert int(gated.argmax().item()) == 0
+    assert gated[4] > gated[2]
+    assert int(gated.argmin().item()) == 5
+
+    q_dns = quality_dominated_novelty(fitnesses, descriptors, k = 2, normalize = False, weight = 0.8, quantile = 0.4, sharpness = 3.0)
+    assert allclose(gated, q_dns)
+
+    nov = novelty_scores(descriptors, k = 2, normalize = False)
+    assert nov.shape == (6,)
+    assert int(nov.argmax().item()) == 5
+
+    archive = torch.tensor([[-20.0, 20.0], [-20.1, 19.9], [-19.9, 20.1]])
+    nov_arch = novelty_scores(descriptors, archive = archive, k = 2, normalize = False)
+    # With archive populated around (-20, 20), idx 5 is no longer the most novel
+    assert nov_arch[4] > nov_arch[5]
+
+    shared = fitness_sharing(fitnesses, descriptors, quantile = 0.5)
+    assert shared.shape == (6,)
+
+
+def test_sketch_trajectories_and_aurora():
+    from populora import Aurora, behavioral_spread, grid_coverage, sketch_trajectories, vendi_score
+
+    torch.manual_seed(42)
+    # Variable-length trajectories (obs, act) tuples
+    trajs = [
+        (torch.randn(15 + i * 3, 6), torch.randn(15 + i * 3, 2))
+        for i in range(16)
+    ]
+    sketches = sketch_trajectories(trajs, num_subsamples = 6, max_horizon = 100)
+    # 6 subsamples * (6+2) + mean(8) + std(8) + length(1) = 48 + 16 + 1 = 65
+    assert sketches.shape == (16, 65)
+
+    # Lazy-initialized Aurora directly on raw variable-length trajectories
+    aurora = Aurora(latent_dim = 4, hidden_dim = 32, batch_size = 8, update_steps = 4, num_subsamples = 6)
+    z1 = aurora(trajs)
+    assert z1.shape == (16, 4)
+    assert len(aurora.loss_history) == 1
+
+    z2 = aurora(sketches, steps = 6)
+    assert z2.shape == (16, 4)
+    assert z2.std(dim = 0).mean().item() > 0.05
+
+    vs = vendi_score(z2)
+    assert 1.0 <= vs <= 16.0
+    sp = behavioral_spread(z2)
+    assert sp > 0.0
+    cov = grid_coverage(z2, bins = 4)
+    assert 0.0 < cov <= 1.0
+
+
+def test_parent_select_assortative_and_modular_evolve():
+    from populora import (
+        Aurora,
+        dominated_novelty,
+        parent_select_assortative,
+        quality_gated_fitness,
+    )
+
+    torch.manual_seed(123)
+    # Two well-separated niches: indices 0..3 near (-10, -10), indices 4..7 near (+10, +10)
+    desc = torch.cat([
+        torch.full((4, 2), -10.0) + 0.05 * torch.randn(4, 2),
+        torch.full((4, 2), 10.0) + 0.05 * torch.randn(4, 2),
+    ], dim = 0)
+    fits = torch.tensor([1.0, 2.0, 3.0, 4.0, 1.5, 2.5, 3.5, 4.5])
+
+    parents = parent_select_assortative(
+        fits,
+        num_children = 20,
+        num_parents_per_child = 2,
+        descriptors = desc,
+        niche_k = 3,
+        normalize_descriptors = False,
+    )
+    assert parents.shape == (20, 2)
+    # Every child's two parents must belong to the same niche (both < 4 or both >= 4)
+    same_niche = (parents[:, 0] < 4) == (parents[:, 1] < 4)
+    assert same_niche.all()
+
+    # Compose Aurora + dominated_novelty + quality_gated_fitness + assortative mating in Population.evolve_
+    model = nn.Sequential(nn.Linear(6, 16), nn.SiLU(), nn.Linear(16, 3))
+    pop = Population(model, pop_size = 12, low_rank = 2)
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = 0.15)
+
+    aurora = Aurora(latent_dim = 4, hidden_dim = 32, update_steps = 3)
+    x_probe = torch.randn(12, 10, 6)
+    raw_fits = torch.linspace(-5.0, 15.0, 12)
+
+    descriptors = aurora(x_probe)
+    dns = dominated_novelty(raw_fits, descriptors, k = 3)
+    comp_fits = quality_gated_fitness(raw_fits, dns, weight = 0.75)
+
+    best_idx = int(raw_fits.argmax().item())
+    best_before = {k: v.data[best_idx].clone() for k, v in pop.weight_down.items()}
+
+    res = pop.evolve_(
+        raw_fits,
+        competition_fitnesses = comp_fits,
+        descriptors = descriptors,
+        raw_elites = 2,
+        survive_frac = 0.5,
+        elite_frac = 0.2,
+        parent_selection_type = 'assortative',
+        crossover_type = 'extrapolative',
+        mutation_type = 'full_gaussian',
+        epsilon = 0.05,
+        consolidate_alpha = 0.0,
+    )
+    # Top 2 raw elites (indices 10 and 11) must be guaranteed to survive
+    assert 11 in res.survivors.tolist()
+    assert 10 in res.survivors.tolist()
+    assert all(allclose(pop.weight_down[k].data[best_idx], best_before[k]) for k in pop.weight_down)
+
+    # Also verify registry shorthand ('dns', 'quality_dns') and automatic genome_distances() fallback
+    res_geno = pop.evolve_(
+        raw_fits,
+        fitness_transform = 'quality_dns',
+        parent_selection_type = 'assortative',
+        crossover_type = 'extrapolative',
+        consolidate_alpha = 0.0,
+    )
+    assert int(raw_fits.argmax().item()) in res_geno.survivors.tolist()
+
+

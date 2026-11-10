@@ -464,3 +464,39 @@ Samples can be routed to explicit individuals (`individual = 3` or `individuals 
     year      = {1987}
 }
 ```
+
+```bibtex
+@misc{bahlousboldi2025dominatednoveltysearch,
+    title         = {Dominated Novelty Search: Rethinking Local Competition in Quality-Diversity},
+    author        = {Ryan Bahlous-Boldi and Maxence Faldor and Luca Grillotti and Hannah Janmohamed and Lisa Coiffard and Lee Spector and Antoine Cully},
+    year          = {2025},
+    eprint        = {2502.00593},
+    archivePrefix = {arXiv},
+    primaryClass  = {cs.NE},
+    url           = {https://arxiv.org/abs/2502.00593}
+}
+```
+
+```bibtex
+@article{grillotti2022unsupervised,
+    title   = {Unsupervised Behavior Discovery With Quality-Diversity Optimization},
+    author  = {Luca Grillotti and Antoine Cully},
+    journal = {IEEE Transactions on Evolutionary Computation},
+    volume  = {26},
+    number  = {6},
+    pages   = {1539--1552},
+    year    = {2022},
+    url     = {https://arxiv.org/abs/2106.05648}
+}
+```
+
+```bibtex
+@inproceedings{cully2019autonomous,
+    title     = {Autonomous Skill Discovery with Quality-Diversity and Unsupervised Descriptors},
+    author    = {Antoine Cully},
+    booktitle = {Proceedings of the Genetic and Evolutionary Computation Conference (GECCO)},
+    pages     = {81--89},
+    year      = {2019},
+    url       = {https://arxiv.org/abs/1905.11874}
+}
+```
