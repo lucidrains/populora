@@ -3155,3 +3155,59 @@ def test_parent_select_assortative_and_modular_evolve():
     assert int(raw_fits.argmax().item()) in res_geno.survivors.tolist()
 
 
+def test_return_trajectories_and_min_fitness_quality_gate():
+    from populora import Aurora, interact_with_env, quality_dominated_novelty
+
+    torch.manual_seed(0)
+    interactor = interact_with_env('CartPole-v1', num_envs = 2, seed = 0)
+    pop = interactor.population(pop_size = 6, low_rank = 2, seed = 0)
+    pop.mutate_('full_gaussian', all_individuals = True, epsilon = 0.2)
+
+    rng_before = torch.random.get_rng_state()
+    fits_plain = interactor.evaluate(pop, horizon = 30, num_episodes = 2, seed = 11)
+    rng_after_plain = torch.random.get_rng_state()
+    fits_traj, trajs = interactor.evaluate(pop, horizon = 30, num_episodes = 2, seed = 11, return_trajectories = True)
+    rng_after_traj = torch.random.get_rng_state()
+    interactor.close()
+
+    assert torch.equal(rng_before, rng_after_plain)
+    assert torch.equal(rng_before, rng_after_traj)
+    assert allclose(fits_plain, fits_traj)
+    assert len(trajs) == 6
+    for obs_t, act_t in trajs:
+        assert obs_t.ndim == 2 and obs_t.shape[1] == 4
+        assert act_t.ndim >= 1 and act_t.shape[0] == obs_t.shape[0]
+        assert 1 <= obs_t.shape[0] <= 30
+
+    aurora = Aurora(latent_dim = 4, hidden_dim = 32, update_steps = 2, max_horizon = 30)
+    desc = aurora(trajs)
+    assert desc.shape == (6, 4)
+
+    # catastrophic fall penalties must not inflate viable f_std or let crashers beat viable individuals
+    loco_fits = torch.tensor([120.0, 118.0, 117.0, 65.0, -3200.0, -3500.0])
+    loco_desc = torch.tensor([
+        [0.00, 0.00],
+        [0.01, 0.00],
+        [0.00, 0.01],
+        [0.80, -0.75],
+        [-0.99, 0.99],
+        [0.99, -0.99],
+    ])
+    q_scores = quality_dominated_novelty(
+        loco_fits,
+        loco_desc,
+        k = 2,
+        weight = 0.75,
+        quantile = 0.25,
+        sharpness = 2.0,
+        min_fitness = 0.0,
+    )
+    assert int(q_scores.argmax().item()) == 0
+    assert q_scores[3] > q_scores[1] and q_scores[3] > q_scores[2]
+    assert q_scores[0:4].min() > q_scores[4:6].max()
+    assert q_scores[4] > q_scores[5]
+
+    # bootstrap regime with a single viable individual falls back to survival ranking
+    boot_fits = torch.tensor([290.0, -2950.0, -3100.0, -3250.0, -3400.0, -3550.0])
+    boot_scores = quality_dominated_novelty(boot_fits, loco_desc, k = 2, min_fitness = 0.0)
+    assert torch.equal(boot_scores.argsort(descending = True), torch.arange(6))

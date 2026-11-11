@@ -16,6 +16,7 @@ from torch_einops_utils import pad_right_at_dim_to, z_score
 from torch_einops_utils.shape import shape, size
 
 from populora._utils import default, exists
+from populora.novelty import _resolve_distances
 
 if TYPE_CHECKING:
     from populora.population import Population
@@ -534,85 +535,53 @@ def parent_select_assortative(
     normalize_descriptors = True,
     **kwargs
 ):
-    # niche-local (assortative) parent pairing: parent 1 is chosen by tournament
-    # on `fitnesses` (e.g. DNS / competition fitness), and remaining parents are
-    # chosen from parent 1's `niche_k` nearest neighbors in descriptor/distance
-    # space to avoid destructive cross-niche recombination
+    # niche-local parent pairing: parent 1 via tournament on `fitnesses`, mates via
+    # tournament within parent 1's `niche_k` nearest neighbors on `raw_fitnesses`
 
-    *batch_shape, pop_size = shape(fitnesses, '... p')
+    *_, pop_size = shape(fitnesses, '... p')
     device = fitnesses.device
 
-    p1 = parent_select_tournament(
-        fitnesses,
-        num_children,
-        num_parents_per_child = 1,
-        tournament_size = tournament_size,
-        **kwargs
-    )
+    p1 = parent_select_tournament(fitnesses, num_children, num_parents_per_child = 1, tournament_size = tournament_size, **kwargs)
 
     if num_parents_per_child <= 1:
         return p1
 
     if (not exists(distances) and not exists(descriptors)) or pop_size <= 2:
-        rest = parent_select_tournament(
-            fitnesses,
-            num_children,
-            num_parents_per_child = num_parents_per_child - 1,
-            tournament_size = tournament_size,
-            **kwargs
-        )
+        rest = parent_select_tournament(fitnesses, num_children, num_parents_per_child = num_parents_per_child - 1, tournament_size = tournament_size, **kwargs)
         return cat((p1, rest), dim = -1)
 
-    mate_scores = default(raw_fitnesses, fitnesses).to(device).float()
-    num_extra = num_parents_per_child - 1
+    unbatched = fitnesses.ndim == 1
+    p1_b = p1.unsqueeze(0) if unbatched else p1
+    scores = default(raw_fitnesses, fitnesses).to(device).float()
+    scores_b = scores.unsqueeze(0) if scores.ndim == 1 else scores
+
+    num_groups, num_extra = p1_b.shape[0], num_parents_per_child - 1
     m = max(1, min(int(niche_k), pop_size - 1))
+    t_sz = min(max(2, tournament_size), m)
 
-    def _select_mates_1d(p1_1d, scores_1d, dist_2d):
-        # p1_1d: (c, 1), scores_1d: (p,), dist_2d: (p, p)
-        c = p1_1d.shape[0]
-        p1_flat = p1_1d.squeeze(-1) # (c,)
-        d_rows = dist_2d[p1_flat].clone() # (c, p)
-        d_rows.scatter_(1, p1_1d, float('inf'))
+    out = []
+    for g in range(num_groups):
+        desc_g = descriptors[g] if (exists(descriptors) and not unbatched and descriptors.ndim >= 3) else descriptors
+        dist_g = distances[g] if (exists(distances) and distances.ndim == 3) else distances
+        d_mat = _resolve_distances(desc_g, dist_g, normalize = normalize_descriptors, device = device)
 
-        _, nn_idx = torch.topk(d_rows, k = m, dim = -1, largest = False) # (c, m)
-        nn_scores = scores_1d[nn_idx] # (c, m)
+        p1_g = p1_b[g]
+        d_rows = d_mat[p1_g.squeeze(-1)].clone().scatter_(1, p1_g, float('inf'))
+        nn_idx = d_rows.topk(k = m, dim = -1, largest = False).indices
+        nn_scores = scores_b[g][nn_idx]
 
         if m <= num_extra:
-            best_local = nn_scores.argmax(dim = -1, keepdim = True)
-            chosen = nn_idx.gather(-1, best_local).expand(c, num_extra)
-            return cat((p1_1d, chosen), dim = -1)
-
-        # tournament within the local neighborhood
-        t_sz = min(max(2, tournament_size), m)
-        rand_local_order = torch.randn((c, num_extra, m), device = device).topk(t_sz, dim = -1, sorted = False).indices
-        cand_idx = nn_idx.unsqueeze(1).expand(c, num_extra, m).gather(-1, rand_local_order)
-        cand_scores = nn_scores.unsqueeze(1).expand(c, num_extra, m).gather(-1, rand_local_order)
-        win = cand_scores.argmax(dim = -1, keepdim = True)
-        mates = cand_idx.gather(-1, win).squeeze(-1) # (c, num_extra)
-        return cat((p1_1d, mates), dim = -1)
-
-    if fitnesses.ndim == 1:
-        if exists(distances):
-            dist_mat = distances.to(device).float()
+            mates = repeat(nn_idx.gather(-1, nn_scores.argmax(dim = -1, keepdim = True)), 'c 1 -> c e', e = num_extra)
         else:
-            from populora.novelty import pairwise_distances
-            dist_mat = pairwise_distances(descriptors.to(device), normalize = normalize_descriptors)
-        return _select_mates_1d(p1, mate_scores, dist_mat)
+            order = torch.randn((num_children, num_extra, m), device = device).topk(t_sz, dim = -1, sorted = False).indices
+            cand_idx = repeat(nn_idx, 'c m -> c e m', e = num_extra).gather(-1, order)
+            cand_scores = repeat(nn_scores, 'c m -> c e m', e = num_extra).gather(-1, order)
+            mates = cand_idx.gather(-1, cand_scores.argmax(dim = -1, keepdim = True)).squeeze(-1)
 
-    # batched / island case: (g, p)
-    num_groups = fitnesses.shape[0]
-    out_groups = []
-    for g in range(num_groups):
-        if exists(distances):
-            d_g = distances[g].to(device).float() if distances.ndim == 3 else distances.to(device).float()
-        else:
-            from populora.novelty import pairwise_distances
-            desc_g = descriptors[g] if descriptors.ndim >= 3 else descriptors
-            d_g = pairwise_distances(desc_g.to(device), normalize = normalize_descriptors)
-        s_g = mate_scores[g] if mate_scores.ndim == 2 else mate_scores
-        out_groups.append(_select_mates_1d(p1[g], s_g, d_g))
+        out.append(cat((p1_g, mates), dim = -1))
 
-    return torch.stack(out_groups, dim = 0)
+    res = torch.stack(out, dim = 0)
+    return res.squeeze(0) if unbatched else res
 
 register_parent_selection('tournament', parent_select_tournament)
 register_parent_selection('fuss', parent_select_fuss)

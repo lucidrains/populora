@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 import random
 from fnmatch import fnmatch
@@ -1039,20 +1040,22 @@ class Population(_LoRAMixin):
         parent_selection_registry = default(self.parent_selection_registry, PARENT_SELECTION_REGISTRY)
         select_fn = _resolve_fn(selection_type, parent_selection_registry, 'parent selection')
 
+        def _slice_kwargs(idx):
+            out = dict(kwargs)
+            if is_tensor(rf := out.get('raw_fitnesses')) and rf.shape[0] == self.pop_size:
+                out['raw_fitnesses'] = rf[idx]
+            if is_tensor(desc := out.get('descriptors')) and desc.shape[0] == self.pop_size:
+                out['descriptors'] = (rearrange(desc, 'p ... -> p (...)') if idx.ndim == 2 else desc)[idx]
+            if is_tensor(dist := out.get('distances')) and dist.shape == (self.pop_size, self.pop_size):
+                out['distances'] = dist[idx][:, idx] if idx.ndim == 1 else torch.stack([dist[i][:, i] for i in idx])
+            return out
+
         # single group selection
 
         if num_groups == 1:
             if exists(eligible_indices):
                 fitnesses = fitnesses[eligible_indices] if size(fitnesses, '... [p]') == self.pop_size else fitnesses
-                sliced_kwargs = dict(kwargs)
-                for key in ('raw_fitnesses', 'descriptors'):
-                    val = sliced_kwargs.get(key, None)
-                    if is_tensor(val) and val.shape[0] == self.pop_size:
-                        sliced_kwargs[key] = val[eligible_indices]
-                dist_val = sliced_kwargs.get('distances', None)
-                if is_tensor(dist_val) and dist_val.ndim == 2 and dist_val.shape == (self.pop_size, self.pop_size):
-                    sliced_kwargs['distances'] = dist_val[eligible_indices][:, eligible_indices]
-                selected = select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **sliced_kwargs)
+                selected = select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **_slice_kwargs(eligible_indices))
                 return eligible_indices[selected]
 
             return select_fn(fitnesses, num_children, num_parents_per_child = num_parents_per_child, **kwargs)
@@ -1062,37 +1065,21 @@ class Population(_LoRAMixin):
         group_size = self.pop_size // num_groups
         fitnesses_grouped = rearrange(fitnesses, '(g p) -> g p', g = num_groups)
         children_per_group = num_children // num_groups
+        global_indices_grouped = rearrange(torch.arange(self.pop_size, device = self.device), '(g p) -> g p', g = num_groups)
 
         if exists(eligible_indices):
             mask = torch.zeros(self.pop_size, dtype = torch.bool, device = self.device)
             mask[eligible_indices] = True
             mask_grouped = rearrange(mask, '(g p) -> g p', g = num_groups)
 
-            global_indices_grouped = rearrange(torch.arange(self.pop_size, device = self.device), '(g p) -> g p', g = num_groups)
-
             eligible_global_indices = rearrange(global_indices_grouped[mask_grouped], '(g p) -> g p', g = num_groups)
             eligible_fitnesses = rearrange(fitnesses_grouped[mask_grouped], '(g p) -> g p', g = num_groups)
 
-            sliced_kwargs = dict(kwargs)
-            if is_tensor(sliced_kwargs.get('raw_fitnesses', None)) and sliced_kwargs['raw_fitnesses'].shape[0] == self.pop_size:
-                rf_grouped = rearrange(sliced_kwargs['raw_fitnesses'], '(g p) -> g p', g = num_groups)
-                sliced_kwargs['raw_fitnesses'] = rearrange(rf_grouped[mask_grouped], '(g p) -> g p', g = num_groups)
-            if is_tensor(sliced_kwargs.get('descriptors', None)) and sliced_kwargs['descriptors'].shape[0] == self.pop_size:
-                desc_flat = sliced_kwargs['descriptors'].reshape(self.pop_size, -1)
-                desc_grouped = rearrange(desc_flat, '(g p) d -> g p d', g = num_groups)
-                sliced_kwargs['descriptors'] = rearrange(desc_grouped[mask_grouped], '(g p) d -> g p d', g = num_groups)
-            if is_tensor(sliced_kwargs.get('distances', None)) and sliced_kwargs['distances'].shape == (self.pop_size, self.pop_size):
-                dist_full = sliced_kwargs['distances']
-                sliced_kwargs['distances'] = torch.stack([
-                    dist_full[eligible_global_indices[g]][:, eligible_global_indices[g]]
-                    for g in range(num_groups)
-                ], dim = 0)
-
-            selected = select_fn(eligible_fitnesses, children_per_group, num_parents_per_child = num_parents_per_child, **sliced_kwargs)
+            selected = select_fn(eligible_fitnesses, children_per_group, num_parents_per_child = num_parents_per_child, **_slice_kwargs(eligible_global_indices))
             parents = batched_index_select(eligible_global_indices, selected, dim = 1)
             return rearrange(parents, 'g c p -> (g c) p')
 
-        parents = select_fn(fitnesses_grouped, children_per_group, num_parents_per_child = num_parents_per_child, **kwargs)
+        parents = select_fn(fitnesses_grouped, children_per_group, num_parents_per_child = num_parents_per_child, **_slice_kwargs(global_indices_grouped))
 
         offset = torch.arange(num_groups, device = fitnesses.device) * group_size
         parents = parents + rearrange(offset, 'g -> g 1 1')
@@ -1720,40 +1707,27 @@ class Population(_LoRAMixin):
     def genome_distances(
         self,
         *,
-        space: str = 'factor',
+        space: str = 'factor'
     ) -> Tensor:
-        """Pairwise `(P, P)` Euclidean/Frobenius distance matrix between
-        individuals in LoRA genome space.
+        # pairwise (p, p) Euclidean/Frobenius distance in factor or merged delta space
 
-        - `space = 'factor'`: Euclidean distance over concatenated `(weight_down, weight_up)`
-          adapter factors across all targets.
-        - `space = 'delta'`: Frobenius distance over merged low-rank weight deltas
-          `ΔW = U · Dᵀ` across all targets (invariant to rank-subspace basis rotations).
-        """
         assert space in ('factor', 'delta'), f'unknown genome distance space {space!r} - choose from "factor", "delta"'
 
-        n = self.pop_size
-        device = self.device
+        n, device = self.pop_size, self.device
         sq = torch.zeros(n, n, device = device, dtype = torch.float32)
 
         for key in self.weight_down:
-            wd = self.weight_down[key].float()
-            wu = self.weight_up[key].float()
-
-            if space == 'factor':
-                tensors = (wd.reshape(n, -1), wu.reshape(n, -1))
-            else:
-                delta = einsum(wu, wd, 'p o r, p i r -> p o i').reshape(n, -1)
-                tensors = (delta,)
+            wd, wu = self.weight_down[key].float(), self.weight_up[key].float()
+            tensors = (
+                (rearrange(wd, 'p ... -> p (...)'), rearrange(wu, 'p ... -> p (...)'))
+                if space == 'factor'
+                else (rearrange(einsum(wu, wd, 'p o r, p i r -> p o i'), 'p ... -> p (...)'),)
+            )
 
             for w in tensors:
-                sq += (w * w).sum(-1, keepdim = True)
-                sq -= 2 * w @ w.T
-                sq += (w * w).sum(-1, keepdim = True).T
+                sq += torch.cdist(w, w).pow(2)
 
-        dist = sq.clamp(min = 0.0).sqrt()
-        dist.fill_diagonal_(0.0)
-        return dist
+        return sq.clamp(min = 0.0).sqrt().fill_diagonal_(0.0)
 
     @torch.no_grad()
     def shared_fitnesses(
@@ -2182,19 +2156,18 @@ class Population(_LoRAMixin):
                 transform_fn = _resolve_fn(comp_spec, FITNESS_TRANSFORM_REGISTRY, 'fitness transform')
                 if not exists(descriptors) and not exists(distances):
                     distances = self.genome_distances()
-                try:
-                    shared_fitnesses = transform_fn(
-                        raw_fitnesses,
-                        descriptors,
-                        distances = distances,
-                        **kwargs
-                    )
-                except TypeError:
-                    try:
-                        shared_fitnesses = transform_fn(raw_fitnesses, descriptors)
-                    except TypeError:
-                        shared_fitnesses = transform_fn(raw_fitnesses)
-                shared_fitnesses = shared_fitnesses.to(self.device).float()
+
+                params = inspect.signature(transform_fn).parameters
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values())
+                pos_params = [p for p in params.values() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+
+                tx_kwargs = {k: v for k, v in kwargs.items() if has_var_kw or k in params}
+                if has_var_kw or 'distances' in params:
+                    tx_kwargs['distances'] = distances
+
+                args = (raw_fitnesses, descriptors) if (has_var_pos or len(pos_params) >= 2) else (raw_fitnesses,)
+                shared_fitnesses = transform_fn(*args, **tx_kwargs).to(self.device).float()
         elif sharing_quantile > 0.:
             shared_fitnesses = self.shared_fitnesses(
                 fitnesses,
@@ -2228,35 +2201,25 @@ class Population(_LoRAMixin):
             else:
                 n_raw_elites = max(0, int(raw_elites))
 
-            survivors = result.survivors
-            culled = result.culled
+            survivors, culled = result.survivors, result.culled
             n_raw_elites = min(n_raw_elites, len(survivors))
 
             if n_raw_elites > 0:
                 top_raw = raw_fitnesses.topk(n_raw_elites).indices
-                protected = set(top_raw.tolist())
+                missing = top_raw[~torch.isin(top_raw, survivors)]
+                droppable = torch.nonzero(~torch.isin(survivors, top_raw)).flatten()
+                k_swap = min(missing.numel(), droppable.numel())
 
-                for r_idx in top_raw.tolist():
-                    if r_idx not in survivors.tolist():
-                        # drop the survivor with the lowest competition score that is not in `protected`
-                        surv_list = survivors.tolist()
-                        cand_pos = [pos for pos, s_id in enumerate(surv_list) if s_id not in protected]
-                        if not cand_pos:
-                            break
-                        cand_pos_t = torch.tensor(cand_pos, device = self.device, dtype = torch.long)
-                        drop_rel = int(shared_fitnesses[survivors[cand_pos_t]].argmin().item())
-                        drop = int(cand_pos_t[drop_rel].item())
-                        dropped = int(survivors[drop].item())
+                if k_swap > 0:
+                    drop_pos = droppable[shared_fitnesses[survivors[droppable]].topk(k_swap, largest = False).indices]
+                    dropped = survivors[drop_pos]
+                    keep = torch.ones(len(survivors), dtype = torch.bool, device = self.device)
+                    keep[drop_pos] = False
+                    survivors = torch.cat((survivors[keep], missing[:k_swap]))
+                    culled = torch.cat((culled[~torch.isin(culled, missing[:k_swap])], dropped))
 
-                        survivors = torch.cat((
-                            survivors[:drop],
-                            survivors[drop + 1:],
-                            torch.tensor([r_idx], device = self.device, dtype = survivors.dtype),
-                        ))
-                        culled = culled[culled != r_idx]
-                        culled = torch.cat((culled, torch.tensor([dropped], device = self.device, dtype = culled.dtype)))
-
-                result = SelectionResult(survivors, culled, result.elites)
+                elites = torch.cat((result.elites, top_raw[~torch.isin(top_raw, result.elites)]))
+                result = SelectionResult(survivors, culled, elites)
 
         # age-forced culls, captured before bookkeeping for later refill
 
@@ -2270,20 +2233,15 @@ class Population(_LoRAMixin):
         ages[result.culled] = 0
         ages[result.survivors] += 1
 
-        parent_kwargs = dict(kwargs)
-        needs_niche_dist = (
-            parent_selection_type == 'assortative'
-            or parent_selection_type is parent_select_assortative
-        )
-        if needs_niche_dist and not exists(descriptors) and not exists(distances):
+        if (parent_selection_type == 'assortative' or parent_selection_type is parent_select_assortative) and not exists(descriptors) and not exists(distances):
             distances = self.genome_distances()
 
-        if exists(descriptors) and 'descriptors' not in parent_kwargs:
-            parent_kwargs['descriptors'] = descriptors
-        if exists(distances) and 'distances' not in parent_kwargs:
-            parent_kwargs['distances'] = distances
-        if 'raw_fitnesses' not in parent_kwargs:
-            parent_kwargs['raw_fitnesses'] = raw_fitnesses
+        parent_kwargs = dict(kwargs)
+        if exists(descriptors):
+            parent_kwargs.setdefault('descriptors', descriptors)
+        if exists(distances):
+            parent_kwargs.setdefault('distances', distances)
+        parent_kwargs.setdefault('raw_fitnesses', raw_fitnesses)
 
         parents = self.select_parents(
             parent_selection_type,

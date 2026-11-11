@@ -20,6 +20,7 @@ from populora.distributed import (
     broadcast_object,
     distributed_device,
     evaluate_population_distributed,
+    is_distributed,
     is_main_rank,
     preserve_rng,
 )
@@ -422,7 +423,8 @@ class EnvInteractor:
         num_episodes = 1,
         seed = None,
         agg = 'mean',
-        baldwin: Baldwin | bool | dict | None = None
+        baldwin: Baldwin | bool | dict | None = None,
+        return_trajectories: bool = False
     ):
         envs = self.envs
         device = population.device
@@ -433,7 +435,8 @@ class EnvInteractor:
         assert num_episodes >= 1, 'num_episodes must be at least 1'
 
         if num_individuals == 0:
-            return torch.zeros(0, device = device)
+            empty = torch.zeros(0, device = device)
+            return (empty, []) if return_trajectories else empty
 
         base_seed = default(seed, default(population.eval_seed, self.seed))
 
@@ -504,6 +507,20 @@ class EnvInteractor:
         episode_counts = torch.zeros(num_individuals, dtype = torch.long, device = device)
         env_reset_count = [0] * len(envs)
 
+        if return_trajectories:
+            slot_obs_buf = [[] for _ in range(num_slots)]
+            slot_act_buf = [[] for _ in range(num_slots)]
+            ind_trajs = [None] * num_individuals
+
+            def flush_traj(k, idx_i):
+                if not exists(ind_trajs[idx_i]) and len(slot_obs_buf[k]) > 0:
+                    ind_trajs[idx_i] = (
+                        torch.stack(slot_obs_buf[k], dim = 0),
+                        torch.stack(slot_act_buf[k], dim = 0),
+                    )
+                slot_obs_buf[k].clear()
+                slot_act_buf[k].clear()
+
         with temp_eval(population), population.routing_cache():
             if exists(baldwin_learner):
                 baldwin_learner.start_rollout(pop_route_ids)
@@ -572,6 +589,13 @@ class EnvInteractor:
                     if rescale_actions:
                         actions = rescale_from_range_to_range(actions, from_range = action_from_range, to_range = to_range)
 
+                    if return_trajectories:
+                        obs_cpu, act_cpu = obs_batch.detach().cpu().float(), actions.detach().cpu().float()
+                        for pos_i, k in enumerate(active_slots):
+                            if not exists(ind_trajs[int(route_ids[k].item())]) and episodes_done[k] == 0:
+                                slot_obs_buf[k].append(obs_cpu[pos_i])
+                                slot_act_buf[k].append(act_cpu[pos_i])
+
                     if exists(baldwin_learner):
                         step_dones = torch.zeros(len(active_slots), device = device, dtype = torch.bool)
                         ep_reset_slots, ep_reset_next_inds = [], []
@@ -631,6 +655,9 @@ class EnvInteractor:
 
                                 idx = route_ids[k]
                                 prev_pop_ind = int(pop_route_ids[k].item())
+
+                                if return_trajectories:
+                                    flush_traj(k, int(idx.item()))
 
                                 returns[idx] = torch.maximum(returns[idx], current_return[idx]) if agg == 'max' else returns[idx] + current_return[idx]
                                 current_return[idx] = 0.
@@ -695,6 +722,10 @@ class EnvInteractor:
                                     current_return[route_ids[k]] = 0.
                                     current_learned[route_ids[k]] = 0.
                                     ep_steps[k] = 0
+
+                                    if return_trajectories:
+                                        slot_obs_buf[k].clear()
+                                        slot_act_buf[k].clear()
 
                                     if memory_wrapped:
                                         memories[k] = init_memories[k]
@@ -777,10 +808,21 @@ class EnvInteractor:
         extrinsic_fitness = _agg_returns(returns, current_return)
 
         if not exists(baldwin_learner):
-            return extrinsic_fitness
+            final_fitness = extrinsic_fitness
+        else:
+            learned_fitness = _agg_returns(learned_returns, current_learned)
+            final_fitness = baldwin_learner.combine_fitness(extrinsic_fitness, learned_fitness)
 
-        learned_fitness = _agg_returns(learned_returns, current_learned)
-        return baldwin_learner.combine_fitness(extrinsic_fitness, learned_fitness)
+        if not return_trajectories:
+            return final_fitness
+
+        for k in range(num_slots):
+            if cursor[k] < len(tours[k]):
+                flush_traj(k, int(route_ids[k].item()))
+
+        obs_d, act_d = default(self.obs_dim, 1), default(self.action_dim, 1)
+        empty_traj = (torch.zeros((0, obs_d)), torch.zeros((0, act_d)))
+        return final_fitness, [default(t, empty_traj) for t in ind_trajs]
 
     # built-in rollout evaluator, distributed-friendly: (pop, individuals)
     # evaluates exactly those - what evaluate_population_distributed partitions
@@ -827,12 +869,37 @@ class EnvInteractor:
         agg = 'mean',
         baldwin: Baldwin | bool | dict | None = None,
         contiguous = False,
-        sync_base_model = False
+        sync_base_model = False,
+        return_trajectories: bool = False
     ):
         # discrete action spaces sample categorically when no action fn is given
         action = default(action, self._auto_action())
+        trajectories = [None] * population.pop_size
+        local_trajs = []
 
-        if not exists(fitness):
+        if return_trajectories:
+            assert not exists(fitness), 'return_trajectories = True requires the built-in rollout evaluator (fitness = None)'
+
+            def fitness(pop, individuals = None):
+                inds = list(default(individuals, range(pop.pop_size)))
+                fits, trajs = self._rollout_fitness(
+                    pop,
+                    inds,
+                    action = action,
+                    horizon = horizon,
+                    num_episodes = num_episodes,
+                    seed = seed,
+                    agg = agg,
+                    baldwin = baldwin,
+                    return_trajectories = True,
+                )
+                for idx, traj in zip(inds, trajs):
+                    trajectories[int(idx)] = traj
+                local_trajs.append((inds, trajs))
+                return fits
+
+            fitness.batch_eval = True
+        elif not exists(fitness):
             fitness = self.fitness(
                 population,
                 action = action,
@@ -871,7 +938,19 @@ class EnvInteractor:
         if not torch.isfinite(fitnesses).all():
             fitnesses = torch.nan_to_num(fitnesses, nan = torch.finfo(torch.float32).min)
 
-        return fitnesses
+        if not return_trajectories:
+            return fitnesses
+
+        if is_distributed():
+            import torch.distributed as dist
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local_trajs)
+            for rank_chunks in gathered:
+                for inds, trajs in rank_chunks:
+                    for idx, traj in zip(inds, trajs):
+                        trajectories[int(idx)] = traj
+
+        return fitnesses, trajectories
 
     def _auto_action(self):
         if action_space_is_discrete(self.action_space):
