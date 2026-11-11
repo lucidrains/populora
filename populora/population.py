@@ -1988,7 +1988,7 @@ class Population(_LoRAMixin):
                 raise ValueError(
                     f"brood_size={brood_size} > 1 is disallowed with crossover_type={crossover_type!r} "
                     f"because it produces identical children across brood candidates. "
-                    f"Use a stochastic crossover operator (e.g. 'extrapolative', 'dare', 'svd_subspace', 'layer_wise', 'xes')."
+                    f"Use a stochastic crossover operator (e.g. 'extrapolative', 'dare', 'svd_subspace', 'layer_wise', 'xes', 'distillation')."
                 )
 
         def produce_candidate():
@@ -2094,7 +2094,7 @@ class Population(_LoRAMixin):
                 raise ValueError(
                     f"brood_size={brood_size} > 1 is disallowed with crossover_type={crossover_type!r} "
                     f"because it produces identical children across brood candidates. "
-                    f"Use a stochastic crossover operator (e.g. 'extrapolative', 'dare', 'svd_subspace', 'layer_wise', 'xes')."
+                    f"Use a stochastic crossover operator (e.g. 'extrapolative', 'dare', 'svd_subspace', 'layer_wise', 'xes', 'distillation')."
                 )
 
         cur_gen = self.generation if gen is None else int(gen)

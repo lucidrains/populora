@@ -407,6 +407,63 @@ def test_crossovers():
     for k in pop.weight_down.keys():
         assert not allclose(pop.weight_down[k][2:4], before[k][2:4])
 
+def test_crossover_distillation():
+    # two specialists on complementary halves of a V-shaped target. each is
+    # wrong on the other half, so weight averaging loses both; per-state
+    # behavior distillation with a critic-like filter should recover both
+
+    torch.manual_seed(0)
+
+    net = nn.Sequential(nn.Linear(1, 16), nn.Tanh(), nn.Linear(16, 1))
+    pop = Population(net, pop_size = 3, low_rank = 2, lora_targets = ['0', '2'], seed = 0)
+
+    probes = torch.linspace(-1, 1, 129)[:, None]
+    labels = -probes.abs()
+
+    def train_adapter(individual, mask, steps = 250, lr = 2e-2):
+        params = [*pop.weight_down.values(), *pop.weight_up.values()]
+
+        for param in params:
+            param.requires_grad_(True)
+
+        optimizer = torch.optim.Adam(params, lr = lr)
+
+        for _ in range(steps):
+            optimizer.zero_grad(set_to_none = True)
+            loss = ((pop(probes[mask], individual = individual) - labels[mask]) ** 2).mean()
+            loss.backward()
+            optimizer.step()
+
+        for param in params:
+            param.requires_grad_(False)
+            param.grad = None
+
+    train_adapter(0, probes[:, 0] < -0.05)
+    train_adapter(1, probes[:, 0] > 0.05)
+
+    def mse(individual):
+        with torch.no_grad():
+            return ((pop(probes, individual = individual) - labels) ** 2).mean().item()
+
+    parent_mse = min(mse(0), mse(1))
+    assert parent_mse > 0.2  # each specialist is bad on the half it never saw
+
+    parents = torch.tensor([[0, 1]])
+    children = torch.tensor([2])
+
+    pop.crossover_('average', parents, children)
+    average_mse = mse(2)
+
+    def oracle_filter(_, parent_outputs, _fitnesses):
+        return -((parent_outputs - labels[None, None]) ** 2).squeeze(-1)
+
+    pop.crossover_('distillation', parents, children, inputs = probes, filter_fn = oracle_filter, steps = 250, lr = 2e-2)
+    distilled_mse = mse(2)
+
+    assert distilled_mse < 0.02
+    assert distilled_mse < 0.1 * parent_mse
+    assert distilled_mse < 0.1 * average_mse
+
 def test_crossover_xes():
     pop = Population(
         get_model(),

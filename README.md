@@ -336,6 +336,19 @@ Samples can be routed to explicit individuals (`individual = 3` or `individuals 
 ```
 
 ```bibtex
+@inproceedings{bodnar2020proximal,
+    title     = {Proximal Distilled Evolutionary Reinforcement Learning},
+    author    = {Cristian Bodnar and Ben Day and Pietro Liò},
+    booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+    volume    = {34},
+    number    = {04},
+    pages     = {3283--3290},
+    year      = {2020},
+    url       = {https://arxiv.org/abs/1906.09807}
+}
+```
+
+```bibtex
 @misc{schmidhuber2012powerplaytrainingincreasinglygeneral,
     title    = {POWERPLAY: Training an Increasingly General Problem Solver by Continually Searching for the Simplest Still Unsolvable Problem},
     author   = {Jürgen Schmidhuber},

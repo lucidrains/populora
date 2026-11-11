@@ -740,6 +740,253 @@ def crossover_xes(population, parent_indices, child_indices, fitnesses = None, n
 register_crossover('xes', crossover_xes)
 register_crossover('clone', crossover_clone)
 
+# X7 - phenotypic crossover. instead of blending weights, train the child to
+# imitate a per-state selection of the parents' outputs. this is the Q-filtered
+# behavior distillation crossover of Bodnar, Day & Lio (AAAI 2020):
+# https://arxiv.org/abs/1906.09807
+
+def _as_probe_args(inputs):
+    if is_tensor(inputs):
+        return (inputs,)
+
+    assert isinstance(inputs, (tuple, list)) and len(inputs) > 0, 'distillation probes must be a tensor or a non-empty tuple of tensors'
+    return tuple(inputs)
+
+def _probe_batch_size(args):
+    for arg in args:
+        if is_tensor(arg) and arg.ndim > 0:
+            return size(arg, '[b] ...')
+
+    raise ValueError('distillation probes must be tensors with a leading batch axis')
+
+def _slice_probe_args(args, index):
+    return tuple(arg[index] if is_tensor(arg) else arg for arg in args)
+
+def _tile_probe_args(args, num_children, num_parents):
+    return tuple(
+        repeat(arg, 'n ... -> (c p n) ...', c = num_children, p = num_parents) if is_tensor(arg) else arg
+        for arg in args
+    )
+
+def _forward_routed(population, args, ids, chunk_size):
+    outputs = []
+
+    for start in range(0, len(ids), chunk_size):
+        end = min(start + chunk_size, len(ids))
+        out = population(*_slice_probe_args(args, slice(start, end)), individuals = ids[start:end])
+
+        assert is_tensor(out), 'distillation crossover requires the model to return a tensor'
+        outputs.append(out)
+
+    return cat(outputs, dim = 0) if len(outputs) > 1 else outputs[0]
+
+def _resolve_parent_choice(filter_fn, inputs, parent_outputs, parent_fitnesses):
+    num_children, num_parents, num_probes = parent_outputs.shape[:3]
+    device = parent_outputs.device
+
+    if filter_fn is None:
+        filter_fn = 'random'
+
+    if isinstance(filter_fn, str):
+        if filter_fn == 'random':
+            return torch.randint(0, num_parents, (num_children, num_probes), device = device)
+
+        if filter_fn == 'fitness':
+            assert exists(parent_fitnesses), 'filter_fn="fitness" requires fitnesses'
+            return parent_fitnesses.argmax(dim = -1).unsqueeze(-1).expand(num_children, num_probes).to(device)
+
+        raise ValueError(f'unknown distillation filter {filter_fn!r} - choose from "random", "fitness", or a callable')
+
+    assert callable(filter_fn), 'filter_fn must be "random", "fitness", or a callable'
+
+    scores = filter_fn(inputs, parent_outputs, parent_fitnesses)
+
+    if is_tensor(scores) and scores.shape == (num_children, num_parents, num_probes):
+        return scores.argmax(dim = 1).to(device)
+
+    if is_tensor(scores) and scores.shape == (num_children, num_probes):
+        return scores.long().to(device)
+
+    raise ValueError(
+        f'filter_fn must return per-parent scores of shape {(num_children, num_parents, num_probes)} '
+        f'or parent choices of shape {(num_children, num_probes)}, got {tuple(scores.shape) if is_tensor(scores) else type(scores)}'
+    )
+
+def _gather_parent_choice(parent_outputs, choice):
+    num_children, _, num_probes = parent_outputs.shape[:3]
+
+    index = choice.reshape(num_children, 1, num_probes, *([1] * (parent_outputs.ndim - 3)))
+    index = index.expand(num_children, 1, num_probes, *parent_outputs.shape[3:])
+
+    return parent_outputs.gather(1, index).squeeze(1)
+
+def _init_distilled_child(population, parent_indices, child_indices, fitnesses, init_from):
+    num_children, _ = shape(parent_indices, 'c p')
+
+    if init_from is None:
+        return
+
+    if isinstance(init_from, str) and init_from in ('best', 'fitness'):
+        # fall back to the first parent when no fitnesses are supplied
+        which = fitnesses[parent_indices].argmax(dim = -1) if exists(fitnesses) else torch.zeros(num_children, dtype = torch.long, device = population.device)
+    elif isinstance(init_from, int):
+        which = torch.full((num_children,), init_from, dtype = torch.long, device = population.device)
+    elif init_from == 'mean':
+        which = None
+    else:
+        raise ValueError(f'unknown distillation init {init_from!r} - choose from "best", "mean", a parent index, or None')
+
+    for weight_down, weight_up in zip(population.weight_down.values(), population.weight_up.values()):
+        parents_down = weight_down.data[parent_indices].float()
+        parents_up = weight_up.data[parent_indices].float()
+
+        if not exists(which):
+            child_down = parents_down.mean(dim = 1)
+            child_up = parents_up.mean(dim = 1)
+        else:
+            index = which.reshape(num_children, 1, *([1] * (parents_down.ndim - 2)))
+
+            child_down = parents_down.gather(1, index.expand(num_children, 1, *parents_down.shape[2:])).squeeze(1)
+            child_up = parents_up.gather(1, index.expand(num_children, 1, *parents_up.shape[2:])).squeeze(1)
+
+        weight_down.data[child_indices] = child_down.to(weight_down.dtype)
+        weight_up.data[child_indices] = child_up.to(weight_up.dtype)
+
+def _distill_child(population, child_indices, inputs, targets, steps, lr, batch_size, loss_fn):
+    num_children, num_probes = targets.shape[:2]
+    device = population.device
+
+    args = _as_probe_args(inputs)
+    args = tuple(arg.to(device) if is_tensor(arg) else arg for arg in args)
+    assert _probe_batch_size(args) == num_probes
+
+    params = [*population.weight_down.values(), *population.weight_up.values()]
+    prev_requires_grad = [param.requires_grad for param in params]
+
+    for param in params:
+        param.requires_grad_(True)
+
+    # only the rows routed to a child receive a gradient, and untouched rows
+    # start with zero moments, so Adam leaves every other individual intact
+    probe_batch = num_probes if not exists(batch_size) else min(int(batch_size), num_probes)
+    base_rows = torch.arange(num_probes, device = device)
+
+    try:
+        optimizer = torch.optim.Adam(params, lr = lr)
+
+        with torch.enable_grad():
+            for _ in range(steps):
+                if probe_batch >= num_probes:
+                    rows = base_rows.expand(num_children, num_probes)
+                else:
+                    rows = torch.randperm(num_probes, device = device)[:probe_batch].expand(num_children, probe_batch)
+
+                flat_rows = rows.reshape(-1)
+                batch_args = tuple(arg[flat_rows] if is_tensor(arg) else arg for arg in args)
+                batch_ids = repeat(child_indices, 'c -> (c b)', b = rows.shape[1])
+
+                optimizer.zero_grad(set_to_none = True)
+
+                preds = population(*batch_args, individuals = batch_ids)
+                assert is_tensor(preds), 'distillation crossover requires the model to return a tensor'
+                preds = preds.float().reshape(num_children, rows.shape[1], *preds.shape[1:])
+
+                index = rows.reshape(num_children, rows.shape[1], *([1] * (targets.ndim - 2)))
+                index = index.expand(num_children, rows.shape[1], *targets.shape[2:])
+                batch_targets = targets.gather(1, index).float()
+
+                loss = loss_fn(preds, batch_targets) if callable(loss_fn) else F.mse_loss(preds, batch_targets)
+                loss.backward()
+                optimizer.step()
+    finally:
+        for param, requires_grad in zip(params, prev_requires_grad):
+            param.requires_grad_(requires_grad)
+            param.grad = None
+
+def crossover_distillation(
+    population,
+    parent_indices,
+    child_indices,
+    fitnesses = None,
+    *,
+    inputs = None,
+    input_fn = None,
+    filter_fn = 'random',
+    init_from = 'best',
+    steps = 64,
+    lr = 1e-2,
+    batch_size = None,
+    loss_fn = None,
+    **kwargs
+):
+    """Phenotypic crossover by behavior distillation (Bodnar, Day & Lio, AAAI 2020).
+
+    Rather than blending LoRA weights, each child starts from one parent
+    (`init_from`) and is trained to reproduce a per-probe choice of its parents'
+    outputs. Probe inputs come from `inputs` or `input_fn`; `filter_fn` chooses
+    which parent to imitate at each probe and stands in for PDERL's Q-filter.
+
+    `filter_fn` may be `'random'`, `'fitness'`, or a callable
+    `(probes, parent_outputs, parent_fitnesses)` returning per-parent scores
+    `(C, P, N)` or hard choices `(C, N)`. `init_from` is `'best'`, `'mean'`, a
+    parent index, or `None`. `steps`, `lr`, and `batch_size` control the child's
+    distillation optimization; `loss_fn` defaults to MSE.
+    """
+
+    assert not hasattr(population, '_population'), 'distillation crossover operates on the whole phenotype and does not support per-target dispatch'
+    assert exists(inputs) or exists(input_fn), 'distillation crossover requires `inputs` or `input_fn` to provide probe states'
+    assert isinstance(steps, int) and steps >= 1, f'steps must be an integer >= 1, got {steps}'
+    assert lr > 0., f'lr must be positive, got {lr}'
+    assert not exists(batch_size) or batch_size >= 1, f'batch_size must be >= 1, got {batch_size}'
+
+    if exists(input_fn):
+        try:
+            inputs = input_fn(population)
+        except TypeError:
+            inputs = input_fn()
+
+    assert exists(inputs), 'input_fn must return probe inputs'
+
+    device = population.device
+
+    parent_indices = torch.as_tensor(parent_indices, device = device, dtype = torch.long)
+    child_indices = torch.as_tensor(child_indices, device = device, dtype = torch.long)
+    fitnesses = torch.as_tensor(fitnesses, device = device).detach() if exists(fitnesses) else None
+
+    num_children, num_parents = shape(parent_indices, 'c p')
+    assert num_parents >= 2, 'distillation crossover requires at least 2 parents'
+    assert len(child_indices) == num_children, f'got {len(child_indices)} children for {num_children} parent pairs'
+    assert not torch.isin(child_indices, parent_indices.flatten()).any(), 'distillation children must not overlap their parents - in-place distillation would corrupt the targets'
+
+    if num_children == 0:
+        return population
+
+    args = _as_probe_args(inputs)
+    args = tuple(arg.to(device) if is_tensor(arg) else arg for arg in args)
+    num_probes = _probe_batch_size(args)
+
+    # parent behaviors on every probe, flattened child-major
+
+    parent_ids = repeat(parent_indices, 'c p -> (c p n)', n = num_probes)
+    parent_args = _tile_probe_args(args, num_children, num_parents)
+
+    with torch.no_grad():
+        parent_outputs = _forward_routed(population, parent_args, parent_ids, default(batch_size, 4096))
+        parent_outputs = parent_outputs.reshape(num_children, num_parents, num_probes, *parent_outputs.shape[1:])
+
+    parent_fitnesses = fitnesses[parent_indices] if exists(fitnesses) else None
+    probe = args[0] if len(args) == 1 else args
+    choice = _resolve_parent_choice(filter_fn, probe, parent_outputs, parent_fitnesses)
+    targets = _gather_parent_choice(parent_outputs, choice).detach()
+
+    _init_distilled_child(population, parent_indices, child_indices, fitnesses, init_from)
+    _distill_child(population, child_indices, inputs, targets, steps, lr, batch_size, loss_fn)
+
+    population.clear_routing_cache()
+    return population
+
+register_crossover('distillation', crossover_distillation)
+
 crossover_average.deterministic = True
 crossover_clone.deterministic = True
 DETERMINISTIC_CROSSOVERS = frozenset({'average', 'clone'})

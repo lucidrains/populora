@@ -39,6 +39,7 @@ from populora.operators import (
     crossover_average,
     crossover_clone,
     crossover_dare,
+    crossover_distillation,
     crossover_extrapolative,
     crossover_layer_wise,
     crossover_svd_subspace,
